@@ -1,0 +1,11 @@
+{
+    "cases": [
+        {
+            "arg_type": ["default"],
+            "world_size": [2],
+            "dtype": ["bfloat16"],
+            "batch_size": [1024],
+            "dim_size": [1024]
+        }
+    ]
+}

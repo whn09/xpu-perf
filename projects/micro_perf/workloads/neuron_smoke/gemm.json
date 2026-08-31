@@ -1,0 +1,10 @@
+{
+    "cases": [
+        {
+            "arg_type": "default",
+            "dtype": ["float32", "float16", "bfloat16"],
+            "K.N": [[4096, 4096]],
+            "M": [1024]
+        }
+    ]
+}
