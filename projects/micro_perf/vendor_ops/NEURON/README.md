@@ -119,22 +119,34 @@ cache, MHA (`q_head_num == kv_head_num`, so no GQA), `batch_size == 1`, and
 | `all_to_all` | Needs the Mesh algorithm, unavailable when every rank sits on one NeuronDevice; requires inf2.24xlarge / trn1.32xlarge or larger |
 | `p2p` | Needs send/recv across multiple NeuronDevices |
 
-## Reference numbers (from `legacy-neuron`, inf2.8xlarge)
+## Reference numbers (from `legacy-neuron`, trn2.3xlarge)
 
-Neuron SDK 2.x, torch-neuronx 2.9.0, neuronx-cc 2.22. trn2.3xlarge results for
-the basic ops are under `micro_perf/benchmark/basic/**/neuron/` on that branch.
+Measured 2026-03-09 on trn2.3xlarge, one NeuronCore: torch-xla 2.9.0,
+torch-neuronx 2.9.0.2.12.22436, neuronx-cc 2.23.6484. These are the targets to
+check a run against; the full set is under
+`micro_perf/benchmark/basic/**/neuron/` on that branch.
 
 | Op | Dtype | Shape | Latency | Metric |
 |---|---|---|---|---|
-| gemm | fp32 | 1024x4096x4096 | 10,740 us | 3.2 TFLOPS |
-| gemm | fp16 | 1024x4096x4096 | 6,260 us | 5.5 TFLOPS |
-| gemm | bf16 | 1024x4096x4096 | 7,082 us | 4.9 TFLOPS |
-| flash_attention | bf16 | 2048 seq, 8h MHA prefill | 994 us | 8.6 TFLOPS |
-| softmax | bf16 | 1024x1024 | 24 us | 233 GB/s |
-| add_rms_norm | bf16 | 128x4096 | 80 us | 52.7 GB/s |
-| moe_gating_gemm | bf16→fp32 | 128x4096x8 | 69 us | 0.12 TFLOPS |
-| all_reduce | bf16 | 1024x1024, 2 cores | 41 us | 51.3 GB/s |
-| all_gather | bf16 | 1024x1024, 2 cores | 17 us | 124.7 GB/s |
+| gemm | fp32 | 1024x4096x4096 | 1,432.3 us | 24.0 TFLOPS |
+| gemm | fp16 | 1024x4096x4096 | 698.7 us | 49.2 TFLOPS |
+| gemm | bf16 | 1024x4096x4096 | 697.4 us | 49.3 TFLOPS |
+| add | bf16 | 1024x1024 | 1,026.7 us | 6.1 GB/s |
+| add | fp32 | 1024x1024 | 1,090.4 us | 11.5 GB/s |
+| softmax | bf16 | 1024x1024 | 16.8 us | 249.3 GB/s |
+| softmax | fp32 | 1024x1024 | 16.8 us | 499.4 GB/s |
+
+`add` really is ~60x slower than `softmax` here: at these sizes the graph launch
+dominates, and it is the shape of the number, not its size, that tells you the
+measurement is real.
+
+Two cautions when comparing:
+
+- **`softmax` cannot detect a CPU fallback.** On this host the CPU produced
+  18.0 us against Neuron's 16.8 us. Check `gemm` — CPU and Neuron differ by
+  orders of magnitude there.
+- Collective baselines on `legacy-neuron` were taken on **trn2.48xlarge**, not
+  trn2.3xlarge, so they are not directly comparable.
 
 ## How this backend differs from GPU
 
