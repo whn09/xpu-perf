@@ -148,6 +148,13 @@ The `legacy` column is the pre-refactor branch's own run from 2026-03-09
 baseline to within 2-9%, and it is the only op here where a wrong device or a
 pruned graph is unmistakable.
 
+**These are single-run figures, and run-to-run spread is wide.** Repeating the
+same shapes against a warm compile cache gave gemm fp32 1,258 us, fp16 628 us,
+bf16 570 us and all_reduce 1,040 us — 15-25% from the table above, in both
+directions. Compare orders of magnitude, not digits: a real fp32 gemm here is
+"about a millisecond", and anything reporting tens of microseconds is a pruned
+graph or the wrong device.
+
 At 1024x1024 both `add` and `softmax` cost 610-710 us, which is graph-launch
 time rather than memory bandwidth — the GB/s figures for them are not
 meaningful. Their agreeing with *each other* is the useful signal.
