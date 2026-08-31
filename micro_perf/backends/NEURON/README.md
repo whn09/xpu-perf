@@ -2,6 +2,15 @@
 
 Micro-benchmark backend for **AWS Trainium and Inferentia** accelerators using the [AWS Neuron SDK](https://awsdocs-neuron.readthedocs-hosted.com/).
 
+> **Branch note** — `legacy-neuron` is a known-working baseline preserved on the
+> pre-refactor `micro_perf/` layout. It is the tree from
+> [cszhz/xpu-perf](https://github.com/cszhz/xpu-perf) (which itself builds on the Neuron
+> backend from [davidshtian/xpu-perf](https://github.com/davidshtian/xpu-perf)), and it
+> lags `bytedance/xpu-perf` by 9 commits — notably the refactor that moved the framework
+> into `src/xpu_perf/` and vendor ops into `projects/micro_perf/vendor_ops/`.
+> Use this branch to reproduce the numbers below; use `main` for the port onto current
+> upstream.
+
 ## Supported Hardware
 
 - AWS Inferentia2 (inf2 instances)
@@ -21,7 +30,7 @@ All dependencies come pre-installed on [Neuron DLAMIs](https://awsdocs-neuron.re
 ## Quick Start
 
 ```bash
-cd byte_micro_perf
+cd micro_perf
 
 # Single op benchmark
 python launch.py --backend NEURON --device 0 --workload workloads/basic/tensor_gemm_ops/gemm.json
@@ -135,7 +144,7 @@ These ops load successfully but cannot be benchmarked due to Neuron platform lim
 ### How to resume testing
 
 ```bash
-cd byte_micro_perf
+cd micro_perf
 
 # Step 1: Run all basic ops (will compile new shapes, ~2-3 hours first time)
 # Recommend running in tmux/screen so SSH disconnect won't kill it
