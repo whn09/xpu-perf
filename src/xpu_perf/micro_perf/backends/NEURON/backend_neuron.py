@@ -144,9 +144,38 @@ class BackendNEURON(Backend):
         # Must be set before torch_xla initialises PJRT, otherwise this process
         # claims every core instead of the one it was assigned.
         os.environ["NEURON_RT_VISIBLE_CORES"] = str(index)
+
+        # torch_xla picks its backend at import time and, if it cannot find the
+        # Neuron PJRT plugin, silently falls back to CPU with nothing but a
+        # logging warning. A benchmark that reports CPU numbers under a NEURON
+        # label is worse than one that fails, so pin the device and then verify.
+        os.environ.setdefault("PJRT_DEVICE", "NEURON")
         import torch_xla  # noqa: F401
 
+        self._assert_running_on_neuron()
+
         self._deferred_ccl_init()
+
+    @staticmethod
+    def _assert_running_on_neuron():
+        """Fail loudly if torch_xla did not actually bind to a NeuronCore.
+
+        The plugin lives in libneuronxla, which is pulled in by torch-neuronx.
+        Stacks that ship only libtorch-neuronx-lite (the vLLM inference venv,
+        for one) have no plugin at all and resolve every device to CPU.
+        """
+        import torch_xla.core.xla_model as xm
+
+        device_kind = str(xm.xla_device())
+        if "CPU" in device_kind.upper():
+            raise EnvironmentError(
+                f"torch_xla bound to {device_kind!r} instead of a NeuronCore, so "
+                "every measurement would be a CPU measurement. The Neuron PJRT "
+                "plugin (libneuronxla/libneuronpjrt.so) is missing -- install "
+                "torch-neuronx:\n"
+                "  pip install torch-neuronx "
+                "--extra-index-url=https://pip.repos.neuron.amazonaws.com"
+            )
 
     def get_device(self):
         import torch_xla.core.xla_model as xm
@@ -349,9 +378,15 @@ class BackendNEURON(Backend):
         # Extra warmup so the neuronx-cc compile of the single-op graph lands
         # before the timed loop.
         effective_warmup = max(warmup_iterations, 4)
+        # Keep the last result reachable across mark_step. A lazy tensor that is
+        # dropped before the graph is cut is dead code, and XLA prunes it -- an
+        # op whose output goes nowhere compiles to nothing and "runs" in the
+        # time it takes to launch an empty graph. Warmup retains it too, so it
+        # compiles the same graph the timed loop below executes.
+        keepalive = None
         try:
             for i in range(effective_warmup):
-                op_instance.core_run(tensor_list[i % len(tensor_list)])
+                keepalive = op_instance.core_run(tensor_list[i % len(tensor_list)])
                 xm.mark_step()
             xm.wait_device_ops()
         except Exception:
@@ -369,7 +404,7 @@ class BackendNEURON(Backend):
         start_time = time.perf_counter_ns()
         try:
             for i in range(prefer_iterations):
-                op_instance.core_run(tensor_list[i % len(tensor_list)])
+                keepalive = op_instance.core_run(tensor_list[i % len(tensor_list)])
                 # One mark_step per iteration reuses the graph compiled during
                 # warmup instead of fusing the loop into a new one.
                 xm.mark_step()
@@ -383,4 +418,5 @@ class BackendNEURON(Backend):
         end_time = time.perf_counter_ns()
 
         latency_us = (end_time - start_time) / 1e3 / prefer_iterations
+        del keepalive
         return latency_us, []

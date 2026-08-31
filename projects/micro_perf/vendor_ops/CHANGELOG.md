@@ -15,6 +15,17 @@ This changelog follows a Keep a Changelog style and semantic versioning.
   Every other op runs its `op_defs` base implementation unchanged.
 - Added `NEURON/env.json` and `NEURON/README.md`.
 
+### Fixed
+
+- `NEURON`: report provider versions independently, so a missing
+  `torch-neuronx` no longer discards the known `torch-xla` version.
+- `NEURON`: pin `PJRT_DEVICE=NEURON` and assert the resolved device is not CPU.
+  Without the Neuron PJRT plugin `torch_xla` silently fell back to CPU, and the
+  benchmark reported host-CPU latencies under a NEURON label.
+- `NEURON`: hold the `core_run()` result across `mark_step()` in `core_perf()`.
+  Discarded lazy tensors are dead code and XLA pruned the op being measured,
+  producing impossible results such as a gemm at 1896 TFLOPS.
+
 ## [0.1.0] - 2026-04-14
 
 ### Added
