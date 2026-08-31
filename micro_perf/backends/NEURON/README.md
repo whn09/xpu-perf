@@ -8,8 +8,24 @@ Micro-benchmark backend for **AWS Trainium and Inferentia** accelerators using t
 > backend from [davidshtian/xpu-perf](https://github.com/davidshtian/xpu-perf)), and it
 > lags `bytedance/xpu-perf` by 9 commits — notably the refactor that moved the framework
 > into `src/xpu_perf/` and vendor ops into `projects/micro_perf/vendor_ops/`.
-> Use this branch to reproduce the numbers below; use `main` for the port onto current
-> upstream.
+> Use this branch to see what was originally run; use `main` for the port onto current
+> upstream, which is where the maintained code lives.
+>
+> **The numbers below no longer reproduce, and some were never valid.** Re-run on a
+> trn2.3xlarge on 2026-08-31 (torch-xla 2.9.0, neuronx-cc 2.23.6484 — the same compiler
+> as the original run), this branch reports gemm at 17-19 us and ~1,900 TFLOPS for fp32,
+> fp16 and bf16 alike, which is physically impossible. `core_perf()` discards the
+> `core_run()` result before `mark_step()`, so XLA prunes the op being measured as dead
+> code and what gets timed is an empty graph launch.
+>
+> The same bug is visible inside the original results: `add` at 1,026 us against
+> `softmax` at 16.8 us, on identically sized 1024x1024 tensors, where both ops are
+> graph-launch bound and must cost about the same. The softmax figure was a pruned graph
+> even then. `gemm` was measured correctly in March and matches `main` today to within
+> 2-9%, so the gemm numbers are the only ones worth trusting here.
+>
+> `main` fixes this by keeping the result reachable across `mark_step()`. Treat this
+> branch as a record of what was run, not as a baseline.
 
 ## Supported Hardware
 
