@@ -259,8 +259,16 @@ class XCCLEngine(BaseEngine):
                 self.subprocess_pids.append(proc.pid)
             logger.info(f"spawn xccl infer loop success, pids: {self.subprocess_pids}")
 
+            # Rank 0 only reports ready after the warmup all_reduce in
+            # xccl_infer_loop, and on backends that compile ahead of execution
+            # (Neuron) that first collective can take many minutes against a
+            # cold cache. 60s is fine for GPU but times out there, so allow an
+            # override.
+            ready_timeout = int(
+                os.environ.get("XPU_PERF_XCCL_READY_TIMEOUT_S", "60")
+            )
             try:
-                signal = self.output_queue.get(timeout=60)
+                signal = self.output_queue.get(timeout=ready_timeout)
                 if signal != "success":
                     logger.error(f"xccl infer loop failed, signal: {signal}")
                     sys.exit(-1)

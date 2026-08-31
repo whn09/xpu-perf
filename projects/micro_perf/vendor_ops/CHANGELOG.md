@@ -25,6 +25,21 @@ This changelog follows a Keep a Changelog style and semantic versioning.
 - `NEURON`: hold the `core_run()` result across `mark_step()` in `core_perf()`.
   Discarded lazy tensors are dead code and XLA pruned the op being measured,
   producing impossible results such as a gemm at 1896 TFLOPS.
+- `NEURON`: serialise `nrt_init()` across workers with a file lock in
+  `set_device()`. Workers are spawned together, and two of them reserving cores
+  on one NeuronDevice within milliseconds made *both* fail with
+  `cores busy, ret=-16`.
+
+Two supporting changes land outside `vendor_ops`, in `micro_perf/core`, because
+a NeuronCore can only be reserved by one process where a GPU can host several.
+Both default to the previous behaviour:
+
+- `XPU_PERF_ENGINES` (`core/perf_engine.py`) restricts which engines start.
+  Without it a multi-device launch puts a `ComputeEngine` and an `XCCLEngine`
+  worker on every device at once, and the second set cannot get cores.
+- `XPU_PERF_XCCL_READY_TIMEOUT_S` (`core/engine.py`) overrides the hardcoded
+  60 s wait for rank 0 to report ready, which does not fit the cold-cache
+  `neuronx-cc` compile of the warmup collective.
 
 ## [0.1.0] - 2026-04-14
 

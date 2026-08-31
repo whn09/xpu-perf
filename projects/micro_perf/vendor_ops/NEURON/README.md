@@ -13,15 +13,20 @@ directory holds the vendor op implementations and the default environment.
 > [cszhz/xpu-perf](https://github.com/cszhz/xpu-perf); that tree is preserved on
 > the `legacy-neuron` branch of this fork along with its measured results. The
 > code here is rebased onto current upstream (`src/xpu_perf/` package +
-> `ProviderRegistry` vendor mixins) and **has not yet produced a verified
-> measurement on hardware**. Numbers in the section below come from the legacy
-> branch and are carried over as expectations to check the port against, not as
-> results produced by it.
+> `ProviderRegistry` vendor mixins).
 >
-> Validated so far on a trn2.3xlarge: device discovery, `get_backend_info()`,
-> op/provider registration, `env.json` handling, report writing, and the
-> deferred-`torch_xla` import contract. Still unverified: every latency number,
-> the NKI `flash_attention` path, and all collectives.
+> Verified on a trn2.3xlarge (2026-08-31): device discovery,
+> `get_backend_info()`, op/provider registration, `env.json` handling, report
+> writing, the deferred-`torch_xla` import contract, and single-core
+> measurements for `gemm`, `add`, `softmax` and the NKI `flash_attention`
+> kernel. `gemm` lands within a few percent of the `legacy-neuron` baseline
+> measured in March, which is the check that the numbers are real — see
+> [Reference numbers](#reference-numbers-measured-on-trn23xlarge).
+>
+> Still unverified: collectives (`all_reduce` / `all_gather`) produce no
+> measurement yet. Their blockers are understood and worked around — see
+> [Collectives](#collectives) — but the warmup collective takes so long to
+> compile that no completed run has been recorded.
 
 ## Supported hardware
 
@@ -119,32 +124,44 @@ cache, MHA (`q_head_num == kv_head_num`, so no GQA), `batch_size == 1`, and
 | `all_to_all` | Needs the Mesh algorithm, unavailable when every rank sits on one NeuronDevice; requires inf2.24xlarge / trn1.32xlarge or larger |
 | `p2p` | Needs send/recv across multiple NeuronDevices |
 
-## Reference numbers (from `legacy-neuron`, trn2.3xlarge)
+## Reference numbers (measured on trn2.3xlarge)
 
-Measured 2026-03-09 on trn2.3xlarge, one NeuronCore: torch-xla 2.9.0,
-torch-neuronx 2.9.0.2.12.22436, neuronx-cc 2.23.6484. These are the targets to
-check a run against; the full set is under
-`micro_perf/benchmark/basic/**/neuron/` on that branch.
+Measured 2026-08-31 on trn2.3xlarge, one NeuronCore, by this backend: torch
+2.9.1, torch-xla 2.9.0, torch-neuronx 2.9.0.2.15.32035, neuronx-cc 2.23.6484.
+The `legacy` column is the pre-refactor branch's own run from 2026-03-09
+(neuronx-cc 2.23.6484, torch-neuronx 2.9.0.2.12.22436), kept as a cross-check.
 
-| Op | Dtype | Shape | Latency | Metric |
-|---|---|---|---|---|
-| gemm | fp32 | 1024x4096x4096 | 1,432.3 us | 24.0 TFLOPS |
-| gemm | fp16 | 1024x4096x4096 | 698.7 us | 49.2 TFLOPS |
-| gemm | bf16 | 1024x4096x4096 | 697.4 us | 49.3 TFLOPS |
-| add | bf16 | 1024x1024 | 1,026.7 us | 6.1 GB/s |
-| add | fp32 | 1024x1024 | 1,090.4 us | 11.5 GB/s |
-| softmax | bf16 | 1024x1024 | 16.8 us | 249.3 GB/s |
-| softmax | fp32 | 1024x1024 | 16.8 us | 499.4 GB/s |
+| Op | Dtype | Shape | Latency | Metric | legacy (2026-03-09) |
+|---|---|---|---|---|---|
+| gemm | fp32 | 1024x4096x4096 | 1,462.2 us | 23.5 TFLOPS | 1,432.3 us |
+| gemm | fp16 | 1024x4096x4096 | 727.9 us | 47.2 TFLOPS | 698.7 us |
+| gemm | bf16 | 1024x4096x4096 | 758.5 us | 45.3 TFLOPS | 697.4 us |
+| add | fp32 | 1024x1024 | 681.6 us | 18.5 GB/s | 1,090.4 us |
+| add | bf16 | 1024x1024 | 711.2 us | 8.8 GB/s | 1,026.7 us |
+| softmax | fp32 | 1024x1024 | 655.9 us | 12.8 GB/s | 16.8 us (see below) |
+| softmax | bf16 | 1024x1024 | 612.2 us | 6.9 GB/s | 16.8 us (see below) |
+| flash_attention | bf16 | prefill q_len=2048, 8 heads, dim 128 | 1,658.6 us | 5.2 TFLOPS | not measured |
 
-`add` really is ~60x slower than `softmax` here: at these sizes the graph launch
-dominates, and it is the shape of the number, not its size, that tells you the
-measurement is real.
+`gemm` is the number that matters for trusting a run: it agrees with the March
+baseline to within 2-9%, and it is the only op here where a wrong device or a
+pruned graph is unmistakable.
 
-Two cautions when comparing:
+At 1024x1024 both `add` and `softmax` cost 610-710 us, which is graph-launch
+time rather than memory bandwidth — the GB/s figures for them are not
+meaningful. Their agreeing with *each other* is the useful signal.
+
+Three cautions when comparing:
 
 - **`softmax` cannot detect a CPU fallback.** On this host the CPU produced
-  18.0 us against Neuron's 16.8 us. Check `gemm` — CPU and Neuron differ by
-  orders of magnitude there.
+  18.0 us. Check `gemm` — CPU and Neuron differ by orders of magnitude there.
+- **The legacy `softmax` baseline of 16.8 us is not a real measurement.** Two
+  launch-dominated ops on identically sized tensors cannot differ 60x, yet that
+  run reported `add` at 1,026 us against `softmax` at 16.8 us. The softmax
+  graph was pruned; see the dead-code note under
+  [XLA compilation dominates first-run time](#xla-compilation-dominates-first-run-time).
+  Run today, `legacy-neuron` prunes `gemm` too, reporting 17-19 us and ~1,900
+  TFLOPS for all three dtypes. Treat that branch as a record of what was run,
+  not as a trustworthy baseline.
 - Collective baselines on `legacy-neuron` were taken on **trn2.48xlarge**, not
   trn2.3xlarge, so they are not directly comparable.
 
@@ -221,6 +238,39 @@ Neuron. `perf()` therefore skips any case whose `world_size` differs from the
 launched world size, so **bench one world_size per launch** — `--device 0,1` for
 `world_size=2`, and so on.
 
+Three further constraints come from a NeuronCore being reservable by exactly one
+process, unlike a GPU. All three show up as the same misleading error, so they
+are worth recognising:
+
+```
+NRT:nrt_allocate_neuron_cores  Logical Neuron Core(s) not available -
+  Requested:lnc0-lnc0 Available:0 Logical Core size:2 (cores busy, ret=-16)
+```
+
+- **One engine at a time.** `perf_engine` starts every engine in
+  `ENGINE_TYPE_MAPPING`, so a multi-device launch puts a `ComputeEngine` worker
+  *and* an `XCCLEngine` worker on each device simultaneously. Set
+  `XPU_PERF_ENGINES=XCCLEngine` to bench collectives, and leave it unset (or
+  `ComputeEngine`) for everything else. Collectives and non-collectives
+  therefore cannot share one launch on Neuron.
+- **`nrt_init()` must not run concurrently.** Workers are spawned together, and
+  when two of them reserve cores on the same NeuronDevice within milliseconds
+  *both* fail. `set_device()` serialises them with a file lock
+  (`XPU_PERF_NEURON_INIT_LOCK`, default `/tmp/xpu_perf_neuron_init.lock`).
+- **The ready timeout has to fit a cold compile.** `XCCLEngine.start()` waits
+  for rank 0 to finish the warmup `all_reduce` in `xccl_infer_loop`, which on a
+  cold cache is tens of minutes of `neuronx-cc`. The upstream default is 60 s;
+  raise it with `XPU_PERF_XCCL_READY_TIMEOUT_S`. When it does expire the parent
+  calls `sys.exit(-1)` while its non-daemon children keep running and keep the
+  cores, so the *next* launch fails on busy cores too — clean up before retrying
+  (see [Troubleshooting](#troubleshooting)).
+
+```bash
+XPU_PERF_ENGINES=XCCLEngine XPU_PERF_XCCL_READY_TIMEOUT_S=2400 \
+    python launch.py --backend NEURON --device 0,1 \
+    --workload workloads/neuron_smoke/all_reduce.json
+```
+
 ### torch_xla import ordering
 
 Importing `torch_xla` initialises PJRT and claims the NeuronCores visible to the
@@ -256,9 +306,22 @@ neuron-ls   # confirm the cores are free
 find /var/tmp/neuron-compile-cache -name "*.lock" -delete
 ```
 
+**A timed-out collective launch leaves workers holding the cores.** The parent
+exits but its non-daemon children do not, so the next launch fails on busy cores.
+Check for strays before retrying — and note that `pkill -f launch.py` will match
+its own command line if you run it from a shell whose arguments contain that
+text, so bracket the pattern:
+
+```bash
+ps -o pid=,cmd= -u "$USER" | grep -E "[l]aunch\.py|[s]pawn_main"
+pkill -9 -f "[l]aunch\.py"; pkill -9 -f "[s]pawn_main"
+```
+
 **`NRT_FAILURE` / `Logical Neuron Core(s) not available ... (cores busy,
-ret=-16)`.** Another process owns the cores. `neuron-ls` attributes them to a
-PID, but it can miss a holder in another container, so also check directly:
+ret=-16)`.** Another process owns the cores — or, on a multi-device launch, one
+of the three single-process-per-core constraints in [Collectives](#collectives).
+`neuron-ls` attributes cores to a PID, but it can miss a holder in another
+container, so also check directly:
 
 ```bash
 sudo bash -c 'for p in /proc/[0-9]*; do for fd in $p/fd/*; do

@@ -10,10 +10,12 @@ import os
 import json
 import math
 import time
+import fcntl
 import random
 import pathlib
 import traceback
 import subprocess
+import contextlib
 import importlib.metadata
 from datetime import timedelta
 
@@ -150,11 +152,39 @@ class BackendNEURON(Backend):
         # logging warning. A benchmark that reports CPU numbers under a NEURON
         # label is worse than one that fails, so pin the device and then verify.
         os.environ.setdefault("PJRT_DEVICE", "NEURON")
-        import torch_xla  # noqa: F401
 
-        self._assert_running_on_neuron()
+        # nrt_init() must not run concurrently with another rank's. Workers are
+        # spawned together, so without this lock every rank reserving a core on
+        # the same NeuronDevice races and *all* of them fail with
+        # "Logical Neuron Core(s) not available ... (cores busy, ret=-16)".
+        # Serialising the reservation is safe: nrt_init only claims cores, and
+        # the XCCL rendezvous happens later, on first collective execution.
+        with self._nrt_init_lock():
+            import torch_xla  # noqa: F401
+
+            # Also forces PJRT initialisation inside the lock, so the core is
+            # actually reserved before the next rank starts trying.
+            self._assert_running_on_neuron()
 
         self._deferred_ccl_init()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _nrt_init_lock():
+        """Serialise NeuronCore reservation across the worker processes.
+
+        A plain file lock in a fixed location: the racing processes are
+        siblings on one host, so they only need to agree on a path.
+        """
+        lock_path = os.environ.get(
+            "XPU_PERF_NEURON_INIT_LOCK", "/tmp/xpu_perf_neuron_init.lock"
+        )
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     @staticmethod
     def _assert_running_on_neuron():

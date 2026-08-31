@@ -150,7 +150,26 @@ class XpuPerfServer:
         server_pt.add_row(["device_port", device_port, "port for device communication."])
         logger.info(f"serving config: \n{server_pt}")
 
+        # Every engine spawns one worker per device, so a multi-device launch
+        # normally has a ComputeEngine worker *and* an XCCLEngine worker open on
+        # each device at once. A GPU allows that; a NeuronCore can only be
+        # reserved by one process, so there the two engines have to be run in
+        # separate launches. XPU_PERF_ENGINES restricts which ones start.
+        enabled_engines = os.environ.get("XPU_PERF_ENGINES")
+        if enabled_engines:
+            enabled_engines = [n.strip() for n in enabled_engines.split(",") if n.strip()]
+            unknown = set(enabled_engines) - set(ENGINE_TYPE_MAPPING)
+            if unknown:
+                logger.error(
+                    f"Unknown engine(s) in XPU_PERF_ENGINES: {sorted(unknown)}, "
+                    f"expected a subset of {list(ENGINE_TYPE_MAPPING)}"
+                )
+                return 1
+
         for engine_name in ENGINE_TYPE_MAPPING:
+            if enabled_engines and engine_name not in enabled_engines:
+                logger.info(f"skip starting {engine_name}, not in XPU_PERF_ENGINES")
+                continue
             if engine_name == "XCCLEngine" and len(self.device_ids) * self.node_world_size <= 1:
                 logger.info(f"skip starting {engine_name} since device num is {len(self.device_ids)} and node_world_size is {self.node_world_size}")
                 continue
