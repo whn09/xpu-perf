@@ -25,10 +25,15 @@ This changelog follows a Keep a Changelog style and semantic versioning.
 - `NEURON`: hold the `core_run()` result across `mark_step()` in `core_perf()`.
   Discarded lazy tensors are dead code and XLA pruned the op being measured,
   producing impossible results such as a gemm at 1896 TFLOPS.
-- `NEURON`: serialise `nrt_init()` across workers with a file lock in
+- `NEURON`: serialise `nrt_init()` across independent workers with a file lock in
   `set_device()`. Workers are spawned together, and two of them reserving cores
   on one NeuronDevice within milliseconds made *both* fail with
-  `cores busy, ret=-16`.
+  `cores busy, ret=-16`. Collective ranks are exempt, since the plugin brings
+  them up together and the lock would deadlock them.
+- `NEURON`: describe the process topology to the Neuron PJRT plugin and call
+  `xm.set_replication()` in `set_device()`. Each worker sees one core, so
+  `xr.world_size()` reported 1 and `ProcessGroupXla` rejected every group wider
+  than one rank — no collective could run at all.
 
 Two supporting changes land outside `vendor_ops`, in `micro_perf/core`, because
 a NeuronCore can only be reserved by one process where a GPU can host several.

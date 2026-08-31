@@ -17,16 +17,16 @@ directory holds the vendor op implementations and the default environment.
 >
 > Verified on a trn2.3xlarge (2026-08-31): device discovery,
 > `get_backend_info()`, op/provider registration, `env.json` handling, report
-> writing, the deferred-`torch_xla` import contract, and single-core
-> measurements for `gemm`, `add`, `softmax` and the NKI `flash_attention`
-> kernel. `gemm` lands within a few percent of the `legacy-neuron` baseline
-> measured in March, which is the check that the numbers are real — see
+> writing, the deferred-`torch_xla` import contract, single-core measurements
+> for `gemm`, `add`, `softmax` and the NKI `flash_attention` kernel, and
+> two-core `all_reduce` / `all_gather`. `gemm` lands within a few percent of the
+> `legacy-neuron` baseline measured in March, which is the check that the
+> numbers are real — see
 > [Reference numbers](#reference-numbers-measured-on-trn23xlarge).
 >
-> Still unverified: collectives (`all_reduce` / `all_gather`) produce no
-> measurement yet. Their blockers are understood and worked around — see
-> [Collectives](#collectives) — but the warmup collective takes so long to
-> compile that no completed run has been recorded.
+> Measured on one NeuronDevice only (4 logical cores at LNC=2), so
+> `world_size` > 4, cross-device collectives, and the ops listed under
+> [Known unsupported](#known-unsupported) remain untested here.
 
 ## Supported hardware
 
@@ -141,6 +141,8 @@ The `legacy` column is the pre-refactor branch's own run from 2026-03-09
 | softmax | fp32 | 1024x1024 | 655.9 us | 12.8 GB/s | 16.8 us (see below) |
 | softmax | bf16 | 1024x1024 | 612.2 us | 6.9 GB/s | 16.8 us (see below) |
 | flash_attention | bf16 | prefill q_len=2048, 8 heads, dim 128 | 1,658.6 us | 5.2 TFLOPS | not measured |
+| all_reduce | bf16 | 1024x1024, world_size=2 | 659.5 us | 3.18 GB/s bus | trn2.48xlarge only |
+| all_gather | bf16 | 1024x1024, world_size=2 | 1,108.3 us | 0.95 GB/s bus | trn2.48xlarge only |
 
 `gemm` is the number that matters for trusting a run: it agrees with the March
 baseline to within 2-9%, and it is the only op here where a wrong device or a
@@ -238,6 +240,31 @@ Neuron. `perf()` therefore skips any case whose `world_size` differs from the
 launched world size, so **bench one world_size per launch** — `--device 0,1` for
 `world_size=2`, and so on.
 
+### torch_xla has to be told the world exists
+
+Each worker narrows `NEURON_RT_VISIBLE_CORES` to one core, so by default the
+Neuron PJRT plugin sees a one-device, one-process job. `ProcessGroupXla` takes
+its size from `xr.world_size()`, which then reports 1 no matter what `world_size`
+`init_process_group` was given, and `new_group()` fails with:
+
+```
+ValueError: the new group's world size should be less or equal to the world
+size set by init_process_group
+```
+
+`set_device()` fixes this in two steps, both before anything queries the world
+size (`xr.world_size()` caches its first answer):
+
+1. `NEURON_PJRT_PROCESS_INDEX`, `NEURON_PJRT_WORLD_SIZE` and
+   `NEURON_PJRT_PROCESSES_NUM_DEVICES` are exported before `torch_xla` is
+   imported, which gets the plugin to `process_count() == 2` and
+   `global_device_count() == 2`.
+2. `xm.set_replication(device, [device])` is called after the import. Without
+   it `_xla_get_replication_devices_count()` is 0 and `xr.world_size()`
+   short-circuits to 1 even though the device count is right.
+
+### One process per NeuronCore
+
 Three further constraints come from a NeuronCore being reservable by exactly one
 process, unlike a GPU. All three show up as the same misleading error, so they
 are worth recognising:
@@ -253,10 +280,14 @@ NRT:nrt_allocate_neuron_cores  Logical Neuron Core(s) not available -
   `XPU_PERF_ENGINES=XCCLEngine` to bench collectives, and leave it unset (or
   `ComputeEngine`) for everything else. Collectives and non-collectives
   therefore cannot share one launch on Neuron.
-- **`nrt_init()` must not run concurrently.** Workers are spawned together, and
-  when two of them reserve cores on the same NeuronDevice within milliseconds
-  *both* fail. `set_device()` serialises them with a file lock
-  (`XPU_PERF_NEURON_INIT_LOCK`, default `/tmp/xpu_perf_neuron_init.lock`).
+- **`nrt_init()` must not run concurrently** — for independent workers. When two
+  of them reserve cores on the same NeuronDevice within milliseconds *both*
+  fail, so `set_device()` serialises them with a file lock
+  (`XPU_PERF_NEURON_INIT_LOCK`, default `/tmp/xpu_perf_neuron_init.lock`; set it
+  to `off` to disable). Ranks of a collective launch are exempt: once the
+  topology above is set the plugin assigns their cores itself and brings them up
+  together, so holding a lock through that would deadlock — rank 0 would wait
+  for rank 1, which would be waiting for the lock.
 - **The ready timeout has to fit a cold compile.** `XCCLEngine.start()` waits
   for rank 0 to finish the warmup `all_reduce` in `xccl_infer_loop`, which on a
   cold cache is tens of minutes of `neuronx-cc`. The upstream default is 60 s;

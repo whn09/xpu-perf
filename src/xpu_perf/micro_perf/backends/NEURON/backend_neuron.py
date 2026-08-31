@@ -153,20 +153,77 @@ class BackendNEURON(Backend):
         # label is worse than one that fails, so pin the device and then verify.
         os.environ.setdefault("PJRT_DEVICE", "NEURON")
 
-        # nrt_init() must not run concurrently with another rank's. Workers are
-        # spawned together, so without this lock every rank reserving a core on
-        # the same NeuronDevice races and *all* of them fail with
+        # initialize_ccl() runs before set_device(), so the world is known here
+        # and can be described to PJRT before it initialises.
+        multi_process = False
+        if self._pending_ccl is not None:
+            _, pending_world_size = self._pending_ccl
+            multi_process = pending_world_size > 1
+            if multi_process:
+                self._configure_pjrt_topology(*self._pending_ccl)
+
+        # nrt_init() must not run concurrently with another rank's. Independent
+        # workers are spawned together, so without a lock every rank reserving a
+        # core on the same NeuronDevice races and *all* of them fail with
         # "Logical Neuron Core(s) not available ... (cores busy, ret=-16)".
-        # Serialising the reservation is safe: nrt_init only claims cores, and
-        # the XCCL rendezvous happens later, on first collective execution.
-        with self._nrt_init_lock():
+        #
+        # Once the topology above is set the plugin assigns cores across the
+        # ranks itself and brings them up together, so there the lock would
+        # deadlock instead of helping -- rank 0 would hold it while PJRT waits
+        # for rank 1, which is waiting for the lock.
+        init_context = (
+            contextlib.nullcontext() if multi_process else self._nrt_init_lock()
+        )
+        with init_context:
             import torch_xla  # noqa: F401
 
             # Also forces PJRT initialisation inside the lock, so the core is
             # actually reserved before the next rank starts trying.
             self._assert_running_on_neuron()
 
+        if multi_process:
+            self._enable_replication()
+
         self._deferred_ccl_init()
+
+    @staticmethod
+    def _enable_replication():
+        """Make torch_xla report the real world size.
+
+        ``xr.world_size()`` reports 1 unless the runtime has replication devices
+        configured, and ``ProcessGroupXla`` takes its size from there. Without
+        this, torch.distributed believes the world is 1 process wide -- whatever
+        world_size ``init_process_group`` was given -- and rejects every wider
+        group with "the new group's world size should be less or equal to the
+        world size set by init_process_group".
+
+        ``xr.world_size()`` caches its result on first call, so this has to run
+        before anything asks for it.
+        """
+        import torch_xla.core.xla_model as xm
+
+        device = xm.xla_device()
+        xm.set_replication(device, [device])
+
+    @staticmethod
+    def _configure_pjrt_topology(rank: int, world_size: int):
+        """Describe the multi-process world to the Neuron PJRT plugin.
+
+        Each worker narrows NEURON_RT_VISIBLE_CORES to one core, so without
+        this the plugin sees a single-device, single-process world and
+        ProcessGroupXla reports a world size of 1 -- whatever world_size
+        init_process_group was given. torch.distributed then rejects any group
+        wider than 1 with "the new group's world size should be less or equal
+        to the world size set by init_process_group".
+
+        Must run before torch_xla initialises PJRT.
+        """
+        os.environ.setdefault("NEURON_PJRT_PROCESS_INDEX", str(rank))
+        os.environ.setdefault("NEURON_PJRT_WORLD_SIZE", str(world_size))
+        # One NeuronCore per micro_perf device, so one device per process.
+        os.environ.setdefault(
+            "NEURON_PJRT_PROCESSES_NUM_DEVICES", ",".join(["1"] * world_size)
+        )
 
     @staticmethod
     @contextlib.contextmanager
@@ -175,10 +232,17 @@ class BackendNEURON(Backend):
 
         A plain file lock in a fixed location: the racing processes are
         siblings on one host, so they only need to agree on a path.
+
+        Set XPU_PERF_NEURON_INIT_LOCK=off to disable. That is needed if the
+        plugin ever rendezvouses across ranks during initialisation, since
+        holding a lock through it would deadlock.
         """
         lock_path = os.environ.get(
             "XPU_PERF_NEURON_INIT_LOCK", "/tmp/xpu_perf_neuron_init.lock"
         )
+        if lock_path.lower() in ("off", "0", "none", ""):
+            yield
+            return
         with open(lock_path, "w") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
