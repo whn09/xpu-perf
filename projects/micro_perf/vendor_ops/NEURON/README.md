@@ -26,10 +26,12 @@ directory holds the vendor op implementations and the default environment.
 > numbers are real — see
 > [Reference numbers](#reference-numbers-measured-on-trn23xlarge).
 >
-> Verified again on the same host (2026-09-01) on the **PyTorch-native eager
+> Verified on a second trn2.3xlarge (2026-09-01) on the **PyTorch-native eager
 > stack** (Beta 4 image, torch 2.12.1 / torch-neuronx 2.12.3 / neuronx-cc
-> 2.27.2878 / nki 0.6.0, no `torch_xla`): the same six cases, with
-> `flash_attention` running through native SDPA instead of NKI. See
+> 2.27.2878 / nki 0.6.0, host driver 2.30.2.0, no `torch_xla`): the same six
+> cases, with `flash_attention` running through native SDPA instead of NKI. Run
+> twice, on hosts whose driver did and did not match the image's expected
+> version, agreeing to within run-to-run noise. See
 > [Two runtimes](#two-runtimes).
 >
 > Measured on one NeuronDevice only (4 logical cores at LNC=2), so
@@ -137,6 +139,71 @@ library to point it at. So `flash_attention` is measured through native
 `scaled_dot_product_attention` instead — see
 [Op coverage](#op-coverage). Both providers are registered conditionally on the
 detected runtime, so exactly one is available.
+
+### Eager dispatch costs ~55-65 us per op, and that is the floor
+
+This is the one number to internalise about this runtime. Measured on
+trn2.3xlarge with a chain of `silu(x + b)` on 1024x1024 bf16 tensors, varying
+only how many ops sit in one region:
+
+| Ops in region | eager | `torch.compile(backend="neuron")` | speedup |
+|---|---|---|---|
+| 1 | 139.9 us | 102.7 us | 1.36x |
+| 4 | 512.2 us | 97.2 us | 5.27x |
+| 16 | 2,035.0 us | 205.9 us | 9.89x |
+| 64 | 8,236.4 us | 706.5 us | 11.66x |
+
+Eager scales linearly at about 64 us per op while the compiled region barely
+moves, which puts the cost squarely in dispatch, not in the arithmetic. So every
+small-op figure in [Reference numbers](#reference-numbers-measured-on-trn23xlarge)
+— `add` at 48.8 us, `softmax` at 53.8 us — is essentially *all* dispatch
+overhead. **Those numbers measure the runtime, not the chip**, and no smaller
+number is reachable on this stack. `gemm` at 1024x4096x4096 is the smallest
+shape in the table where the arithmetic clearly dominates.
+
+### torch.compile does not help micro_perf
+
+It is the obvious thing to reach for, and the measurements say no. On Neuron
+`torch.compile(backend="neuron")` is not eager-plus-fusion: it lowers through
+`torch_mlir` to StableHLO and compiles a NEFF with neuronx-cc, so it is the
+graph-compiled path again, entered through dynamo instead of LazyTensor. One
+NEFF launch costs ~95-100 us against ~55 us for one eager dispatch, and
+micro_perf times exactly one op per region — there is nothing to amortise the
+launch over:
+
+| Case | eager | compiled | speedup |
+|---|---|---|---|
+| gemm bf16 1024x4096x4096 | 282.9 us | 289.9 us | 0.98x |
+| gemm bf16 2048x4096x4096 | 530.9 us | 539.9 us | 0.98x |
+| add bf16 1024x1024 | 52.5 us | 75.5 us | 0.69x |
+| softmax bf16 1024x1024 | 55.8 us | 75.3 us | 0.74x |
+| add bf16 2048x1024 | 58.0 us | 73.0 us | 0.80x |
+| softmax bf16 2048x1024 | 68.6 us | 79.7 us | 0.86x |
+| sdpa bf16 causal 2048x8x128 | 346.5 us | 332.4 us | 1.04x |
+| sdpa bf16 causal 4096x8x128 | 780.9 us | 781.8 us | 1.00x |
+
+Large ops are unchanged (same tensor-engine kernel either way), small ops get
+20-30% *worse*, and `flash_attention` gains nothing — so compiling does not
+recover a fused attention kernel that eager SDPA was missing. A
+`torch.compile` option is therefore not offered: it would never win, and it
+would reintroduce the dead-code-elimination hazard that eager is immune to (see
+[Timing](#timing-never-use-torch_neuronxevent)) for nothing.
+
+Where it does win is fusion across many ops — the 11.6x above, and 1.27x on a
+llama-shaped `gemm -> silu -> gemm`. That is a model-level concern, and
+measuring single ops is what micro_perf is for.
+
+Two notes if you do use it here anyway:
+
+- **`dynamic=False` is mandatory.** Benchmarking the same function at two shapes
+  makes dynamo mark the varying dimension dynamic, and neuronx-cc rejects that:
+  `[NCC_EMOD025] Dynamic shape is not supported: instruction 'parameter' has
+  shape 'bf16[?,4096]'`. The error can surface at an unrelated later device
+  call, so also call `torch._dynamo.reset()` between cases.
+- Compilation is 1.4-5.1 s per graph for 8-323 nodes — minutes-to-hours faster
+  than the XLA path, but not free. `torch_neuronx.get_dynamo_metrics()` reports
+  node count and lowering/compile time per graph, which is also the cheapest way
+  to confirm a graph really was compiled and run.
 
 ### Checking a run really was on-device
 
@@ -295,20 +362,29 @@ Three cautions when comparing:
 
 ### Eager runtime
 
-Measured 2026-09-01 on the same trn2.3xlarge, one logical NeuronCore, in the
+Measured 2026-09-01 on a trn2.3xlarge, one logical NeuronCore, in the
 PyTorch-native image: torch 2.12.1, torch-neuronx 2.12.3.0.1636, neuronx-cc
-2.27.2878.0, nki 0.6.0. The `xla` column is the table above, on the same host.
+2.27.2878.0, nki 0.6.0, host driver 2.30.2.0. The `xla` column is the table
+above, taken on a second trn2.3xlarge.
 
 | Op | Dtype | Shape | Latency | Metric | `xla` latency |
 |---|---|---|---|---|---|
-| gemm | fp32 | 1024x4096x4096 | 1,024.2 us | 33.5 TFLOPS | 1,462.2 us |
-| gemm | fp16 | 1024x4096x4096 | 283.7 us | 121.1 TFLOPS | 727.9 us |
-| gemm | bf16 | 1024x4096x4096 | 279.4 us | 123.0 TFLOPS | 758.5 us |
-| add | bf16 | 1024x1024 | 48.8 us | 129.0 GB/s | 711.2 us |
-| softmax | bf16 | 1024x1024 | 53.8 us | 77.9 GB/s | 612.2 us |
-| flash_attention | bf16 | prefill q_len=2048, 8 heads, dim 128 | 544.5 us | 15.8 TFLOPS | 1,658.6 us (NKI) |
-| all_reduce | bf16 | 1024x1024, world_size=2 | 105.0 us | 20.0 GB/s bus | 659.5 us |
-| all_gather | bf16 | 1024x1024, world_size=2 | 91.5 us | 11.5 GB/s bus | 1,108.3 us |
+| gemm | fp32 | 1024x4096x4096 | 990.9 us | 34.7 TFLOPS | 1,462.2 us |
+| gemm | fp16 | 1024x4096x4096 | 305.2 us | 112.6 TFLOPS | 727.9 us |
+| gemm | bf16 | 1024x4096x4096 | 276.8 us | 124.1 TFLOPS | 758.5 us |
+| add | bf16 | 1024x1024 | 45.4 us | 138.7 GB/s | 711.2 us |
+| softmax | bf16 | 1024x1024 | 51.5 us | 81.4 GB/s | 612.2 us |
+| flash_attention | bf16 | prefill q_len=2048, 8 heads, dim 128 | 539.3 us | 15.9 TFLOPS | 1,658.6 us (NKI) |
+| all_reduce | bf16 | 1024x1024, world_size=2 | 105.3 us | 19.9 GB/s bus | 659.5 us |
+| all_gather | bf16 | 1024x1024, world_size=2 | 91.1 us | 11.5 GB/s bus | 1,108.3 us |
+
+**The host driver version turned out not to matter here.** The same sweep on a
+host whose driver was 2.x.8955.0 against the image's expected 2.30.2.0 — which
+makes the runtime log `nrta_tensor_read/write` warnings and fall back to
+synchronous tensor IO — agreed with this table to within run-to-run noise
+(gemm bf16 279.4 us, add 48.8 us, all_reduce 105.0 us). Worth knowing, since
+that warning looks alarming and is easy to mistake for the cause of a slow
+result.
 
 The eager path is faster across the board here, but read the gap carefully
 rather than as a hardware result:
@@ -524,8 +600,16 @@ of the three single-process-per-core constraints in [Collectives](#collectives).
 container, so also check directly:
 
 ```bash
-sudo bash -c 'for p in /proc/[0-9]*; do for fd in $p/fd/*; do
-  case "$(readlink "$fd" 2>/dev/null)" in *neuron*)
+sudo bash -c 'for p in /proc/[0-9]*; do for fd in "$p"/fd/*; do
+  case "$(readlink "$fd" 2>/dev/null)" in /dev/neuron*)
     echo "$(basename $p) $(tr -d "\0" < $p/cmdline)"; break;; esac; done; done'
 sudo docker ps        # a second container is an easy holder to miss
 ```
+
+Match `/dev/neuron*`, not any path containing `neuron`: the looser pattern also
+matches a process whose *own executable* lives under `/opt/aws/neuron`, which
+says nothing about the device. And note that `neuron-top` and `neuron-monitor`
+appear in this list — they open `/dev/neuron0` to read counters without
+reserving a core, so simply watching the device looks identical to using it.
+Filter them out before treating a non-empty list as "busy", or waiting for an
+idle machine will wait forever.
