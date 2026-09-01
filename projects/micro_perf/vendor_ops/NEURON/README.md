@@ -56,7 +56,16 @@ supports both:
 | Device string | `xla` | `neuron` (a privateuse1 backend) |
 | Sync | `xm.mark_step()` + `xm.wait_device_ops()` | `torch_neuronx.synchronize()` |
 | PG backend | `xla` | `neuron` |
-| First-run cost | minutes to hours of compilation per shape | none |
+| First-run cost | minutes to hours of compilation per shape | usually none, but see below |
+
+"Eager" is not a promise that `neuronx-cc` never runs. Most ops dispatch straight
+to a prebuilt kernel, but an op the runtime has no kernel for still falls back to
+building one, and that fallback is the full XLA-era compile. `gather` at
+`bfloat16` / `dim_size=8192` sat in `neuronx-cc compile module.mlir --framework
+XLA --target trn2 --lnc 2 -O1` for over two hours at 199% CPU before it was
+killed. So budget a per-shape timeout on the eager path too, and be aware that a
+run which appears hung is more likely compiling than deadlocked — check for a
+`neuronx-cc` or `walrus_driver` process before assuming the worst.
 
 `detect_neuron_runtime()` picks one by looking for `torch_xla` with
 `importlib.util.find_spec` — availability only, so the check itself never claims
@@ -302,11 +311,111 @@ copy that would land inside the timed region.
 
 ### Known unsupported
 
-| Ops | Blocker |
-|---|---|
-| 8 quantization ops (`scale_dynamic_quant`, `add_rms_norm_dynamic_quant`, `head_rms_norm_dynamic_quant`, `swiglu_dynamic_quant`, `moe_scatter_dynamic_quant`, `quant_matmul`, `moe_quant_group_gemm`, `dequant_kv_cache`) | Need int8/fp8 tensors, which Neuron XLA does not provide |
-| `all_to_all` | Needs the Mesh algorithm, unavailable when every rank sits on one NeuronDevice; requires inf2.24xlarge / trn1.32xlarge or larger |
-| `p2p` | Needs send/recv across multiple NeuronDevices |
+Two different things get conflated here easily, so they are kept apart: a case
+the *base op definition* never implemented, which no vendor can fix from a
+`vendor_ops` directory, and a case this backend genuinely cannot run. An earlier
+version of this table blamed Neuron for several rows that are actually the first
+kind; it was rewritten after sweeping every shipped workload on the eager stack.
+
+| Cases | Blocker | Whose limit |
+|---|---|---|
+| `flash_attention` with any quantized dtype (`int8`/`float8`/`mxfloat8` for q, k, or the compute dtypes) | `op_defs/llm_ops/flash_attention.py` accepts all-bfloat16 or bfloat16 + `int8` cache, and raises on everything else | base op def |
+| `quant_matmul` and `moe_quant_group_gemm` with `float8` / `mxfloat8` / `mxfloat4` / `int4` weights | both base impls accept only `int8/int8/int8 -> bfloat16` | base op def |
+| `flash_attention` with a paged cache (`block_size` set in the workload), `attn_mode=decode`, or GQA | neither the NKI `flash_fwd` kernel nor native SDPA covers those; see [flash_attention constraints](#flash_attention-constraints) | this backend |
+| `p2p` | Needs send/recv across multiple NeuronDevices | this backend |
+| `all_gather` / `all_reduce` / `all_to_all` above ~1 GiB per rank | One logical NeuronCore gets 24 GiB (96 GiB / 4 at LNC=2) and the compiler counts I/O plus an equal scratchpad, so an 8 GiB buffer asks for 32 GiB and fails with `NCC_EOOM001` | this backend (capacity) |
+
+Three corrections worth calling out, because the old table got them wrong:
+
+- **`all_to_all` runs fine on a single trn2.3xlarge.** The constraint is not the
+  instance type; it is the world size. Neuron rejects `world_size=2` outright
+  (`unsupported world size 2, supported sizes: 4, 8, 16, or multiples of 32`),
+  and a trn2.3xlarge has exactly 4 logical cores at LNC=2. Run it with
+  `--device 0,1,2,3` and all 76 cases pass.
+- **`moe_scatter_dynamic_quant`, `moe_quant_group_gemm_combine`, `quant_matmul`
+  and `moe_quant_group_gemm` all run on the eager stack** (int8 only for the last
+  two). The old row claimed Neuron cannot provide int8 tensors; that was true of
+  the XLA path and is not true here.
+- **`scale_dynamic_quant`, `add_rms_norm_dynamic_quant`,
+  `head_rms_norm_dynamic_quant`, `swiglu_dynamic_quant` and `dequant_kv_cache`
+  appear in no workload JSON in the repo.** They have never been exercised on any
+  backend, so they are untested, not unsupported. Listing them as blocked implied
+  someone had tried.
+
+### What the shipped LLM workloads actually measure
+
+Worth knowing before quoting a number from `workloads/llm/`: most of those cases
+do not run, and the ones that do often measure a reference simulation rather than
+a kernel.
+
+| Workload | Cases | Measured | Note |
+|---|---|---|---|
+| `vendor_test/flash_attention.json` | 588 | **0** | 420 rejected by the base op def, 168 by this backend (paged cache) |
+| `vendor_test_demo/flash_attention.json` | 9 | **0** | same, plus 2 `attn_mode=decode` |
+| `single_test_ops/fa_ops.json` | 11 | **0** | every case sets `block_size: 512` and GQA `[80, 8, 128]` |
+| `vendor_test/quant_matmul.json` | 736 | int8 only (184) | the other 552 are `float8`/`mxfloat8`/`mxfloat4`, rejected by the base op def |
+| `vendor_test/moe_quant_group_gemm.json` | 1380 | int8 only (276) | ditto |
+| `single_test_ops/ccl_ops.json` | — | **0** | asks for `world_size: 8`; a trn2.3xlarge has 4 logical cores |
+
+So the flash_attention figures in [Reference numbers](#reference-numbers-measured-on-trn23xlarge)
+come from `workloads/neuron_smoke/flash_attention.json`, which was written for
+this backend and is the only flash_attention workload in the repo with a runnable
+case: no `block_size`, MHA `[8, 8, 128]`, all-bfloat16.
+
+**The quantized ops are a bf16 simulation, on every backend.** `quant_matmul`,
+`moe_quant_group_gemm`, `moe_quant_group_gemm_combine` and
+`quant_group_gemm_reduce_sum` all route through `fake_quant_gemm`
+(`core/utils.py`), which casts the int8 operands **to bfloat16**, matmuls, then
+scales in fp32. No int8 arithmetic happens anywhere. `grep -rl` across
+`vendor_ops/` finds no vendor implementation of any of them, for NEURON or GPU,
+so this is what every backend reports. Two consequences:
+
+- Their TOPS figures describe `fake_quant_gemm`, not a quantized datapath. Measured
+  here: `quant_matmul` plateaus around 12-16 "TOPS", which is ~7-10% of the bf16
+  peak — about what a bf16 matmul with an int8 upcast on both operands and an fp32
+  scaling epilogue should cost.
+- `moe_quant_group_gemm` is worse than a simulation of the wrong dtype: it is a
+  Python `for` loop over experts whose slice bounds are read out of device
+  tensors, so it syncs to the host once per expert and recompiles for each
+  data-dependent shape. Its latency is **2.7 s and completely flat** from 1 token
+  to 640 tokens — a 640x range with no change, because none of the time is
+  arithmetic. Do not quote it as a MoE number for any accelerator.
+
+### Ops that run but are pathologically slow
+
+Two of the index ops are worth a warning, because they will dominate any sweep
+they are part of and their numbers say nothing about the hardware.
+
+| Op | mem_bw | Note |
+|---|---|---|
+| `embedding` | 631 GB/s | full memory bandwidth for one logical core |
+| `index_select` | 631 GB/s | same |
+| `index_add` | 98 GB/s | |
+| `gather` | **1.34 GB/s** | flat across a 256x size range; wedges the compiler at `dim_size=65536` |
+| `scatter` | **0.8 GB/s** | wedges the compiler at `dim_size=4096` |
+
+`gather` and `index_select` select rows from the same tensor and differ only in
+how the index is expressed: `IndexSelectOp` passes a 1-D index of
+`dst_batch_size` int64s, which lowers to a whole-row DMA, while `GatherOp`
+passes an index the same shape as the output (`[dst_batch_size, dim_size]`, built
+with `.view(N, 1).expand(N, dim_size)`), which lowers to per-element indexed
+access. That is the whole 470x difference — not a hardware property.
+
+Both also eventually hang the compiler outright: `neuronx-cc compile module.mlir
+--framework XLA --target trn2 --lnc 2 -O1` plus `walrus_driver` sit at ~200% CPU
+indefinitely, `gather` at `float32 dim_size=65536` and `scatter` at `float32
+dim_size=4096`. A `gather` case ran for over two hours before being killed. Give
+any run that includes these two a hard timeout, or exclude them:
+`--task embedding,index_select,scatter` style task lists are honoured by
+`parse_tasks`, so naming ops explicitly is the easy way out.
+
+One caveat on the numbers above: `GatherOp` inherits `prepare_args` from
+`IndexSelectOp`, which declares the index tensor as 1-D `[dst_batch_size]`, but
+`GatherOp.create_tensors` builds a 2-D `[dst_batch_size, dim_size]` one. The
+declared `io_bytes` therefore does not describe the tensors the op actually
+creates. Whether that costs real traffic depends on whether the backend
+materialises the stride-0 `expand`, which was not verified here — but the
+reported `mem_bw` for `gather` should be read as approximate either way.
 
 ## MFU and where the denominator comes from
 
@@ -450,6 +559,83 @@ rather than as a hardware result:
 - Unlike the XLA table, these needed no warm compile cache, and run-to-run
   spread is far narrower: there is no compilation to hit or miss.
 
+### Eager runtime, full sweep
+
+Measured 2026-09-01 on the same host and image, sweeping every workload file in
+the repo. 3,000-odd cases; the per-workload accounting of what ran and what was
+rejected is under
+[What the shipped LLM workloads actually measure](#what-the-shipped-llm-workloads-actually-measure).
+`workloads/llm/single_test_ops/ccl_ops.json` is the only file with no runnable
+case here at all — it asks for `world_size: 8`.
+
+Memory-bound ops, one logical NeuronCore. A quarter of the chip's 2.9 TB/s is
+~725 GB/s, so that is the ceiling to read these against:
+
+| Op | Best mem_bw | Cases |
+|---|---|---|
+| `device2device` | 648.7 GB/s | 76 |
+| `reduce_sum` | 639.0 GB/s | 33 |
+| `index_select` | 631.6 GB/s | 44 |
+| `embedding` | 631.5 GB/s | 44 |
+| `softmax` | 495.8 GB/s | 33 |
+| `topk` | 476.3 GB/s | 147 |
+| `reduce_max` / `reduce_min` | 177.0 / 176.6 GB/s | 33 each |
+| `index_add` | 98.4 GB/s | 66 |
+| `gather` | 1.34 GB/s | 16 of 44 (compiler wedge) |
+| `scatter` | 0.8 GB/s | 5 of 44 (compiler wedge) |
+
+`reduce_max` and `reduce_min` at 177 GB/s against `reduce_sum` at 639 is a 3.6x
+gap between three reductions over the same shapes, so the max/min lowering is
+leaving bandwidth on the table. `gather` and `scatter` are a different phenomenon
+entirely — see
+[Ops that run but are pathologically slow](#ops-that-run-but-are-pathologically-slow).
+
+Collectives, best `bus_bw` per op. The world_size=2 column comes from
+`--device 0,1` and the world_size=4 column from `--device 0,1,2,3`:
+
+| Op | ws=2 | ws=4 |
+|---|---|---|
+| `all_gather` | 64.5 GB/s | 125.1 GB/s |
+| `all_reduce` | 37.8 GB/s | 107.1 GB/s |
+| `reduce_scatter` | 91.8 GB/s | 101.7 GB/s |
+| `all_to_all` | not supported at ws=2 | 54.2 GB/s |
+| `device2host` | 14.3 GB/s | 4.2 GB/s |
+| `host2device` | 14.0 GB/s | 4.1 GB/s |
+
+Three things to know before reusing these:
+
+- **Use all four cores.** Every collective is substantially faster at world_size 4,
+  and `all_to_all` does not run at 2 at all. A world_size=2 run on a single chip
+  barely exercises the interconnect.
+- **The host-transfer rows are not comparable across the two columns.** The ws=4
+  run capped transfers at 1 GiB to stay inside the per-core HBM budget (see
+  below), while the ws=2 run reached 8 GiB, and `device2host` needs the larger
+  sizes to saturate. Four ranks also contend for the same host DMA path:
+  4.2 x 4 is in the same range as 14.3 x 2.
+- `all_to_all` has a ~360 us fixed floor that dominates everything below 8 MB,
+  then climbs to a ~40 GB/s plateau (fp32) at 256-512 MB.
+
+**The largest sizes in `workloads/xccl_ops/` do not fit.** Each file sweeps
+`batch_size` to 2,097,152 x `dim_size` 1024, i.e. 8 GiB at fp32. One logical
+NeuronCore has 24 GiB (96 GiB / 4 at LNC=2, confirmed by the runtime reporting
+`total_hbm=25769803776`), and `neuronx-cc` budgets I/O plus an equal scratchpad,
+so an 8 GiB buffer asks for 32 GiB and fails:
+
+```
+[ERROR] [NCC_EOOM001] Maximum peak HBM usage of 32.00GB exceeds HBM limit of
+24.00GB for Trn2. This consists of 16.00GB I/O tensors, 0B intermediate tensors,
+and 16.00GB internal (scratchpad) allocations
+```
+
+**And an OOM in a rank hangs the run permanently.** When `all_gather` hit the
+above, both worker processes died and became zombies while the launcher stayed in
+`sleep`, waiting for results that could never arrive — `XCCLEngine` neither
+notices a dead child nor times out. It sat there 35 minutes before being killed
+from outside. This is why the sweep script wraps every launch in a
+`docker kill`-based watchdog rather than trusting the launcher to finish. Cap
+`batch_size` at 262,144 (1 GiB at fp32, far past the bandwidth plateau) to avoid
+the situation entirely.
+
 ## How this backend differs from GPU
 
 ### XLA compilation dominates first-run time (XLA runtime)
@@ -533,6 +719,27 @@ Neuron. `perf()` therefore skips any case whose `world_size` differs from the
 launched world size, so **bench one world_size per launch** — `--device 0,1` for
 `world_size=2`, and so on.
 
+Not every world size is legal. `all_to_all` is rejected at 2:
+
+```
+unsupported world size 2, supported sizes: 4, 8, 16, or multiples of 32
+```
+
+This is a collective-library rule, not an instance-type one — a trn2.3xlarge has
+exactly 4 logical cores, so `--device 0,1,2,3` satisfies it. Prefer world_size 4
+here in general: it is the only size that runs every op, and every other
+collective is 1.1-2.8x faster at 4 than at 2. See
+[Eager runtime, full sweep](#eager-runtime-full-sweep) for both columns, and for
+the 24 GiB per-core limit that the largest `workloads/xccl_ops/` sizes exceed.
+
+**A rank that dies takes the run with it, silently and forever.** `XCCLEngine`
+has no liveness check and no timeout on the results it waits for, so when a
+worker OOMs during compilation the launcher blocks indefinitely — `ps` shows the
+workers in state `Z` and the launcher in `sleep`, with nothing on stdout after
+the last completed case. Bound collective runs from outside (a watchdog that
+`docker kill`s the container, or `timeout` on the launcher process itself)
+instead of relying on the launch to return.
+
 ### torch_xla has to be told the world exists
 
 Each worker narrows `NEURON_RT_VISIBLE_CORES` to one core, so by default the
@@ -573,6 +780,17 @@ NRT:nrt_allocate_neuron_cores  Logical Neuron Core(s) not available -
   `XPU_PERF_ENGINES=XCCLEngine` to bench collectives, and leave it unset (or
   `ComputeEngine`) for everything else. Collectives and non-collectives
   therefore cannot share one launch on Neuron.
+
+  The cost of that setting is that **an op whose engine is excluded is dropped
+  with no diagnostic at all** — it appears in the enumerated case list, then
+  produces no results, no warning, and exit code 0. This is easy to walk into
+  because engine membership does not follow the workload directory:
+  `device2device` lives in `workloads/xccl_ops/` and takes a device list like a
+  collective, but is registered `@ProviderRegistry.register_base_impl(
+  "device2device", "ComputeEngine")` (`op_defs/basic_ops/xccl_ops.py`), so under
+  `XPU_PERF_ENGINES=XCCLEngine` it silently measures nothing. Run it with
+  `ComputeEngine` and check the case count in the report against the case count
+  the launcher printed.
 - **`nrt_init()` must not run concurrently** — for independent workers. When two
   of them reserve cores on the same NeuronDevice within milliseconds *both*
   fail, so `set_device()` serialises them with a file lock

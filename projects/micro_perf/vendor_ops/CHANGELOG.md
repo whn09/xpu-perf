@@ -43,9 +43,41 @@ This changelog follows a Keep a Changelog style and semantic versioning.
   logical-core count `neuron-ls` reports — 667 / 4 = 166.75 bf16 TFLOPS per
   device on a trn2 at LNC=2. Sparse peaks are excluded (no op feeds a sparse
   operand), and int8 / fp4 report no MFU because AWS publishes no peak for them.
+- `NEURON/README.md`: added reference numbers from a full sweep of every workload
+  file in the repo on the eager runtime (trn2.3xlarge, 2026-09-01), covering the
+  memory-bound ops, both world sizes for the collectives, and a per-workload
+  accounting of how many cases each file actually measures. Three findings worth
+  reading before planning a run: `ccl_ops.json` asks for `world_size: 8` and so
+  has no runnable case on a 4-core instance; the largest `xccl_ops/` sizes (8 GiB
+  at fp32) exceed the 24 GiB a logical NeuronCore gets, and an OOM there hangs
+  the launch permanently rather than failing it; and world_size 4 is the only
+  size that runs every collective, since `all_to_all` rejects 2.
+- `NEURON/README.md`: documented the ops that run but are not worth reporting as
+  hardware results — `gather` at 1.34 GB/s and `scatter` at 0.8 GB/s against
+  `index_select`'s 631 GB/s, which is a 470x gap caused entirely by the base op
+  defs building an output-shaped index (per-element access) where `index_select`
+  passes a 1-D one (whole-row DMA), not by anything Neuron-specific.
 
 ### Fixed
 
+- `NEURON/README.md`: corrected three claims that the sweep disproved.
+  (1) The eager runtime's first-run cost was given as "none"; an op the runtime
+  has no prebuilt kernel for still falls back to a full `neuronx-cc` compile, and
+  `gather` at bf16 / `dim_size=8192` sat in one for over two hours. (2) Eight
+  quantized ops were listed as unsupported by Neuron; they are not implemented by
+  *any* vendor, the base defs gate them to `int8/int8/int8 -> bfloat16`, and that
+  path is `fake_quant_gemm` — a bf16 matmul with scale multiplies, on every
+  backend — so the numbers are not int8 hardware numbers anywhere. Four of them
+  do run on eager. (3) `all_to_all` was said to be unsupported on this instance
+  type; it is gated on world size (4, 8, 16, or multiples of 32) and runs at
+  `--device 0,1,2,3`. The "Known unsupported" table now separates a base-op-def
+  limit from a backend limit, and distinguishes untested-because-no-workload-uses-it
+  from unsupported.
+- `NEURON/README.md`: documented that an op whose engine is excluded by
+  `XPU_PERF_ENGINES` is dropped with no warning and exit code 0. Engine
+  membership does not follow the workload directory — `device2device` sits in
+  `workloads/xccl_ops/` but registers under `ComputeEngine`, so a collectives
+  launch measures none of it and reports success.
 - `NEURON`: report provider versions independently, so a missing
   `torch-neuronx` no longer discards the known `torch-xla` version.
 - `NEURON`: pin `PJRT_DEVICE=NEURON` and assert the resolved device is not CPU.
