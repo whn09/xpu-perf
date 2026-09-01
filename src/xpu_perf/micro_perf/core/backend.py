@@ -132,7 +132,19 @@ class Backend(ABC):
     def get_backend_info(self):
         raise NotImplementedError
 
-    
+
+    """
+    单个 device 在给定 compute_dtype 下的标称算力 (TFLOPS), 用于计算 MFU。
+
+    A backend that has no published figure for a dtype should return None for
+    it: summary() then omits "mfu" rather than reporting a number against a
+    guessed denominator. Not abstract, so a backend without a spec table keeps
+    working exactly as before.
+    """
+    def get_peak_tflops(self, dtype: str, index: int = 0):
+        return None
+
+
     def _load_envs(self, env_file):
         if env_file is None:
             return {}

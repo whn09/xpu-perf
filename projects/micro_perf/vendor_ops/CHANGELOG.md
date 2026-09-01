@@ -34,6 +34,15 @@ This changelog follows a Keep a Changelog style and semantic versioning.
 - `NEURON`: `all_gather` now reproduces the base `all_gather_into_tensor`
   behaviour on the eager runtime, which implements it; the `xm.all_gather`
   override applies to the XLA runtime only.
+- `NEURON`: report `peak_tflops` and `mfu`. `llm_ops.md` has always specified MFU
+  against "the corresponding nominal computing power" for the op's
+  `compute_dtype`, but no backend shipped a nominal figure, so MFU was
+  uncomputable. `Backend.get_peak_tflops(dtype)` is the new hook (returning
+  `None` by default, so backends without a spec table are unaffected), and this
+  backend fills it from AWS's published dense per-chip peaks divided by the
+  logical-core count `neuron-ls` reports — 667 / 4 = 166.75 bf16 TFLOPS per
+  device on a trn2 at LNC=2. Sparse peaks are excluded (no op feeds a sparse
+  operand), and int8 / fp4 report no MFU because AWS publishes no peak for them.
 
 ### Fixed
 

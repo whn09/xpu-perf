@@ -306,6 +306,38 @@ class BasicOp:
         return self._create_tensors_func(instance_num)
 
 
+    def mfu_dtype(self):
+        """Which dtype the matmul engine runs the math in.
+
+        MFU is achieved TFLOPS over the nominal peak *for that dtype*, so a
+        quantised op has to be scored against its compute dtype and not its
+        storage dtype: a w8a8 matmul stores int8 but the peak that matters is
+        the one for the accumulating datapath. Ops that declare a compute dtype
+        (quant_matmul, moe_*_gemm) expose it as ``compute_dtype``;
+        flash_attention splits it into a q*k and a p*v dtype and the two are
+        equal in every shipped workload, so the q*k one stands for the pair.
+        Everything else computes in its operand dtype.
+        """
+        for attr in ("compute_dtype", "qk_compute_dtype", "dtype"):
+            dtype = getattr(self, attr, None)
+            if isinstance(dtype, str) and dtype:
+                return dtype
+        return None
+
+    def _peak_tflops(self):
+        """Nominal peak for this op's compute dtype, or None if unavailable.
+
+        Never lets a missing spec table break a measurement that already
+        succeeded -- summary() runs after the timing.
+        """
+        dtype = self.mfu_dtype()
+        if not dtype or self.backend is None:
+            return None
+        try:
+            return self.backend.get_peak_tflops(dtype)
+        except Exception:
+            return None
+
     def summary(self, latency_us, kernel_mapping={}):
         target_dict = {}
         if latency_us > 0:
@@ -321,8 +353,22 @@ class BasicOp:
                 target_dict["io_bytes(B)"] = self.io_bytes
                 target_dict["mem_bw(GB/s)"] = round(self.io_bytes / latency_us / 1e3, 3)
                 target_dict["calc_flops"] = self.calc_flops
-                target_dict["calc_flops_power(tflops)"] = round(self.calc_flops / latency_us / 1e6, 3)
+                tflops = round(self.calc_flops / latency_us / 1e6, 3)
+                target_dict["calc_flops_power(tflops)"] = tflops
                 target_dict["calc_mem_ratio"] = round(self.calc_flops / self.io_bytes, 3) if self.io_bytes!= 0 else 0
+
+                # MFU, only when the backend publishes a nominal peak for this
+                # compute dtype. Absent rather than zero otherwise, so a missing
+                # spec entry cannot be mistaken for an op that achieved nothing.
+                # Skipped for ops that report no arithmetic at all (copy, cast,
+                # reorder), where 0.0 would be a property of the op rather than a
+                # result. Ops with a little arithmetic and a lot of traffic --
+                # add, softmax -- do get an MFU, and it is correctly tiny; read
+                # mem_bw for those.
+                peak_tflops = self._peak_tflops() if self.calc_flops > 0 else None
+                if peak_tflops:
+                    target_dict["peak_tflops"] = round(peak_tflops, 3)
+                    target_dict["mfu"] = round(tflops / peak_tflops, 4)
             target_dict["kernels"] = kernel_mapping
         return target_dict
 

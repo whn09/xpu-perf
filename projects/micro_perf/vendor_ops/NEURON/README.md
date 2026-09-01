@@ -308,6 +308,54 @@ copy that would land inside the timed region.
 | `all_to_all` | Needs the Mesh algorithm, unavailable when every rank sits on one NeuronDevice; requires inf2.24xlarge / trn1.32xlarge or larger |
 | `p2p` | Needs send/recv across multiple NeuronDevices |
 
+## MFU and where the denominator comes from
+
+`micro_perf` reports `mfu` = `calc_flops_power / peak_tflops`, and this backend
+supplies `peak_tflops` from `NEURON_CHIP_PEAK_TFLOPS` in `backend_neuron.py`.
+The figures are AWS's published dense peaks per *chip*, from
+`general/arch/neuron-hardware/trainium2.html`:
+
+| | trn1 (NeuronCore-v2) | trn2 (NeuronCore-v3) |
+|---|---|---|
+| FP32 | 48 TFLOPS | 181 TFLOPS |
+| BF16 / FP16 / TF32 | 191 TFLOPS | 667 TFLOPS |
+| FP8 | not published | 1,299 TFLOPS |
+
+Four things to keep in mind before quoting an MFU from here.
+
+- **The denominator is per logical NeuronCore, not per chip.** micro_perf treats
+  one logical core as one device, so the per-chip peak is divided by the number
+  of logical cores the chip reports. A trn2 chip is 8 physical NeuronCore-v3 and
+  splits into 4 logical cores at the default LNC=2, so the bf16 denominator is
+  667 / 4 = **166.75 TFLOPS** — but 83.375 at LNC=1. The split is read from
+  `neuron-ls` rather than assumed, so both are handled; check
+  `logical_neuroncore_config` in the run's `backend` block if a number surprises
+  you.
+- **Sparse peaks are excluded on purpose.** AWS also quotes 2,563 TFLOPS sparse
+  for trn2, but no micro_perf op feeds a sparse operand, so scoring against it
+  would understate every result by ~4x.
+- **int8 and fp4 have no published peak, so those ops report no MFU at all.**
+  That covers the `int8` and `mxfloat4` variants of `quant_matmul` and the
+  `moe_*_gemm` family. `mxfloat8` *is* scored, against the fp8 peak: the repo's
+  own dtype table maps `mxfloat8` onto `torch.float8_e4m3fn`, so MX there is a
+  block-scaling scheme over fp8 operands and the multiplies go through the fp8
+  datapath. If you need an int8 number, quote TOPS and leave MFU blank rather
+  than borrowing the fp8 denominator.
+- **A memory-bound op's MFU is correctly near zero, and that is not a finding.**
+  `add` at 1024x1024 counts one FLOP per element, so it reports ~0.01% MFU — the
+  arithmetic intensity is 0.5 FLOP/byte and no accelerator can do better on it.
+  Read `mem_bw(GB/s)` for those ops. Only ops reporting no arithmetic at all get
+  no MFU field. Note also that HBM bandwidth (2.9 TB/s on trn2) is a *per-chip*
+  resource shared by all four logical cores, so unlike TFLOPS there is no clean
+  per-device bandwidth denominator to divide by — one core running alone can
+  exceed a naive 1/4 share.
+
+As a cross-check on the denominator: a standalone probe (not through
+micro_perf) of a 8192x4096x4096 bf16 gemm on one logical core reached 143
+TFLOPS, i.e. 86% of 166.75 — the right shape of number for a large gemm, which
+is the main reason to believe 166.75 is the correct per-core figure rather than
+667 or 83.375.
+
 ## Reference numbers (measured on trn2.3xlarge)
 
 ### XLA runtime
@@ -317,18 +365,18 @@ Measured 2026-08-31 on trn2.3xlarge, one NeuronCore, by this backend: torch
 The `legacy` column is the pre-refactor branch's own run from 2026-03-09
 (neuronx-cc 2.23.6484, torch-neuronx 2.9.0.2.12.22436), kept as a cross-check.
 
-| Op | Dtype | Shape | Latency | Metric | legacy (2026-03-09) |
-|---|---|---|---|---|---|
-| gemm | fp32 | 1024x4096x4096 | 1,462.2 us | 23.5 TFLOPS | 1,432.3 us |
-| gemm | fp16 | 1024x4096x4096 | 727.9 us | 47.2 TFLOPS | 698.7 us |
-| gemm | bf16 | 1024x4096x4096 | 758.5 us | 45.3 TFLOPS | 697.4 us |
-| add | fp32 | 1024x1024 | 681.6 us | 18.5 GB/s | 1,090.4 us |
-| add | bf16 | 1024x1024 | 711.2 us | 8.8 GB/s | 1,026.7 us |
-| softmax | fp32 | 1024x1024 | 655.9 us | 12.8 GB/s | 16.8 us (see below) |
-| softmax | bf16 | 1024x1024 | 612.2 us | 6.9 GB/s | 16.8 us (see below) |
-| flash_attention | bf16 | prefill q_len=2048, 8 heads, dim 128 | 1,658.6 us | 5.2 TFLOPS | not measured |
-| all_reduce | bf16 | 1024x1024, world_size=2 | 659.5 us | 3.18 GB/s bus | trn2.48xlarge only |
-| all_gather | bf16 | 1024x1024, world_size=2 | 1,108.3 us | 0.95 GB/s bus | trn2.48xlarge only |
+| Op | Dtype | Shape | Latency | Metric | MFU | legacy (2026-03-09) |
+|---|---|---|---|---|---|---|
+| gemm | fp32 | 1024x4096x4096 | 1,462.2 us | 23.5 TFLOPS | 52% | 1,432.3 us |
+| gemm | fp16 | 1024x4096x4096 | 727.9 us | 47.2 TFLOPS | 28% | 698.7 us |
+| gemm | bf16 | 1024x4096x4096 | 758.5 us | 45.3 TFLOPS | 27% | 697.4 us |
+| add | fp32 | 1024x1024 | 681.6 us | 18.5 GB/s | ~0% | 1,090.4 us |
+| add | bf16 | 1024x1024 | 711.2 us | 8.8 GB/s | ~0% | 1,026.7 us |
+| softmax | fp32 | 1024x1024 | 655.9 us | 12.8 GB/s | ~0% | 16.8 us (see below) |
+| softmax | bf16 | 1024x1024 | 612.2 us | 6.9 GB/s | ~0% | 16.8 us (see below) |
+| flash_attention | bf16 | prefill q_len=2048, 8 heads, dim 128 | 1,658.6 us | 5.2 TFLOPS | 3% | not measured |
+| all_reduce | bf16 | 1024x1024, world_size=2 | 659.5 us | 3.18 GB/s bus | n/a | trn2.48xlarge only |
+| all_gather | bf16 | 1024x1024, world_size=2 | 1,108.3 us | 0.95 GB/s bus | n/a | trn2.48xlarge only |
 
 `gemm` is the number that matters for trusting a run: it agrees with the March
 baseline to within 2-9%, and it is the only op here where a wrong device or a
@@ -367,16 +415,16 @@ PyTorch-native image: torch 2.12.1, torch-neuronx 2.12.3.0.1636, neuronx-cc
 2.27.2878.0, nki 0.6.0, host driver 2.30.2.0. The `xla` column is the table
 above, taken on a second trn2.3xlarge.
 
-| Op | Dtype | Shape | Latency | Metric | `xla` latency |
-|---|---|---|---|---|---|
-| gemm | fp32 | 1024x4096x4096 | 990.9 us | 34.7 TFLOPS | 1,462.2 us |
-| gemm | fp16 | 1024x4096x4096 | 305.2 us | 112.6 TFLOPS | 727.9 us |
-| gemm | bf16 | 1024x4096x4096 | 276.8 us | 124.1 TFLOPS | 758.5 us |
-| add | bf16 | 1024x1024 | 45.4 us | 138.7 GB/s | 711.2 us |
-| softmax | bf16 | 1024x1024 | 51.5 us | 81.4 GB/s | 612.2 us |
-| flash_attention | bf16 | prefill q_len=2048, 8 heads, dim 128 | 539.3 us | 15.9 TFLOPS | 1,658.6 us (NKI) |
-| all_reduce | bf16 | 1024x1024, world_size=2 | 105.3 us | 19.9 GB/s bus | 659.5 us |
-| all_gather | bf16 | 1024x1024, world_size=2 | 91.1 us | 11.5 GB/s bus | 1,108.3 us |
+| Op | Dtype | Shape | Latency | Metric | MFU | `xla` latency |
+|---|---|---|---|---|---|---|
+| gemm | fp32 | 1024x4096x4096 | 990.9 us | 34.7 TFLOPS | 77% | 1,462.2 us |
+| gemm | fp16 | 1024x4096x4096 | 305.2 us | 112.6 TFLOPS | 68% | 727.9 us |
+| gemm | bf16 | 1024x4096x4096 | 276.8 us | 124.1 TFLOPS | 74% | 758.5 us |
+| add | bf16 | 1024x1024 | 45.4 us | 138.7 GB/s | ~0% | 711.2 us |
+| softmax | bf16 | 1024x1024 | 51.5 us | 81.4 GB/s | ~0% | 612.2 us |
+| flash_attention | bf16 | prefill q_len=2048, 8 heads, dim 128 | 539.3 us | 15.9 TFLOPS | 10% | 1,658.6 us (NKI) |
+| all_reduce | bf16 | 1024x1024, world_size=2 | 105.3 us | 19.9 GB/s bus | n/a | 659.5 us |
+| all_gather | bf16 | 1024x1024, world_size=2 | 91.1 us | 11.5 GB/s bus | n/a | 1,108.3 us |
 
 **The host driver version turned out not to matter here.** The same sweep on a
 host whose driver was 2.x.8955.0 against the image's expected 2.30.2.0 — which

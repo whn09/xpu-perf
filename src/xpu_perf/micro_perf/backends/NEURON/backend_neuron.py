@@ -69,6 +69,34 @@ def detect_neuron_runtime():
     return RUNTIME_EAGER
 
 
+# Nominal dense peak per *chip*, from the AWS Neuron architecture docs
+# (general/arch/neuron-hardware/{trainium,trainium2}.html). Sparse rates are
+# deliberately absent: no micro_perf op feeds a sparse operand, so a sparse
+# denominator would understate every result.
+#
+# Only dtypes AWS actually publishes are listed. int8 and fp4 are not published
+# for any Trainium generation, so those ops get no "mfu" field rather than a
+# number measured against a guess. The mxfloat8 aliases are included because the
+# repo's own dtype table maps them onto torch.float8_e4m3fn -- MX is a block
+# scaling scheme over fp8 operands, so the math runs through the fp8 datapath.
+NEURON_CHIP_PEAK_TFLOPS = {
+    "trn1": {
+        "float32": 48.0,
+        "tfloat32": 191.0,
+        "float16": 191.0, "half": 191.0,
+        "bfloat16": 191.0,
+    },
+    "trn2": {
+        "float32": 181.0,
+        "tfloat32": 667.0,
+        "float16": 667.0, "half": 667.0,
+        "bfloat16": 667.0,
+        "float8": 1299.0, "float8_e4m3": 1299.0, "float8_e5m2": 1299.0,
+        "mxfloat8": 1299.0, "mxfloat8_e4m3": 1299.0, "mxfloat8_e5m2": 1299.0,
+    },
+}
+
+
 class BackendNEURON(Backend):
     def __init__(self, **kwargs):
         # Patch pin_memory before any tensor work: Neuron hosts have no NVIDIA
@@ -166,6 +194,34 @@ class BackendNEURON(Backend):
 
     def clean_extra_files(self):
         pass
+
+    def _chip_family(self):
+        """trn1 / trn2 from the instance type, or None for anything else."""
+        instance_type = self.backend_info.get("device_name", "")
+        for family in ("trn2", "trn1"):
+            if instance_type.startswith(family):
+                return family
+        return None
+
+    def get_peak_tflops(self, dtype: str, index: int = 0):
+        """Nominal dense peak of one logical NeuronCore, or None if unpublished.
+
+        AWS quotes peak per chip while micro_perf treats one logical NeuronCore
+        as one device, so the per-chip figure is divided by however many logical
+        cores the chip was split into. That split is read off neuron-ls rather
+        than assumed, because it depends on LNC: a trn2 chip is 8 physical
+        NeuronCore-v3 and reports 4 logical cores at the default LNC=2, giving
+        667 / 4 = 166.75 bf16 TFLOPS per device -- but 8 and 83.375 at LNC=1.
+        """
+        chip_peak = NEURON_CHIP_PEAK_TFLOPS.get(self._chip_family(), {}).get(dtype)
+        if not chip_peak:
+            return None
+
+        chips = self.backend_info.get("neuron_device_count", 0)
+        cores = self.backend_info.get("neuron_core_count", 0)
+        if not chips or not cores:
+            return None
+        return chip_peak / (cores / chips)
 
     """
     device management related

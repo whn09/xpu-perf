@@ -55,6 +55,17 @@ For different types of operators (Compute-bound / Memory-bound), we adopt variou
 | mem_bw            | GB/s          | kernel memory bandwidth |
 | calc_flops_power  | TFLOPS / TOPS | testing kernel computing power |
 | calc_mem_ratio    | FLOPS / Byte  | algorithm roofline model |
+| peak_tflops       | TFLOPS / TOPS | nominal computing power of one device for this compute dtype |
+| mfu               | ratio         | `calc_flops_power / peak_tflops` |
+
+`peak_tflops` and `mfu` are only reported where the backend publishes a nominal
+figure for the op's compute dtype (`Backend.get_peak_tflops`). They are omitted,
+not zeroed, otherwise -- a backend with no spec table, or a dtype the vendor has
+never published a peak for, would otherwise look like an op that achieved
+nothing. The dtype used is the compute dtype (`compute_dtype`, or
+`qk_compute_dtype` for flash_attention), not the storage dtype, so a w8a8 matmul
+is scored against the datapath that does the multiplying. For a memory-bound op
+the MFU is genuinely near zero — read `mem_bw` there instead.
 
 Example:
 ```
