@@ -1,7 +1,9 @@
 # NEURON vendor ops (AWS Trainium / Inferentia)
 
 micro_perf support for AWS Trainium and Inferentia through the
-[Neuron SDK](https://awsdocs-neuron.readthedocs-hosted.com/), using PyTorch/XLA.
+[Neuron SDK](https://awsdocs-neuron.readthedocs-hosted.com/), on either of the
+two PyTorch integrations Neuron offers — PyTorch/XLA or the newer PyTorch-native
+eager stack. See [Two runtimes](#two-runtimes).
 
 The backend class lives at `src/xpu_perf/micro_perf/backends/NEURON/`; this
 directory holds the vendor op implementations and the default environment.
@@ -24,6 +26,12 @@ directory holds the vendor op implementations and the default environment.
 > numbers are real — see
 > [Reference numbers](#reference-numbers-measured-on-trn23xlarge).
 >
+> Verified again on the same host (2026-09-01) on the **PyTorch-native eager
+> stack** (Beta 4 image, torch 2.12.1 / torch-neuronx 2.12.3 / neuronx-cc
+> 2.27.2878 / nki 0.6.0, no `torch_xla`): the same six cases, with
+> `flash_attention` running through native SDPA instead of NKI. See
+> [Two runtimes](#two-runtimes).
+>
 > Measured on one NeuronDevice only (4 logical cores at LNC=2), so
 > `world_size` > 4, cross-device collectives, and the ops listed under
 > [Known unsupported](#known-unsupported) remain untested here.
@@ -34,7 +42,110 @@ directory holds the vendor op implementations and the default environment.
 - AWS Trainium — trn1 / trn1n instances
 - AWS Trainium2 — trn2 instances
 
+## Two runtimes
+
+Neuron ships two mutually exclusive PyTorch integrations, and this backend
+supports both:
+
+| | `xla` | `eager` |
+|---|---|---|
+| Dispatch | lazy, traced into HLO, compiled by `neuronx-cc` | eager, op by op |
+| Requires | `torch_xla` + `libneuronxla` (PJRT plugin) | `torch_neuronx` only |
+| Device string | `xla` | `neuron` (a privateuse1 backend) |
+| Sync | `xm.mark_step()` + `xm.wait_device_ops()` | `torch_neuronx.synchronize()` |
+| PG backend | `xla` | `neuron` |
+| First-run cost | minutes to hours of compilation per shape | none |
+
+`detect_neuron_runtime()` picks one by looking for `torch_xla` with
+`importlib.util.find_spec` — availability only, so the check itself never claims
+a NeuronCore or drags `torch_xla` into a process that is about to fork workers.
+Override with `XPU_PERF_NEURON_RUNTIME=xla|eager|auto` (default `auto`). Where
+`torch_xla` exists the XLA path is chosen, so nothing about an existing
+installation changes. The selected runtime is reported as `neuron_runtime` in
+`get_backend_info()` — check it before trusting a report.
+
+Most of this file describes the XLA path, because that is where nearly all of
+the sharp edges are. The eager path is simpler; what follows is everything that
+differs.
+
+### Running the eager stack
+
+The PyTorch-native stack currently ships as a container image rather than
+through pip. It needs `--privileged`, otherwise `import torch_neuronx` dies with
+`Failed to get Neuron instance information. Status: 1`:
+
+```bash
+docker run --rm --privileged \
+    -v "$PWD":/xpu-perf -w /xpu-perf/projects/micro_perf \
+    -e PYTHONPATH=/xpu-perf/src <native-image> \
+    python launch.py --backend NEURON --device 0 \
+    --workload workloads/neuron_smoke/gemm.json
+```
+
+The image carries no reporting dependencies, so add `prettytable jsonlines
+flask` to it (or to a derived image) first.
+
+### Timing: never use `torch_neuronx.Event`
+
+It looks like the CUDA-event equivalent and it is not one. `elapsed_time()`
+returns 25-30 us regardless of the work submitted: a 1024x4096x4096 bf16 gemm
+and an 8192x4096x4096 one both "take" ~24 us, which would be 1,154 and 11,273
+TFLOPS. It is not measuring device execution. `_core_perf_eager()` therefore
+times with `time.perf_counter_ns()` around a single
+`torch_neuronx.synchronize()`, which scales linearly with FLOPs. No keepalive
+reference is needed the way the XLA path needs one — eager dispatch has already
+executed the op by the time `core_run()` returns, so there is no graph for dead
+code elimination to prune.
+
+### Use the device string `neuron`, never `neuron:0`
+
+Under `init_process_group` the native backend sets each rank's local device
+start index to its local rank, so on rank 1 the only valid index is 1.
+`torch.empty`/`torch.randn` with `neuron:0` raise there — and `torch.full`
+*silently returns a `neuron:1` tensor*, which is worse than raising. Bare
+`neuron` always resolves to the current device, so
+`get_torch_device_name()` returns it unindexed on this runtime.
+
+### The process group comes before the device
+
+This inverts the XLA ordering. `torch_neuronx.distributed.backend`'s
+`_neuron_runtime_setup` asserts the runtime is *not* yet initialised, because it
+wants to assign cores from `LOCAL_RANK` itself, publish `NEURON_RT_ROOT_COMM_ID`
+through the store and run an nrt barrier. So on this runtime nothing may touch
+the device until `init_process_group` has returned, and the check that the
+process really is on a NeuronCore has to come *after* it rather than before.
+`LOCAL_WORLD_SIZE` must be set too, or the backend infers local rank by
+rendezvousing on IP addresses; `set_device()` defaults it from `WORLD_SIZE`.
+
+### Sub-world process groups work here
+
+Unlike the XLA path, a group narrower than the world does complete (verified
+with a `ranks=[0,1]` group in a `world_size=4` job), so the "bench one
+world_size per launch" restriction does not apply — `perf()` gates that skip on
+the XLA runtime only. `dist.all_gather_into_tensor` is also implemented, so the
+`xm.all_gather` override is unnecessary and the `all_gather` vendor op
+reproduces the base behaviour instead.
+
+### No NKI attention kernel
+
+`neuronxcc.nki.kernels.attention.flash_fwd` is traced into HLO and fails on this
+runtime deep inside the kernel with `No module named 'torch_neuronx.pyhlo'`. The
+native entry point is `torch_neuronx.wrap_nki` (note that
+`torch_neuronx.nki_kernel` is a module, not a callable), but it expects kernels
+written against the standalone `nki` package, which as of 0.6.0 ships no kernel
+library to point it at. So `flash_attention` is measured through native
+`scaled_dot_product_attention` instead — see
+[Op coverage](#op-coverage). Both providers are registered conditionally on the
+detected runtime, so exactly one is available.
+
+### Checking a run really was on-device
+
+`torch_neuronx.get_fallback_ops()` lists ops that silently ran on CPU. Across a
+basic op sweep only `aten::normal_` (tensor initialisation) falls back.
+
 ## Requirements
+
+For the XLA runtime:
 
 - Neuron SDK 2.x, `torch-neuronx` >= 2.1, `torch-xla`, `neuronx-cc`,
   `aws-neuronx-runtime-lib` — all preinstalled on the
@@ -44,7 +155,7 @@ directory holds the vendor op implementations and the default environment.
 The backend is only offered when `/dev/neuron*` exists; on a machine without the
 driver `--backend NEURON` simply is not listed.
 
-### `torch-neuronx` is not optional
+### `torch-neuronx` is not optional (XLA runtime)
 
 `torch-neuronx` is what pulls in `libneuronxla`, which ships the Neuron PJRT
 plugin (`libneuronpjrt.so`). Without it `torch_xla` finds no plugin and falls
@@ -101,13 +212,14 @@ python client.py --task all                          # terminal 2
 ## Op coverage
 
 Only three ops need vendor code; every other op in `op_defs` runs its base
-implementation on XLA unchanged, via the `base` provider.
+implementation unchanged, via the `base` provider.
 
-| Op | Provider | Why it needs an override |
-|---|---|---|
-| `gemm` | `torch` | Rejects `tfloat32` (an NVIDIA format) and `int8` (not lowered through `torch.matmul`) |
-| `all_gather` | `torch` | Base uses `dist.all_gather_into_tensor`, unimplemented on the `xla` backend; uses `xm.all_gather` |
-| `flash_attention` | `nki` | Has no base implementation at all; uses the `flash_fwd` NKI kernel |
+| Op | Provider | Runtime | Why it needs an override |
+|---|---|---|---|
+| `gemm` | `torch` | both | Rejects `tfloat32` (an NVIDIA format) and `int8` (not lowered through `torch.matmul`) |
+| `all_gather` | `torch` | both | Base uses `dist.all_gather_into_tensor`, unimplemented on the `xla` backend, so the XLA path uses `xm.all_gather`; the `neuron` backend implements it, so the eager path reproduces the base behaviour |
+| `flash_attention` | `nki` | `xla` only | Has no base implementation at all; uses the `flash_fwd` NKI kernel |
+| `flash_attention` | `torch` | `eager` only | No NKI attention kernel exists for the native stack; uses `scaled_dot_product_attention` |
 
 ### flash_attention constraints
 
@@ -115,6 +227,11 @@ implementation on XLA unchanged, via the `base` provider.
 decode with a paged KV cache is not. It also requires all-bfloat16 with a linear
 cache, MHA (`q_head_num == kv_head_num`, so no GQA), `batch_size == 1`, and
 `cache_len == 0`.
+
+The eager `torch` provider accepts exactly the same envelope so that the two
+runtimes report the same cases, even though SDPA itself is more general. GQA is
+excluded deliberately: expanding the kv heads needs a `repeat_interleave`, a real
+copy that would land inside the timed region.
 
 ### Known unsupported
 
@@ -125,6 +242,8 @@ cache, MHA (`q_head_num == kv_head_num`, so no GQA), `batch_size == 1`, and
 | `p2p` | Needs send/recv across multiple NeuronDevices |
 
 ## Reference numbers (measured on trn2.3xlarge)
+
+### XLA runtime
 
 Measured 2026-08-31 on trn2.3xlarge, one NeuronCore, by this backend: torch
 2.9.1, torch-xla 2.9.0, torch-neuronx 2.9.0.2.15.32035, neuronx-cc 2.23.6484.
@@ -174,9 +293,42 @@ Three cautions when comparing:
 - Collective baselines on `legacy-neuron` were taken on **trn2.48xlarge**, not
   trn2.3xlarge, so they are not directly comparable.
 
+### Eager runtime
+
+Measured 2026-09-01 on the same trn2.3xlarge, one logical NeuronCore, in the
+PyTorch-native image: torch 2.12.1, torch-neuronx 2.12.3.0.1636, neuronx-cc
+2.27.2878.0, nki 0.6.0. The `xla` column is the table above, on the same host.
+
+| Op | Dtype | Shape | Latency | Metric | `xla` latency |
+|---|---|---|---|---|---|
+| gemm | fp32 | 1024x4096x4096 | 1,024.2 us | 33.5 TFLOPS | 1,462.2 us |
+| gemm | fp16 | 1024x4096x4096 | 283.7 us | 121.1 TFLOPS | 727.9 us |
+| gemm | bf16 | 1024x4096x4096 | 279.4 us | 123.0 TFLOPS | 758.5 us |
+| add | bf16 | 1024x1024 | 48.8 us | 129.0 GB/s | 711.2 us |
+| softmax | bf16 | 1024x1024 | 53.8 us | 77.9 GB/s | 612.2 us |
+| flash_attention | bf16 | prefill q_len=2048, 8 heads, dim 128 | 544.5 us | 15.8 TFLOPS | 1,658.6 us (NKI) |
+| all_reduce | bf16 | 1024x1024, world_size=2 | 105.0 us | 20.0 GB/s bus | 659.5 us |
+| all_gather | bf16 | 1024x1024, world_size=2 | 91.5 us | 11.5 GB/s bus | 1,108.3 us |
+
+The eager path is faster across the board here, but read the gap carefully
+rather than as a hardware result:
+
+- **The small ops are not a hardware comparison at all.** `add` and `softmax` at
+  1024x1024 are launch-bound on both runtimes, so 49 us vs 711 us is the cost of
+  cutting and dispatching an HLO graph versus dispatching one op. It says
+  nothing about memory bandwidth.
+- **gemm is the honest comparison**, and bf16 at 2.7x is large enough to be
+  real. The two stacks have different compilers (neuronx-cc 2.27 vs 2.23), so
+  part of the gap is the compiler version rather than the dispatch model.
+- **flash_attention is not the same computation path** — native SDPA against the
+  NKI `flash_fwd` kernel — so the 3x is a comparison of two implementations,
+  not of two runtimes.
+- Unlike the XLA table, these needed no warm compile cache, and run-to-run
+  spread is far narrower: there is no compilation to hit or miss.
+
 ## How this backend differs from GPU
 
-### XLA compilation dominates first-run time
+### XLA compilation dominates first-run time (XLA runtime)
 
 Every distinct tensor shape is compiled by `neuronx-cc` on first use — 5-15
 minutes per op on inf2, hours for a full sweep. Later runs reuse
@@ -210,10 +362,14 @@ Three backend behaviours follow from this, all in `backend_neuron.py`:
 
 ### Timing and profiling
 
-There is no CUDA-event equivalent, so timing is `time.perf_counter_ns()` around
-an explicit `mark_step()` + `wait_device_ops()`. There is no kernel-level
-profiler either: the `kernels` field in results is always empty. For kernel
-detail use
+There is no usable CUDA-event equivalent on either runtime, so timing is
+`time.perf_counter_ns()` around an explicit `mark_step()` + `wait_device_ops()`
+on XLA, or around `torch_neuronx.synchronize()` on eager. The eager stack does
+expose a `torch_neuronx.Event` with an `elapsed_time()`, but it does not measure
+anything — see
+[Timing: never use `torch_neuronx.Event`](#timing-never-use-torch_neuronxevent).
+There is no kernel-level profiler either: the `kernels` field in results is
+always empty. For kernel detail use
 [Neuron Profile](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/tools/neuron-sys-tools/neuron-profile-user-guide.html)
 separately.
 
@@ -233,6 +389,12 @@ physical cores into each logical core.
 | trn2.48xlarge | 64 |
 
 ### Collectives
+
+Everything in this subsection and the two that follow it describes the XLA
+runtime; for the eager runtime see
+[The process group comes before the device](#the-process-group-comes-before-the-device)
+and [Sub-world process groups work here](#sub-world-process-groups-work-here).
+The one-process-per-NeuronCore rules below apply to both.
 
 Python object exchange (`all_gather_object`) hangs on the `xla` process group
 backend, so it runs over gloo instead. Upstream's `xccl_infer_loop` already

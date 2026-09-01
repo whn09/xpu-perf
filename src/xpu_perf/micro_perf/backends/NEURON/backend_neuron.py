@@ -1,10 +1,22 @@
 """micro_perf backend for AWS Trainium / Inferentia (Neuron SDK).
 
-torch_xla is never imported at module level. Importing it initialises the PJRT
-runtime, which claims the NeuronCores visible to the current process; if that
-happens in the parent it leaves nothing for the spawned workers. Every
-torch_xla import therefore lives inside a method that only runs in a child
-process, after ``set_device`` has narrowed ``NEURON_RT_VISIBLE_CORES``.
+Neuron ships two mutually exclusive PyTorch integrations, and this backend
+drives either one -- see ``_detect_runtime``:
+
+``xla``
+    The classic stack. Ops are traced into an XLA graph and compiled by
+    neuronx-cc via the PJRT plugin in libneuronxla.
+``eager``
+    The PyTorch-native stack (torch-neuronx >= 2.12). Ops dispatch eagerly to a
+    privateuse1 device named ``neuron``; there is no torch_xla at all.
+
+Neither runtime module is imported at module level. Importing torch_xla
+initialises PJRT, which claims the NeuronCores visible to the current process;
+if that happens in the parent it leaves nothing for the spawned workers. The
+native stack is equally eager to bind a core, and additionally refuses to
+initialise a process group once the runtime is up. Every import of either
+therefore lives inside a method that only runs in a child process, after
+``set_device`` has narrowed ``NEURON_RT_VISIBLE_CORES``.
 """
 import os
 import json
@@ -16,6 +28,7 @@ import pathlib
 import traceback
 import subprocess
 import contextlib
+import importlib.util
 import importlib.metadata
 from datetime import timedelta
 
@@ -26,11 +39,45 @@ from xpu_perf.micro_perf.core.backend import Backend
 from xpu_perf.micro_perf.core.utils import logger
 
 
+# The two PyTorch integrations Neuron offers. See detect_neuron_runtime().
+RUNTIME_XLA = "xla"
+RUNTIME_EAGER = "eager"
+
+
+def detect_neuron_runtime():
+    """Pick which Neuron PyTorch stack to drive.
+
+    Detection is by import *availability* only: find_spec locates a module
+    without executing it, so calling this cannot claim a NeuronCore or drag
+    torch_xla into a process that is about to fork workers.
+
+    A stack carrying torch_xla is treated as an XLA stack, which keeps the
+    behaviour of every previously validated environment unchanged; the native
+    path is only taken where torch_xla genuinely does not exist. Override with
+    ``XPU_PERF_NEURON_RUNTIME=xla|eager``.
+    """
+    requested = os.environ.get("XPU_PERF_NEURON_RUNTIME", "auto").strip().lower()
+    if requested in (RUNTIME_XLA, RUNTIME_EAGER):
+        return requested
+    if requested not in ("", "auto"):
+        raise ValueError(
+            f"XPU_PERF_NEURON_RUNTIME={requested!r} is not recognised; "
+            f"expected one of 'auto', {RUNTIME_XLA!r}, {RUNTIME_EAGER!r}."
+        )
+    if importlib.util.find_spec("torch_xla") is not None:
+        return RUNTIME_XLA
+    return RUNTIME_EAGER
+
+
 class BackendNEURON(Backend):
     def __init__(self, **kwargs):
         # Patch pin_memory before any tensor work: Neuron hosts have no NVIDIA
         # driver, so pin_memory() on a CPU tensor raises instead of pinning.
         self._patch_pin_memory()
+
+        # Which Neuron PyTorch stack to drive. Resolved before super().__init__
+        # because get_backend_info() reports it.
+        self._runtime = detect_neuron_runtime()
 
         # Set by set_device() in the worker process.
         self._device_index = None
@@ -41,6 +88,11 @@ class BackendNEURON(Backend):
         self._cpu_group_mapping = {}
 
         super().__init__(**kwargs)
+
+    @property
+    def neuron_runtime(self):
+        """``RUNTIME_XLA`` or ``RUNTIME_EAGER``; read by the vendor ops."""
+        return self._runtime
 
     @staticmethod
     def _patch_pin_memory():
@@ -98,10 +150,12 @@ class BackendNEURON(Backend):
                 neuron_data[0].get("logical_neuroncore_config", 1)
 
         info_dict["torch_version"] = torch.__version__
+        info_dict["neuron_runtime"] = self._runtime
         for key, package in (
             ("torch_xla_version", "torch-xla"),
             ("torch_neuronx_version", "torch-neuronx"),
             ("neuronx_cc_version", "neuronx-cc"),
+            ("nki_version", "nki"),
         ):
             try:
                 info_dict[key] = importlib.metadata.version(package)
@@ -117,6 +171,14 @@ class BackendNEURON(Backend):
     device management related
     """
     def get_torch_device_name(self):
+        if self._runtime == RUNTIME_EAGER:
+            # Deliberately unindexed. In a distributed run the native runtime
+            # sets each rank's local device start index to its local rank, so
+            # rank 1's only valid index is 1: "neuron:0" raises there for
+            # torch.empty/torch.randn -- and torch.full silently returns a
+            # neuron:1 tensor instead, which is worse than raising. Bare
+            # "neuron" always resolves to the current device.
+            return "neuron"
         return "xla"
 
     def get_device_name(self, index: int = 0):
@@ -143,24 +205,58 @@ class BackendNEURON(Backend):
     def set_device(self, index: int):
         self._device_index = index
 
-        # Must be set before torch_xla initialises PJRT, otherwise this process
-        # claims every core instead of the one it was assigned.
+        # Must be set before either runtime binds a core, otherwise this process
+        # claims every core instead of the one it was assigned. A bare index is
+        # also exactly what the native runtime's resolve_visible_cores() passes
+        # through untouched, so each rank keeps the core it was given.
         os.environ["NEURON_RT_VISIBLE_CORES"] = str(index)
 
+        # initialize_ccl() runs before set_device(), so the world is already
+        # known here -- which both runtimes need before they initialise.
+        multi_process = (
+            self._pending_ccl is not None and self._pending_ccl[1] > 1
+        )
+
+        if self._runtime == RUNTIME_EAGER:
+            self._set_device_eager(multi_process)
+        else:
+            self._set_device_xla(multi_process)
+
+    def _set_device_eager(self, multi_process: bool):
+        """Bring up the PyTorch-native runtime on the assigned core.
+
+        The ordering here is the opposite of the XLA path's. The native
+        distributed backend asserts the Neuron runtime is *not* yet initialised
+        when init_process_group is called -- it wants to assign cores, set
+        NEURON_RT_ROOT_COMM_ID from the store and run an nrt barrier itself. So
+        nothing may touch the device until the process group exists, and the
+        verification that would normally come first has to come after.
+        """
+        if multi_process:
+            # With both of these set, _set_rt_visible_cores() takes its
+            # deterministic branch instead of inferring local rank by
+            # rendezvousing on IP addresses through the store.
+            os.environ.setdefault("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1"))
+
+        # Same rationale as the XLA path: independent workers race in nrt_init
+        # and must be serialised, while ranks of one collective are brought up
+        # together by the runtime and would deadlock behind the lock.
+        init_context = (
+            contextlib.nullcontext() if multi_process else self._nrt_init_lock()
+        )
+        with init_context:
+            self._deferred_ccl_init()
+            self._assert_running_on_neuron()
+
+    def _set_device_xla(self, multi_process: bool):
         # torch_xla picks its backend at import time and, if it cannot find the
         # Neuron PJRT plugin, silently falls back to CPU with nothing but a
         # logging warning. A benchmark that reports CPU numbers under a NEURON
         # label is worse than one that fails, so pin the device and then verify.
         os.environ.setdefault("PJRT_DEVICE", "NEURON")
 
-        # initialize_ccl() runs before set_device(), so the world is known here
-        # and can be described to PJRT before it initialises.
-        multi_process = False
-        if self._pending_ccl is not None:
-            _, pending_world_size = self._pending_ccl
-            multi_process = pending_world_size > 1
-            if multi_process:
-                self._configure_pjrt_topology(*self._pending_ccl)
+        if multi_process:
+            self._configure_pjrt_topology(*self._pending_ccl)
 
         # nrt_init() must not run concurrently with another rank's. Independent
         # workers are spawned together, so without a lock every rank reserving a
@@ -250,11 +346,16 @@ class BackendNEURON(Backend):
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-    @staticmethod
-    def _assert_running_on_neuron():
-        """Fail loudly if torch_xla did not actually bind to a NeuronCore.
+    def _assert_running_on_neuron(self):
+        """Fail loudly if the runtime did not actually bind to a NeuronCore."""
+        if self._runtime == RUNTIME_EAGER:
+            return self._assert_running_on_neuron_eager()
+        return self._assert_running_on_neuron_xla()
 
-        The plugin lives in libneuronxla, which is pulled in by torch-neuronx.
+    @staticmethod
+    def _assert_running_on_neuron_xla():
+        """The PJRT plugin lives in libneuronxla, pulled in by torch-neuronx.
+
         Stacks that ship only libtorch-neuronx-lite (the vLLM inference venv,
         for one) have no plugin at all and resolve every device to CPU.
         """
@@ -271,17 +372,48 @@ class BackendNEURON(Backend):
                 "--extra-index-url=https://pip.repos.neuron.amazonaws.com"
             )
 
+    @staticmethod
+    def _assert_running_on_neuron_eager():
+        """Confirm the native device exists and actually executes.
+
+        The native stack cannot silently degrade to CPU the way torch_xla can
+        -- importing torch_neuronx without a visible device raises outright --
+        but it can fall back per-op, so run something and check where the
+        result landed rather than trusting the device object.
+        """
+        import torch_neuronx
+
+        probe = torch.ones(8, 8, device="neuron")
+        result = (probe @ probe).sum()
+        torch_neuronx.synchronize()
+        if result.device.type != "neuron" or result.item() != 512.0:
+            raise EnvironmentError(
+                f"the native Neuron device produced {result.item()} on "
+                f"{result.device} instead of 512.0 on a neuron device, so "
+                "measurements would not be Neuron measurements."
+            )
+
     def get_device(self):
+        if self._runtime == RUNTIME_EAGER:
+            import torch_neuronx
+            return torch.device("neuron", torch_neuronx.current_device())
         import torch_xla.core.xla_model as xm
         return xm.xla_device()
 
     def device_synchronize(self):
+        if self._runtime == RUNTIME_EAGER:
+            import torch_neuronx
+            torch_neuronx.synchronize()
+            return
+        # mark_step cuts the graph, wait_device_ops blocks until it has run.
         import torch_xla.core.xla_model as xm
         xm.mark_step()
         xm.wait_device_ops()
 
     def empty_cache(self):
-        pass
+        if self._runtime == RUNTIME_EAGER:
+            import torch_neuronx
+            torch_neuronx.empty_cache()
 
     """
     ccl related
@@ -290,16 +422,21 @@ class BackendNEURON(Backend):
         return dist
 
     def get_dist_backend(self):
+        if self._runtime == RUNTIME_EAGER:
+            return "neuron"
         return "xla"
 
     def initialize_ccl(self, rank: int, world_size: int):
         """Record the request; the real init happens in set_device().
 
-        xccl_infer_loop calls initialize_ccl() before set_device(), but the
-        "xla" process group backend needs torch_xla imported, and torch_xla
-        must not be imported before NEURON_RT_VISIBLE_CORES is narrowed. So the
-        init is deferred by one step. Both calls happen on every rank, in the
-        same order, so the process group is still formed collectively.
+        xccl_infer_loop calls initialize_ccl() before set_device(), but neither
+        runtime can form a process group this early: the "xla" backend needs
+        torch_xla imported, which must not happen before
+        NEURON_RT_VISIBLE_CORES is narrowed, and the native "neuron" backend
+        assigns cores itself and so must run *after* that narrowing too. The
+        init is therefore deferred by one step. Both calls happen on every
+        rank, in the same order, so the process group is still formed
+        collectively.
         """
         self._pending_ccl = (rank, world_size)
         if self._device_index is not None:
@@ -313,8 +450,16 @@ class BackendNEURON(Backend):
         rank, world_size = self._pending_ccl
         self._pending_ccl = None
 
-        # Registers the "xla" backend with torch.distributed.
-        import torch_xla.distributed.xla_backend  # noqa: F401
+        if self._runtime == RUNTIME_EAGER:
+            # Registers the "neuron" backend with torch.distributed. Importing
+            # it also arranges for init_process_group to assign this rank's
+            # core, publish NEURON_RT_ROOT_COMM_ID through the store and run an
+            # nrt barrier -- all of which it refuses to do if the Neuron
+            # runtime is already up, hence the ordering in _set_device_eager.
+            import torch_neuronx.distributed.backend  # noqa: F401
+        else:
+            # Registers the "xla" backend with torch.distributed.
+            import torch_xla.distributed.xla_backend  # noqa: F401
 
         dist.init_process_group(
             backend=self.get_dist_backend(),
@@ -337,22 +482,18 @@ class BackendNEURON(Backend):
             )
 
     def op_group_barrier(self, op_group=None, group_size=1):
-        import torch_xla.core.xla_model as xm
         if dist.is_initialized() and group_size > 1:
             dist.all_reduce(
                 torch.tensor([1], dtype=torch.int32, device=self.get_torch_device_name()),
                 op=dist.ReduceOp.SUM,
                 group=op_group
             )
-            xm.mark_step()
-            xm.wait_device_ops()
+            self.device_synchronize()
 
     """
     perf related
     """
     def perf(self, op_instance):
-        import torch_xla.core.xla_model as xm
-
         # XLA collectives on a sub-group whose members are only part of the
         # world do not complete on Neuron, so a case narrower than the launched
         # world is reported as skipped instead of being run. Returning a
@@ -360,7 +501,15 @@ class BackendNEURON(Backend):
         # loops already treat as "this case produced nothing" -- and the loops
         # exchange that verdict over gloo, so no rank is left waiting.
         # Bench one world_size per launch, e.g. --device 0,1 for world_size=2.
-        if op_instance.group_size > 1 and dist.is_initialized():
+        #
+        # The native runtime has no such limitation: a group narrower than the
+        # world reduces correctly there, so one launch can cover every
+        # world_size up to the device count.
+        if (
+            self._runtime == RUNTIME_XLA
+            and op_instance.group_size > 1
+            and dist.is_initialized()
+        ):
             world_size = dist.get_world_size()
             if op_instance.group_size != world_size:
                 logger.warning(
@@ -384,9 +533,11 @@ class BackendNEURON(Backend):
         try:
             # Each XLA graph has to be compiled by neuronx-cc before it runs,
             # which dominates wall clock. Favour a few long iterations over
-            # many short ones: a 1 s budget capped at 10 iterations.
+            # many short ones: a 1 s budget capped at 10 iterations. Eager
+            # dispatch pays no such per-graph cost, so it can afford the
+            # iterations that bring the run-to-run spread down.
             min_test_iters = 2
-            max_test_iters = 10
+            max_test_iters = 50 if self._runtime == RUNTIME_EAGER else 10
             max_test_time = 1e6     # 1 s
 
             max_data_cnt = 1
@@ -407,20 +558,21 @@ class BackendNEURON(Backend):
             # count produces one long clone chain in the HLO. At the GPU
             # default of up to 256 copies that graph exceeds 10 MB and takes
             # neuronx-cc over five minutes to compile. Four copies is plenty
-            # here anyway -- the copies exist to defeat a CPU cache that
-            # NeuronCores do not have.
+            # on either runtime anyway -- the copies exist to defeat a CPU
+            # cache that NeuronCores do not have.
             max_data_cnt = min(max_data_cnt, 4)
 
             tensor_list = op_instance.create_tensors(max_data_cnt)
             random.shuffle(tensor_list)
 
-            # Materialise the tensors now so they stop being pending lazy ops.
-            # Otherwise the first clone carries "empty -> clone -> op" while
-            # later ones carry "empty -> op": different graphs, so every few
-            # warmup iterations triggers a fresh compile, and neuronx-cc
+            # On XLA, materialise the tensors now so they stop being pending
+            # lazy ops. Otherwise the first clone carries "empty -> clone -> op"
+            # while later ones carry "empty -> op": different graphs, so every
+            # few warmup iterations triggers a fresh compile, and neuronx-cc
             # intermittently fails with "type must be number, but is null".
-            xm.mark_step()
-            xm.wait_device_ops()
+            # Eager has no pending ops to flush, so this just waits for the
+            # copies to land.
+            self.device_synchronize()
 
             latency_us, _ = self.core_perf(op_instance, 2, 2, tensor_list, profiling=False)
 
@@ -434,7 +586,7 @@ class BackendNEURON(Backend):
 
             if op_instance.group_size > 1:
                 # Over gloo, not op_instance.op_group: all_gather_object on the
-                # xla backend hangs. See _deferred_ccl_init().
+                # device backend hangs. See _deferred_ccl_init().
                 cpu_group = self._cpu_group_mapping.get(op_instance.group_size)
                 prefer_iters_list = [None for _ in range(op_instance.group_size)]
                 dist.all_gather_object(prefer_iters_list, prefer_iters, group=cpu_group)
@@ -460,6 +612,62 @@ class BackendNEURON(Backend):
         warmup_iterations, prefer_iterations,
         tensor_list,
         profiling=True
+    ):
+        # Neither runtime offers a kernel-level profiler, so profiling is
+        # ignored and the kernel breakdown is always empty (see README).
+        if self._runtime == RUNTIME_EAGER:
+            return self._core_perf_eager(
+                op_instance, warmup_iterations, prefer_iterations, tensor_list
+            )
+        return self._core_perf_xla(
+            op_instance, warmup_iterations, prefer_iterations, tensor_list
+        )
+
+    def _core_perf_eager(
+        self, op_instance,
+        warmup_iterations, prefer_iterations,
+        tensor_list
+    ):
+        """Time an eager op with the wall clock around one synchronize.
+
+        Do not be tempted to use torch_neuronx.Event here. On trn2 with
+        torch-neuronx 2.12.3 its elapsed_time() sits at 25-30 us no matter how
+        much work the loop submits -- a 1024x4096x4096 bf16 gemm and an
+        8192x4096x4096 one both "take" ~24 us, which would be 1,154 and 11,273
+        TFLOPS respectively. It is not measuring device execution. Wall clock
+        around a single synchronize() scales linearly with the work and lands on
+        believable numbers, so that is what is used.
+
+        No keepalive is needed, unlike the XLA path: eager dispatch has already
+        executed the op by the time core_run returns, so dropping the result
+        cannot delete the work.
+        """
+        import torch_neuronx
+
+        op_group = op_instance.op_group
+        group_size = op_instance.group_size
+
+        self.op_group_barrier(op_group=op_group, group_size=group_size)
+        torch_neuronx.synchronize()
+
+        for i in range(warmup_iterations):
+            op_instance.core_run(tensor_list[i % len(tensor_list)])
+        torch_neuronx.synchronize()
+
+        self.op_group_barrier(op_group=op_group, group_size=group_size)
+
+        start_time = time.perf_counter_ns()
+        for i in range(prefer_iterations):
+            op_instance.core_run(tensor_list[i % len(tensor_list)])
+        torch_neuronx.synchronize()
+        end_time = time.perf_counter_ns()
+
+        return (end_time - start_time) / 1e3 / prefer_iterations, []
+
+    def _core_perf_xla(
+        self, op_instance,
+        warmup_iterations, prefer_iterations,
+        tensor_list
     ):
         import torch_xla.core.xla_model as xm
 

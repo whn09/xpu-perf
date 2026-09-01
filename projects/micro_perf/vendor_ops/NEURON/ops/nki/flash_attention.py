@@ -1,7 +1,23 @@
 from xpu_perf.micro_perf.core.op import ProviderRegistry
 
 
+from xpu_perf.micro_perf.backends.NEURON.backend_neuron import (
+    RUNTIME_XLA,
+    detect_neuron_runtime,
+)
+
 try:
+    # The bundled neuronxcc kernels are traced into HLO, so they only run on the
+    # XLA runtime; on the PyTorch-native stack the call fails deep inside the
+    # kernel with "No module named 'torch_neuronx.pyhlo'". Deciding that at
+    # registration time means flash_attention is reported as having no
+    # implementation there, rather than failing case by case. The native stack's
+    # own NKI entry point (torch_neuronx.wrap_nki) expects kernels written
+    # against the newer standalone `nki` package, which as of nki 0.6.0 ships no
+    # attention kernel to point it at.
+    if detect_neuron_runtime() != RUNTIME_XLA:
+        raise ImportError("neuronxcc NKI kernels require the XLA runtime")
+
     from neuronxcc.nki.kernels.attention import flash_fwd, FlashConfig
 
     # Hardware kernel shipped with neuronx-cc, invoked through NKI.
