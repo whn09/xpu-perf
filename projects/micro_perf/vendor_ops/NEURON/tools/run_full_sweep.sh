@@ -33,7 +33,7 @@
 # could write its CSVs.
 set -u
 
-IMAGE=${IMAGE:-xpu-perf-beta4:latest}
+IMAGE=${IMAGE:-xpu-perf-eager:latest}
 REPO=${REPO:-$(cd ../.. && pwd)}          # repo root, mounted at /xpu-perf
 LOG=${LOG:-/tmp/neuron_sweep.log}
 RESULTS=${RESULTS:-/tmp/sweep_results}

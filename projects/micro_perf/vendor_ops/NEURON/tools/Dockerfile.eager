@@ -11,7 +11,7 @@
 #
 #   aws ecr get-login-password --region us-east-1 \
 #       | docker login --username AWS --password-stdin 421672808698.dkr.ecr.us-east-1.amazonaws.com
-#   docker build -f Dockerfile.eager -t xpu-perf-beta4:latest .
+#   docker build -f Dockerfile.eager -t xpu-perf-eager:latest .
 FROM 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
 
 RUN pip install --no-cache-dir prettytable jsonlines flask

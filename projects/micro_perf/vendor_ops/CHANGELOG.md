@@ -52,6 +52,14 @@ This changelog follows a Keep a Changelog style and semantic versioning.
   at fp32) exceed the 24 GiB a logical NeuronCore gets, and an OOM there hangs
   the launch permanently rather than failing it; and world_size 4 is the only
   size that runs every collective, since `all_to_all` rejects 2.
+- `NEURON/IMPLEMENTATION.md`: split out of the README, which had grown to 933
+  lines with Quick start buried at line 264 behind the runtime internals. The
+  README now runs Quick start -> reference numbers -> how to read them ->
+  reproducing -> troubleshooting, and this file holds why the backend code is
+  shaped the way it is (dispatch model, compilation behaviour, collective
+  plumbing, and the bug each guard rail prevents). Nothing was dropped in the
+  split; the README also gained a symptom-indexed troubleshooting section, since
+  several failure modes were previously only findable inside prose.
 - `NEURON/tools/`: the harness that produced those numbers, so the sweep is
   reproducible rather than just described. `Dockerfile.eager` (the native image
   plus the reporting deps `launch.py` needs), `run_full_sweep.sh` (per-workload
