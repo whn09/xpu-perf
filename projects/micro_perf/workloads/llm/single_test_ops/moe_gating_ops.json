@@ -1,0 +1,22 @@
+{
+    "moe_softmax_topk": [
+        {
+            "arg_type": "llm",
+            "dtype": [
+                "float32"
+            ],
+            "compute_mode": [
+                "pre-softmax", "post-softmax"
+            ],
+            "num_experts.topk": [
+                [8, 2],
+                [64, 8],
+                [128, 8],
+                [256, 8]
+            ],
+            "num_tokens": [
+                1, 16, 128, 1024, 4096, 16384, 32768
+            ]
+        }
+    ]
+}

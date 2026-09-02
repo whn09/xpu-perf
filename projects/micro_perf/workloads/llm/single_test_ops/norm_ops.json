@@ -1,0 +1,77 @@
+{
+    "add_rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": [
+                "bfloat16"
+            ],
+            "num_tokens": [
+                1, 16, 128, 1024, 4096, 16384, 32768
+            ],
+            "hidden_size": [
+                4096, 8192
+            ]
+        }
+    ],
+    "add_rms_norm_dynamic_quant": [
+        {
+            "arg_type": "llm",
+            "dtype.dst_dtype": [
+                ["bfloat16", "int8"]
+            ],
+            "output_mode": [
+                "none", "res"
+            ],
+            "num_tokens": [
+                1, 16, 128, 1024, 4096, 16384, 32768
+            ],
+            "hidden_size": [
+                4096, 8192
+            ]
+        }
+    ],
+    "head_rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": [
+                "float32", "bfloat16"
+            ],
+            "total_head_num.head_dim.norm_head_start.norm_head_num": [
+                [96, 128, 0, 80],
+                [96, 128, 80, 8]
+            ],
+            "num_tokens": [
+                1, 16, 128, 1024, 4096, 16384, 32768
+            ]
+        }
+    ],
+    "head_rms_norm_dynamic_quant": [
+        {
+            "arg_type": "llm",
+            "dtype.dst_dtype": [
+                ["bfloat16", "int8"]
+            ],
+            "head_num.head_dim": [
+                [80, 128],
+                [8, 128]
+            ],
+            "num_tokens": [
+                1, 16, 128, 1024, 4096, 16384, 32768
+            ]
+        }
+    ],
+    "qk_rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": [
+                "float32", "bfloat16"
+            ],
+            "q_head_num.kv_head_num.qk_head_dim": [
+                [80, 8, 128]
+            ],
+            "num_tokens": [
+                1, 16, 128, 1024, 4096, 16384, 32768
+            ]
+        }
+    ]
+}

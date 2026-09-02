@@ -1,0 +1,64 @@
+{
+    "swiglu": [
+        {
+            "arg_type": "llm",
+            "dtype": [
+                "float32", "float16", "bfloat16"
+            ],
+            "num_tokens": [
+                1, 16, 128, 1024, 4096, 16384, 32768
+            ],
+            "hidden_size": [
+                4096, 8192
+            ]
+        }
+    ],
+    "swiglu_dynamic_quant": [
+        {
+            "arg_type": "llm",
+            "dtype.dst_dtype": [
+                ["bfloat16", "int8"]
+            ],
+            "num_tokens": [
+                1, 16, 128, 1024, 4096, 16384, 32768
+            ],
+            "hidden_size": [
+                4096, 8192
+            ]
+        }
+    ],
+    "moe_swiglu": [
+        {
+            "arg_type": "llm",
+            "dtype": [
+                "bfloat16"
+            ],
+            "num_experts.topk.ep_size": [
+                [128, 8, 8]
+            ],
+            "num_tokens": [
+                1024, 4096, 10240
+            ],
+            "hidden_size": [
+                4096
+            ]
+        }
+    ],
+    "moe_swiglu_dynamic_quant": [
+        {
+            "arg_type": "llm",
+            "dtype.dst_dtype": [
+                ["bfloat16", "int8"]
+            ],
+            "num_experts.topk.ep_size": [
+                [128, 8, 8]
+            ],
+            "num_tokens": [
+                1024, 4096, 10240
+            ],
+            "hidden_size": [
+                4096
+            ]
+        }
+    ]
+}

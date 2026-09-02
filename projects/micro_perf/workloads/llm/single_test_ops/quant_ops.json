@@ -1,0 +1,31 @@
+{
+    "scale_dynamic_quant": [
+        {
+            "arg_type": "llm",
+            "dtype.dst_dtype": [
+                ["bfloat16", "int8"]
+            ],
+            "num_tokens": [
+                1, 16, 128, 1024, 4096, 16384, 32768
+            ],
+            "hidden_size": [
+                4096, 8192
+            ]
+        }
+    ],
+    "quant_group_gemm_reduce_sum": [
+        {
+            "arg_type": "llm",
+            "dtype.dst_dtype": [
+                ["int8", "bfloat16"],
+                ["float8", "bfloat16"]
+            ],
+            "sp_size.hidden_size.new_hidden_size": [
+                [8, 8192, 8192]
+            ],
+            "num_tokens": [
+                48, 8192
+            ]
+        }
+    ]
+}

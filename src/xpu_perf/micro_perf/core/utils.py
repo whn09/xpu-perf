@@ -625,7 +625,11 @@ def smooth_per_token_dynamic_quant(
     per_token_scale = per_token_max * max_dtype_val
 
     # [num_tokens, hidden_size], quantized
-    quant_tokens_fp32 = torch.mul(smooth_scale, per_token_scale).clamp(-max_dtype_val, max_dtype_val)
+    # NB: this multiplies smoothed_input, not smooth_scale. Scaling smooth_scale
+    # [1, hidden_size] by per_token_scale [num_tokens, 1] also broadcasts to
+    # [num_tokens, hidden_size] and so does not fail, but the result would not
+    # depend on hidden_states at all.
+    quant_tokens_fp32 = torch.mul(smoothed_input, per_token_scale).clamp(-max_dtype_val, max_dtype_val)
     if dst_torch_dtype == torch.int8:
         quant_tokens_fp32 = quant_tokens_fp32.round()
 
