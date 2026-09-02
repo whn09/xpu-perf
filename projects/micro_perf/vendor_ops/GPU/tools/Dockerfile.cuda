@@ -1,0 +1,40 @@
+# CUDA image for the GPU backend, sized for a Hopper card (H100 / H200).
+#
+# The GPU backend itself needs nothing beyond torch + CUDA, but three vendor
+# providers are optional imports guarded by try/except, and without them the
+# corresponding ops silently report no result rather than failing:
+#
+#   flash_attn   -> the `fa2` provider for `flash_attention`. This one is not
+#                   optional in practice: op_defs/llm_ops/flash_attention.py has
+#                   no base implementation (it raises NotImplementedError), so
+#                   with no flash_attn installed *every* flash_attention case is
+#                   skipped and the sweep reports success having measured none.
+#   flashinfer   -> a second `rms_norm` provider, useful as a cross-check against
+#                   the base one rather than as the headline number.
+#   vllm         -> a third `rms_norm` provider, same role.
+#
+# prettytable / jsonlines / flask are what launch.py imports for reporting.
+#
+#   docker build -f Dockerfile.cuda -t xpu-perf-cuda:latest .
+#
+# Pin the base tag to whatever the comparison run should be reproducible against;
+# 25.01 ships torch 2.6 and CUDA 12.8, which have working fp8 _scaled_mm on sm90.
+FROM nvcr.io/nvidia/pytorch:25.01-py3
+
+RUN pip install --no-cache-dir prettytable jsonlines flask
+
+# flash-attn builds CUDA extensions and is slow to compile from source; the
+# prebuilt wheels only match specific torch/CUDA/ABI triples, so let pip resolve
+# it against whatever torch the base image pinned rather than pinning a version
+# here. MAX_JOBS caps a build that otherwise OOMs a 16 vCPU box.
+RUN MAX_JOBS=4 pip install --no-cache-dir --no-build-isolation flash-attn
+
+# Both are genuinely optional -- a failure here should not fail the image.
+RUN pip install --no-cache-dir flashinfer-python || \
+    echo "flashinfer not installed; its rms_norm provider will not register"
+RUN pip install --no-cache-dir vllm || \
+    echo "vllm not installed; its rms_norm provider will not register"
+
+# Fail the build rather than the sweep if the one non-optional provider is
+# missing, since a missing flash_attn is invisible at run time.
+RUN python -c "import flash_attn; print('flash_attn', flash_attn.__version__)"
