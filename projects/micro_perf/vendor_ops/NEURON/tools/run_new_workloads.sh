@@ -153,6 +153,13 @@ run_one single_fa_linear_ops 21600 0 - \
 # 2026-09-01 table.
 run_one gemm_fp8 28800 0 - --workload $W/basic/tensor_gemm_ops/gemm.json
 
+# A one-core run of the *same task_dir*, which is the only thing chip4_gemm can be
+# compared against per shape. The 2026-09-01 sweep's per-case gemm jsonl no longer
+# exists on disk, and comparing chip4's peak to a published peak only shows that the
+# best case is unchanged -- it cannot show whether some particular shape degrades.
+# Skip it only if you already have a matched single-core tree.
+run_one core1_gemm 28800 0 - --task_dir $W/basic/tensor_gemm_ops --task all
+
 # All four logical cores. See run_full_sweep.sh section 7 for what this does and
 # does not measure -- in short, four independent cases in flight, so these are
 # single-core latencies under three-way HBM contention.
@@ -160,6 +167,19 @@ run_one chip4_gemm 7200 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
     --task_dir $W/basic/tensor_gemm_ops --task all
 run_one chip4_mem  5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
     --task_dir $W/basic/vector_linear_ops --task all
+
+# Selection and sorting, one core and four, because these are the two ops where a
+# Neuron core is within 8-32% of a whole H100 (see ../../GPU/README.md) and the
+# per-chip claim therefore rests entirely on whether they scale. chip4_mem shows
+# elementwise work scales at 1.00-1.02x, but topk and moe_softmax_topk are not
+# elementwise -- they are the ops most likely to serialise on something shared, so
+# the x4 has to be measured rather than carried over. Both are cheap: the whole
+# 56-case moe_gating file takes 123 s here (the same file takes an H100 1,191 s).
+run_one core1_reduction 5400 0       - --task_dir $W/basic/vector_reduction_ops --task all
+run_one chip4_reduction 5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
+    --task_dir $W/basic/vector_reduction_ops --task all
+run_one chip4_moe       5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
+    --workload "$W/llm/single_test_ops/moe_gating_ops.json"
 
 echo ""
 echo "=============== new-workload sweep finished $(date -Is) ==============="

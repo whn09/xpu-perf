@@ -603,13 +603,31 @@ only measured quantity is the end-to-end ratio in the table.
 The practical consequences:
 
 - **Do not quote these six as quantisation performance for any accelerator.** They
-  measure a helper, and they would be similarly bad on a GPU. If you need a real
-  per-token dynamic-quant number, fuse the helper first.
-- The reported figures **understate** the op slightly rather than flattering it:
-  an earlier version of the helper multiplied `smooth_scale` by `per_token_scale`
+  measure a helper. If you need a real per-token dynamic-quant number, fuse the
+  helper first.
+- **The helper is most of the problem but not all of it — that is now measured,
+  not assumed.** An earlier version of this section claimed the six "would be
+  similarly bad on a GPU"; the same code has since been run on an H100 SXM5, and
+  "similarly" was too strong. There, the same helper reaches only **73.4-178.7
+  GB/s, i.e. 2.2-5.3% of a 3.35 TB/s HBM peak**, and is 3-14x slower than the
+  corresponding unquantised op on the same hardware — so it is genuinely bad on a
+  well-served backend, and the shared algorithm is the dominant cause. But a
+  logical NeuronCore gets 0.15-0.33% of *its* peak on the same shapes, which is
+  another **4-23x down** (median per matched shape, by op). So roughly one order of
+  magnitude is the helper and one is Neuron-specific lowering on top. Full table
+  in [`../GPU/README.md`](../GPU/README.md#norm-activation-and-moe-ops).
+- An earlier version of the helper multiplied `smooth_scale` by `per_token_scale`
   instead of `smoothed_input`, which broadcasts to the same shape and so never
-  failed, but made the output independent of `hidden_states`. That is fixed, and
-  the fix makes the op marginally *more* work.
+  failed, but made the output independent of `hidden_states`. That is fixed. The
+  fix reads a `[num_tokens, hidden_size]` operand where the buggy version read a
+  `[1, hidden_size]` one, so it is strictly *more* work — but re-running all
+  eleven affected ops measured a per-shape median of **0.98-1.01x**, i.e. the
+  change is performance-neutral within noise. Every figure in this section was
+  taken before the fix and remains valid as a performance number.
+- **Precision here is one significant figure.** At 1-2 GB/s these ops take
+  hundreds of ms per case and the run-to-run spread on the peak is about ±25%
+  (the re-run above moved individual peaks by up to 20% with the median flat).
+  Do not read a difference of 0.2 GB/s between two rows as real.
 
 ### fp8 runs but does not reach the fp8 datapath
 
