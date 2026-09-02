@@ -322,8 +322,11 @@ Five things in that table are lowering quality rather than hardware:
   a 14x gap is the `erf`-based expansion, not bandwidth. If a model can use
   `silu`, that is 14x here.
 - **`sin` / `cos` at bf16 are 4x slower than at fp32** (30 GB/s vs 119) — the only
-  ops in the sweep that get *worse* with a narrower dtype, and the reason
-  `rotary_embedding` lands at 42.8 GB/s.
+  ops in the sweep that get *worse* with a narrower dtype. This used to carry "and
+  the reason `rotary_embedding` lands at 42.8 GB/s", which was wrong and is
+  corrected [below](#rotary_embedding-is-not-a-neuron-result-at-all): `cos` and
+  `sin` are precomputed when the tensors are created, so no trig runs inside that
+  op's timed region at all.
 - **`reduce_max`/`reduce_min` at 177 GB/s against `reduce_sum` at 639** is a 3.6x
   gap between three reductions over the same shapes.
 - **`div` at fp32 is 379 GB/s where `mul` is 599**, but at fp16/bf16 both are
@@ -342,6 +345,67 @@ parity](#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-fr
 K=N=8192: 573.3 fp16 / 559.2 bf16 / 499.8 fp32), i.e. 77-79% of the per-core
 ceiling. That is the cleanest bandwidth number in the sweep after
 `device2device`, because it comes from an op whose operands are read exactly once.
+
+##### `rotary_embedding` is not a Neuron result at all
+
+Its 42.8 GB/s is 5.90% of one core's 725 GB/s ceiling, which reads like the worst
+lowering in the table after the index ops. It is not a lowering result. The same
+op on an H100 lands at **5.85-5.97% of its own 3.35 TB/s**:
+
+| Case | Trn2 1 core | % of 725 | H100 | % of 3,350 |
+|---|---|---|---|---|
+| prefill `q_len` 10240 | 42.77 GB/s | **5.90%** | 197.35 GB/s | **5.89%** |
+| prefill `cache_len` 5120 + `q_len` 5120 | 42.32 | 5.84% | 195.98 | 5.85% |
+| prefill `q_len` 32768 | 42.22 | 5.82% | 199.95 | 5.97% |
+| decode `batch_size` 16, `q_len` 1 | 0.99 | 0.14% | 3.80 | 0.11% |
+| decode `batch_size` 16, `q_len` 4 | 1.01 | 0.14% | 4.85 | 0.14% |
+
+Two backends whose bandwidths differ by 4.62x giving the same fraction of peak to
+one significant figure means the cost is in the op def, not in either stack. Per
+chip it is 171.2 against 197.4 GB/s, **1.15x** — exactly the 1.155x memory-bound
+bar.
+
+Timing the body piece by piece on one core at `q_len` 10240 (220 MB written; one
+full pass at 725 GB/s would be 318 us) says where it goes:
+
+| Step | us | Share | GB/s over the slice |
+|---|---|---|---|
+| `.contiguous()` on the strided slice | 825.7 | 7.5% | 558.8 |
+| **`rotate()`** | **8,591.3** | **78.1%** | 53.7 |
+| `copy_` back into the strided slice view | 1,697.5 | 15.4% | 271.8 |
+| — same bytes into a contiguous dst (control) | 815.1 | — | 566.0 |
+| one elementwise pass, reference (`mul`) | 1,087.4 | — | 424.3 |
+| whole body | 10,995.6 | 100% | 42.0 |
+
+`rotate()` is 78% of it, and it is five-plus materialising passes where a fused
+kernel is one:
+
+```python
+def rotate(qk, cos, sin):                       # core/utils.py:587
+    left_part, right_part = qk[:, :, :rope_dim//2], qk[:, :, rope_dim//2:]
+    return torch.cat([left_part, right_part], -1) * cos.unsqueeze(1) + \
+           torch.cat([-right_part, left_part], -1) * sin.unsqueeze(1)
+```
+
+Two `torch.cat` each write a fresh 220 MB, then two multiplies and an add. At the
+424 GB/s a single `mul` pass gets, five passes is ~5.4 ms; the measured 8.6 ms says
+the concatenations cost more than a plain pass, which is unsurprising for a
+last-dim concat with a negation. An H100 pays the same passes, which is why the
+percentages match.
+
+The remaining 15% is [the in-place
+problem](#writes-into-a-strided-slice-view-are-not-in-place), and it is real but
+secondary: `copy_` into the strided destination is 1,697.5 us against 815.1 for
+the same bytes into a contiguous one, **2.08x**. `packed_qkv` has 96 heads and the
+op writes heads 0:88, so the destination view is not contiguous; sizing the buffer
+to exactly 88 heads makes the identical write contiguous and confirms the cause
+(1,711.6 us strided vs 836.4 contiguous, 2.05x).
+
+The decode rows are a third thing again and are not bandwidth at all:
+`vendor_impl_run` loops over batches in Python, so `batch_size` 16 with `q_len` 1
+is 16 dispatches writing one token each — 377 us per iteration on a 393 KB tensor.
+The H100 is 3.8-4.8x faster there, i.e. at parity per chip, because both are
+paying for the loop rather than for memory.
 
 #### Norm, activation and MoE gating ops
 
@@ -900,6 +964,62 @@ from `IndexSelectOp`, which declares a 1-D index, while `GatherOp.create_tensors
 builds a 2-D one — so the declared `io_bytes` does not describe the tensors the op
 creates, and `gather`'s `mem_bw` should be read as approximate either way.
 
+### Writes into a strided slice view are not in-place
+
+Two op defs write into a *strided slice view* of a large pre-allocated tensor and
+count only the slice in `write_bytes`:
+
+```python
+dst_k_cache = k_cache[kv_slot_id, :, cache_start:cache_end, :]       # store_kv_cache.py:276
+dst_k_cache.copy_(src_k_data)                                        # store_kv_cache.py:280
+packed_qkv[t0:t1, qk0:qk1, d0:d1].copy_(rotate(...))                 # rotary_embedding.py:173
+```
+
+`store_kv_cache` documents itself as "This operator is inplace." On eager Neuron
+that is not what happens. The check needs no profiler: hold the update size fixed
+and scan the buffer size. True in-place is a flat line; a functionalised
+copy-the-whole-buffer is linear. Fixed 256 KB update, `k_cache` 8 → 32 → 128 MB
+(16x), bf16, one core:
+
+| Written how | 8 MB | 32 MB | 128 MB | Slope |
+|---|---|---|---|---|
+| `k_cache[0,:,cs:ce,:].copy_(src)` — the op def's pattern | 0.171 | 0.234 | 0.556 ms | **3.25x** |
+| `cache.add_(1.0)` — O(buffer) by design, positive control | 0.321 | 0.656 | 1.774 ms | 5.53x |
+| read the slice, write nothing | 0.083 | 0.085 | 0.108 ms | 1.30x (flat) |
+| the same `copy_` but at offset 0 | 0.105 | 0.172 | 0.493 ms | 4.68x |
+| **2-D contiguous dst**, `flat[cs:ce].copy_(src)` | 0.063 | **0.043** | **0.043 ms** | **0.69x (flat)** |
+
+Three readings:
+
+- **The cost tracks the buffer, not the update.** The 128 MB point spends 0.556 ms
+  writing 256 KB. Scored as a whole-buffer copy that is 256 MB / 0.556 ms ≈ **460
+  GB/s**, 63% of the per-core ceiling and a plausible real copy; scored as the
+  slice it is 0.46 GB/s. The 8 MB and 32 MB points come out at 94 and 273 GB/s,
+  which is the same curve plus ~0.1 ms of fixed overhead. That overhead is also why
+  the slope is 3.25x over a 16x range rather than 16x, and why `add_` — which is
+  genuinely O(buffer) — only reaches 5.53x.
+- **The trigger is a non-contiguous destination, not slicing and not the offset.**
+  A 2-D contiguous slice write is flat at 43 us — the true in-place path exists.
+  Moving the strided write to offset 0 does not help.
+- **`torch.compile(backend="neuron")` does not rescue it at cache sizes that
+  matter.** It helps at 8 MB (0.139 vs 0.171 ms), then fails to compile at 32 MB
+  and 128 MB with `BackendCompilerFailed: RuntimeError: Neuron backend NEFF
+  execution setup failed`. Establishing input/output aliasing through dynamo is the
+  usual advice for this; on this stack it is not available for a realistic KV cache.
+
+`store_kv_cache` itself never reaches the device — see [Known
+unsupported](#known-unsupported) — so no published number here is affected by it.
+`rotary_embedding` does run, and this costs it **2.08x on its write step**, which
+is 15% of that op's time. It is not the dominant term there; see
+[`rotary_embedding` is not a Neuron result at
+all](#rotary_embedding-is-not-a-neuron-result-at-all).
+
+One thing this is *not* evidence for: a general eager in-place problem. `add_` on a
+whole tensor is O(buffer) because it is supposed to be, and the contiguous slice
+write is flat. It is specifically the strided destination view.
+
+Reproduce with `tools/probe_inplace_write.py`.
+
 ### Known unsupported
 
 Two different things are easy to conflate, so they are kept apart: a case the
@@ -909,6 +1029,8 @@ Two different things are easy to conflate, so they are kept apart: a case the
 | Cases | Blocker | Whose limit |
 |---|---|---|
 | `flash_attention` with any quantized dtype | `op_defs/llm_ops/flash_attention.py` accepts all-bfloat16 or bfloat16 + `int8` cache, and raises on everything else | base op def |
+| **`store_kv_cache`, all 16 cases in `pre_fa_ops.json`** | every case sets `block_size: 512`, so `get_attn_info` classifies the cache as paged and `op_defs/llm_ops/store_kv_cache.py:257` raises `NotImplementedError("StoreKVCacheOp paged cache not implemented yet.")` | base op def |
+| **`store_kv_cache` with `store_mode: "k"`**, independently of the above | `vendor_impl` creates `v_cache` only for `store_mode in ("both", "v")`, but `vendor_impl_run` reads `tensor_mapping["v_cache"]` unconditionally at `store_kv_cache.py:248` → `KeyError: 'v_cache'`. So removing `block_size` is not enough to make the file run | base op def |
 | `quant_matmul` / `moe_quant_group_gemm` with `float8` / `mxfloat8` / `mxfloat4` / `int4` weights | both base impls accept only `int8/int8/int8 -> bfloat16` | base op def |
 | `flash_attention` with a paged cache (`block_size`) | neither the NKI `flash_fwd` kernel nor native SDPA takes a block table | this backend |
 | `flash_attention` chunked prefill (`cache_len > 0`, `q_len > 1`) or multi-token decode | `is_causal` is top-left aligned; these need bottom-right | this backend (correctness) |
@@ -986,6 +1108,24 @@ because working around them in `vendor_ops` would hide them: the dropped
 `aten::scatter_.src` having no NKI kernel. Both are described in
 [the index-ops section](#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity).
 
+Three further gaps are in the **base op defs**, so they are not Neuron gaps and
+closing them would move both backends. They are listed here because it is easy to
+read them off the Neuron column as if they were:
+
+- **`rotate()` in `core/utils.py:587` is five-plus materialising passes.** It costs
+  Neuron and an H100 the same 94% of their respective peaks — see
+  [`rotary_embedding` is not a Neuron result at
+  all](#rotary_embedding-is-not-a-neuron-result-at-all). One fused kernel would be
+  ~17x on both.
+- **Writes into a strided slice view are not in-place**, worth 2.08x on
+  `rotary_embedding`'s write step. Sizing `packed_qkv` to the heads actually written
+  makes the destination contiguous; see [Writes into a strided slice view are not
+  in-place](#writes-into-a-strided-slice-view-are-not-in-place).
+- **`store_kv_cache` has no runnable case on any backend**, for two independent
+  reasons in the op def. Both are in [Known unsupported](#known-unsupported). Until
+  they are fixed there is no `store_kv_cache` number to compare, on this backend or
+  the GPU.
+
 ## Reproducing the full sweep
 
 `tools/` holds what produced the eager full-sweep numbers. `launch.py --task all`
@@ -1023,6 +1163,11 @@ python3 vendor_ops/NEURON/tools/analyze_scaling.py \
 # 6. The gather int64-vs-int32 finding, on device, in one file (~2 min).
 sudo docker run --rm --privileged -v "$PWD":/w -w /w xpu-perf-eager:latest \
     python3 vendor_ops/NEURON/tools/probe_index_dtype.py
+
+# 7. The in-place-write finding: the slope test, plus rotary_embedding
+#    decomposed at the shape the table publishes (~4 min, needs a few GB HBM).
+sudo docker run --rm --privileged -v "$PWD":/w -w /w xpu-perf-eager:latest \
+    python3 vendor_ops/NEURON/tools/probe_inplace_write.py
 ```
 
 `IMAGE`, `REPO`, `LOG`, `RESULTS`, `DOCKER` and `WAIT_BUDGET_S` all come from the

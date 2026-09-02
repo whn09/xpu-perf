@@ -23,6 +23,7 @@ different ones:
 | `gather` / `scatter` | **449x / 621x** | the op def is exonerated; `gather` is one index dtype away from **1.08x**, `scatter` has no kernel |
 | `topk`, `moe_softmax_topk` | **0.33x / 0.27x** | Trainium2 ~3x ahead per chip, and the x4 is now measured at these shapes |
 | `gemm` at fp32 | **0.32x** | Trainium2 3.09x ahead; the nominal bar favours it 2.70x |
+| `rotary_embedding` | **1.15x** | exactly the memory-bound bar — both backends get 5.9% of their own peak, so the missing 94% is the op def |
 
 So the headline is that **Trainium2's silicon is fine and the gap is bimodal in
 its software.** Nothing here lands between 1.4x and 3.1x, and nothing between
@@ -50,6 +51,18 @@ is ~3x faster per chip at both selection ops, and it is 3.09x faster at fp32
 column repeatedly exonerates the benchmark: `gelu` matches `silu` there, `gather`
 matches `index_select` there, and `head_rms_norm` is broken on *both* backends by
 a hard-coded fp32 norm weight in the op def.
+
+`rotary_embedding` is the cleanest of those exonerations, and the only case in this
+comparison where the two backends agree to a significant figure: **5.89% of the
+H100's own HBM peak against 5.90% of Trainium2's**, at 197.35 and 42.77 GB/s. Two
+chips whose bandwidths differ by 4.62x cannot land on the same fraction of peak by
+accident — the 94% that is missing is in the op def, which spends 78% of its time
+in `rotate()` doing five-plus materialising elementwise passes where a fused kernel
+would do one. Per chip that is 197.4 against 171.2, **1.15x**, exactly the
+memory-bound bar. This row was previously blamed on Neuron's slow bf16 `sin`/`cos`;
+that was wrong, since `cos` and `sin` are precomputed outside the timed region —
+see [the NEURON README](../NEURON/README.md#rotary_embedding-is-not-a-neuron-result-at-all)
+for the decomposition.
 
 Memory-bound attention still tells the original story. During decode the H100
 reads its KV cache at 80-86% of HBM peak, Trainium at 15-33% of its own — and
@@ -436,7 +449,27 @@ suggest:
   4x *slower* at bf16 than fp32 on Neuron; on the H100 `sin` is 2,884.9 bf16
   against 2,974.7 fp32, a 1.03x difference. `reduce_max` against `reduce_sum` is
   3.6x on Neuron and 1.06x on the H100. `div` at fp32 is 1.58x off `mul` on
-  Neuron (379 vs 599) and *identical* on the H100 (both 3,034.8).
+  Neuron (379 vs 599) and *identical* on the H100 (both 3,034.8). Note that this
+  does **not** carry over to `rotary_embedding`, which is the op those trig rows
+  look like they should explain — it does not call `sin` or `cos` at all:
+
+  | Case | Trn2 1 core | % of 725 | H100 | % of 3,350 | Per chip |
+  |---|---|---|---|---|---|
+  | prefill `q_len` 10240 | 42.77 | **5.90%** | 197.35 | **5.89%** | 1.15x |
+  | prefill `cache_len` 5120 + `q_len` 5120 | 42.32 | 5.84% | 195.98 | 5.85% | 1.16x |
+  | prefill `q_len` 32768 | 42.22 | 5.82% | 199.95 | 5.97% | 1.18x |
+  | decode `batch_size` 16, `q_len` 1 | 0.99 | 0.14% | 3.80 | 0.11% | 0.96x |
+  | decode `batch_size` 16, `q_len` 4 | 1.01 | 0.14% | 4.85 | 0.14% | 1.20x |
+
+  The prefill rows are matched to a significant figure as a fraction of each chip's
+  own peak, which is what identifies the op def rather than either stack:
+  `rotate()` is 78% of the time and is five-plus materialising passes. The decode
+  rows are not bandwidth on either side — `vendor_impl_run` loops over batches in
+  Python, so `batch_size` 16 at `q_len` 1 is 16 dispatches of one token each.
+  These are the only `pre_fa_ops.json` numbers in this comparison; the file's other
+  op, `store_kv_cache`, does not run on **either** backend (two base-op-def
+  blockers, [listed in the NEURON
+  README](../NEURON/README.md#known-unsupported)).
 - **Selection and sorting are where the H100 is the weak side**, and it is two ops
   rather than one, which is what makes it a pattern instead of an oddity:
 

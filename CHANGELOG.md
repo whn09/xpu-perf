@@ -43,6 +43,14 @@ This changelog follows semantic versioning and Keep a Changelog style.
   proximate cause, the 1-D `index_select` control, `scatter_add_`, and a dump of
   `_NEURON_OPS_REGISTRY` showing the declared-vs-effective implementation
   priorities.
+- `projects/micro_perf/vendor_ops/NEURON/tools/probe_inplace_write.py`: tests
+  whether the two op defs that write into a strided slice view of a large
+  pre-allocated tensor — `store_kv_cache` and `rotary_embedding` — actually get an
+  in-place write. Part 1 is the slope test (hold the update size fixed, scan the
+  buffer size; flat means in-place, linear means a functionalised full-buffer copy)
+  with `add_` as the positive control and a contiguous-destination control. Part 2
+  decomposes `rotary_embedding` at the shape the README publishes, which the slope
+  test cannot cover because its prefill cases have `q_len == num_tokens`.
 
 ### Changed
 
@@ -75,8 +83,44 @@ This changelog follows semantic versioning and Keep a Changelog style.
   TF from an XLA run, which reverses the comparison — Trainium2 is **3.09x ahead**
   of the H100's 48.72 TF on a 2.70x nominal bar.
 
+- `projects/micro_perf/vendor_ops/NEURON/README.md`: a section on in-place
+  semantics. `store_kv_cache` documents itself as "This operator is inplace"; on
+  eager Neuron a write into a strided slice view is not. Fixed 256 KB update over an
+  8 → 128 MB `k_cache`, the write scales 3.25x where a contiguous 2-D slice write is
+  flat at 43 us, and the 128 MB point's 0.556 ms is 460 GB/s scored as a whole-buffer
+  copy against 0.46 GB/s scored as the slice. The trigger is the non-contiguous
+  destination, not slicing and not the offset. `torch.compile(backend="neuron")` —
+  the usual advice, since dynamo establishes input/output aliasing — helps at 8 MB
+  and then fails to compile at 32 MB and 128 MB with
+  `RuntimeError: Neuron backend NEFF execution setup failed`, so it is not a remedy
+  at realistic KV cache sizes.
+
 ### Fixed
 
+- `projects/micro_perf/vendor_ops/NEURON/README.md`,
+  `projects/micro_perf/vendor_ops/GPU/README.md`: **`rotary_embedding`'s 42.8 GB/s
+  was attributed to Neuron's slow bf16 `sin`/`cos`. That is impossible** — `cos` and
+  `sin` are precomputed by `precompute_freqs_cis` when the tensors are created, and
+  `rotate()` is only `cat`/`mul`/`add`, so no trig runs inside the timed region. The
+  op was run on an H100 to settle it (it had no GPU number, since `pre_fa_ops.json`
+  was never run there) and the two backends agree to a significant figure as a
+  fraction of their own peak: **5.89% for the H100 at 197.35 GB/s against 5.90% for
+  one Trainium2 core at 42.77**. Two chips 4.62x apart in bandwidth do not land on
+  the same fraction of peak by accident — the cost is in the op def. Decomposing the
+  body confirms it: `rotate()` is 78.1% of the 10,995.6 us, five-plus materialising
+  elementwise passes where a fused kernel would be one pass (318 us at peak). Per
+  chip the op is 1.15x, exactly the memory-bound bar. The decode rows are a third
+  thing again and are not bandwidth on either side: `vendor_impl_run` loops over
+  batches in Python, so `batch_size` 16 at `q_len` 1 is 16 dispatches of one token.
+- `projects/micro_perf/vendor_ops/NEURON/README.md`: two `store_kv_cache` blockers
+  added to the "Known unsupported" table, both **base op def** and so affecting the
+  GPU backend identically. All 16 cases in `pre_fa_ops.json` set `block_size: 512`,
+  which makes the cache paged and hits
+  `raise NotImplementedError("StoreKVCacheOp paged cache not implemented yet.")` at
+  `store_kv_cache.py:257`. Independently, `store_mode: "k"` cases fail with
+  `KeyError: 'v_cache'` at `store_kv_cache.py:248`, because `vendor_impl` creates
+  `v_cache` only for `store_mode in ("both", "v")` while `vendor_impl_run` reads it
+  unconditionally — so removing `block_size` is not enough to make the file run.
 - `projects/micro_perf/vendor_ops/NEURON/ops/torch/flash_attention.py`,
   `projects/micro_perf/vendor_ops/GPU/ops/torch/flash_attention.py`,
   `projects/micro_perf/vendor_ops/NEURON/README.md`,
