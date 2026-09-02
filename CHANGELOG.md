@@ -51,6 +51,23 @@ This changelog follows semantic versioning and Keep a Changelog style.
   with `add_` as the positive control and a contiguous-destination control. Part 2
   decomposes `rotary_embedding` at the shape the README publishes, which the slope
   test cannot cover because its prefill cases have `q_len == num_tokens`.
+- `projects/micro_perf/vendor_ops/NEURON/tools/probe_attention_kernel.py`: settles
+  which kernel backs the prefill attention rows, by object identity rather than by
+  benchmark — `torch_neuronx`'s `decompositions.py` imports `attention_cte` from
+  `nkilib` at line 24 and wraps *that object* at line 71, so
+  `dc.attention_cte is attention_cte` is the whole proof and it is `True`. Then
+  times the same shape three ways (SDPA; `attention_cte` launched the way
+  `torch_neuronx` launches it; `attention_cte` launched the obvious way) and checks
+  every variant's output against the SDPA reference, because two of the three are
+  traps: the `lnc` subscript takes a bare int, and omitting it costs 1.85x by
+  running on one half of the LNC2 pair.
+- `projects/micro_perf/vendor_ops/NEURON/tools/probe_fp8_datapath.py`: separates the
+  two independent causes of the 1.2% fp8 MFU — the `e4m3fn`-vs-`f8e4m3` encoding
+  mismatch and the absence of an eager fp8 gemm lowering — by sweeping
+  {bf16, e5m2, e4m3fn} x {eager, compiled} at two square shapes. Documents two
+  reproduce gotchas in code: `torch.compile(..., dynamic=False)` is mandatory when
+  compiling one function body at two shapes, and the `e4m3fn` compile must run last
+  because its failure latches an error that the *next* device op inherits.
 
 ### Changed
 
@@ -97,6 +114,51 @@ This changelog follows semantic versioning and Keep a Changelog style.
 
 ### Fixed
 
+- `projects/micro_perf/vendor_ops/NEURON/README.md`,
+  `projects/micro_perf/vendor_ops/GPU/README.md`: **both READMEs concluded that
+  Trainium2 reaches no fp8 datapath at all, and told the reader not to plan capacity
+  around fp8 on this stack. That was too broad.** The 1.2% MFU measurement was
+  right; what it measures is the *eager* path in an encoding the chip does not
+  implement, not the hardware. Two independent causes, neither of which alone
+  explains the number. (1) **Encoding:** `float8_e4m3` maps to
+  `torch.float8_e4m3fn`, the finite-only variant CUDA uses; Trainium1/2 implement
+  the other e4m3, and the compiler says so by name — `[NCC_EVRF051] Data type
+  F8E4M3FN is not supported on TRN1/TRN2`. The workaround flag that error recommends
+  does not exist in neuronx-cc 2.27.2878.0 (`compile --help` has no fp8 options at
+  all). (2) **Path:** eager has no fp8 gemm lowering for *either* encoding, so both
+  land on the same software widening at ~1-2 TFLOPS. Fix both — `e5m2` under
+  `torch.compile(backend="neuron", dynamic=False)` — and one logical core does
+  **245.50 TFLOPS at 75.6% of its 324.75 TF fp8 peak** at 4096^3, 1.82x its own
+  bf16 on a nominal 1.95x bar and 115.7x the eager figure at the same shape. That
+  path also scales across cores where eager fp8 does not (1.018x worst case over
+  four concurrent runs against 1.46-1.53x eager), so **982 TFLOPS per chip and a
+  1.56x gap to the H100** where the nominal fp8 peak ratio is 1.52x — not 99x. The
+  99x row stays in the tables because it is what `gemm.json` measures today;
+  closing it needs an fp8 provider that compiles and `float8_e5m2` cases to point
+  at. Also newly documented: the fp8 row **cannot** be made like-for-like inside
+  this op def, since the H100's number is `e4m3fn` via `torch._scaled_mm`,
+  Trainium2 has no `e4m3fn`, and `torch._scaled_mm` rejects `e5m2 x e5m2` on CUDA —
+  the two chips share no fp8 format both stacks will multiply. And
+  `torch._scaled_mm` is not a usable route on Neuron: 690 ms at 512^3 (~5,500x the
+  bf16 matmul), and at 2048^3 a single call did not return in 3.5 minutes while
+  burning 555% host CPU, which is the "50% CPU, 0% Neuron" symptom it produces.
+- `projects/micro_perf/vendor_ops/NEURON/README.md`,
+  `projects/micro_perf/vendor_ops/GPU/README.md`: the attention sections said the
+  prefill rows are a fused NKI kernel but left open which kernel, and listed writing
+  a NKI prefill provider as work that would close the gap. **It would not: the
+  kernel the SDPA rewrite lowers to already *is* `nkilib`'s `attention_cte`**, by
+  object identity in `torch_neuronx`'s `decompositions.py` (line 24 imports it, line
+  71 wraps it, line 935 launches it with `tp_q=True, tp_k=True` and KV left at its
+  own head count so the kernel does the GQA). Calling `attention_cte` by hand with
+  those arguments reproduces the SDPA latency to **0.97x** (7,407.4 vs 7,636.7 us at
+  B=1/HQ=80/HKV=8/L=4096/D=128) with bit-identical output — one kernel, reached two
+  ways. So the residual ~2.1x software component of the 3.1x prefill gap is this
+  kernel against cuDNN/FA, and there is no unused kernel in `nkilib` to reach for.
+  The `What would close these gaps` list now scopes its NKI-attention item to
+  decode (`attention_tkg`). Recorded as a trap because it nearly produced a false
+  finding: launched without the `lnc` subscript, `attention_cte` runs on one half of
+  the LNC2 pair and measures 1.85x slower, which reads as "the nkilib kernel is
+  worse than what SDPA gets".
 - `projects/micro_perf/vendor_ops/NEURON/README.md`,
   `projects/micro_perf/vendor_ops/GPU/README.md`: **`rotary_embedding`'s 42.8 GB/s
   was attributed to Neuron's slow bf16 `sin`/`cos`. That is impossible** — `cos` and

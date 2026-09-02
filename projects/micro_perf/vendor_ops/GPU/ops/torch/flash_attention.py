@@ -35,7 +35,11 @@ class GPUSDPAFlashAttentionOp:
     is not; the earlier claim in this docstring that the eager runtime had no fused
     kernel at all was wrong. What is true is the narrower statement it rested on:
     `neuronxcc.nki.kernels.attention.flash_fwd` is HLO-traced and only loads under
-    torch_xla, so that particular kernel is unreachable there.
+    torch_xla, so that particular kernel is unreachable there. And the kernel the
+    rewrite does pick is `nkilib`'s `attention_cte`, by object identity in
+    `decompositions.py` rather than by inference -- calling it by hand reproduces
+    the SDPA latency to 0.97x -- so the residual prefill gap is this kernel against
+    cuDNN/FA, not an absent kernel on the Neuron side.
 
     That is *not* the same as saying this is a slow fallback on CUDA. SDPA
     dispatches to a fused backend -- FlashAttention or cuDNN, both of which do

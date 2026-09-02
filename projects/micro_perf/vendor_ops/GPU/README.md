@@ -16,10 +16,10 @@ different ones:
 | dense bf16 `gemm` | **1.35x** | silicon (nominal peak ratio is 1.48x) |
 | elementwise / reductions | **~1.4x** | parity: 12 of 24 ops within 0.93-1.15x of the H100's %-of-own-peak |
 | head/QK norms, `swiglu` | **0.35-1.26x** | Trainium2 *ahead* on 6 of 8 rows |
-| attention prefill | **3.1x** | ~1.5x silicon, ~2.1x software |
+| attention prefill | **3.1x** | ~1.5x silicon, ~2.1x software — and the software is `nkilib`'s `attention_cte`, confirmed by identity, so there is no better kernel to reach for |
 | `gelu`, `sin`/`cos`, `reduce_max` | **3.5-7.7x** | single-op lowering gaps, each with a fast sibling op |
 | the 7 quantised ops | **3.8-38x** | on top of a shared unfused helper that costs the H100 3-14x too |
-| `gemm` at fp8 | **~99x** | no fp8 datapath is being reached at all |
+| `gemm` at fp8 | **~99x** as published, **~1.56x** measured | the published row is the eager path in an e4m3 encoding Trainium2 does not implement; compiled, in `e5m2`, it reaches 75.6% of its fp8 peak |
 | `gather` / `scatter` | **449x / 621x** | the op def is exonerated; `gather` is one index dtype away from **1.08x**, `scatter` has no kernel |
 | `topk`, `moe_softmax_topk` | **0.33x / 0.27x** | Trainium2 ~3x ahead per chip, and the x4 is now measured at these shapes |
 | `gemm` at fp32 | **0.32x** | Trainium2 3.09x ahead; the nominal bar favours it 2.70x |
@@ -34,8 +34,13 @@ within 1.35x per chip — [and the four-core run confirms that x4 is
 real](#how-to-compare-these-to-the-trainium2-numbers). On attention it delivers
 32% against the H100's 69% — and that 32% is *already* a fused NKI flash kernel,
 [measured by turning it off](#attention), so the remaining 2.1x is kernel quality
-rather than an absent kernel. On fp8 nothing is reached at all: the op runs,
-returns fp8 tensors, and times a software widening to bf16.
+rather than an absent kernel. On fp8 the published row is not a hardware
+number on either count: it is the eager path, in an `e4m3` encoding Trainium2 does
+not implement. Compiled, in `e5m2`, one logical core does **245.50 TFLOPS at 75.6%
+of its fp8 peak**, which puts the per-chip gap at **1.56x** against a 1.52x nominal
+bar — [details](../NEURON/README.md#fp8-the-sweep-measures-the-eager-path-and-the-wrong-e4m3-encoding).
+The 99x is real as a measurement of what the sweep currently runs, and it is not a
+statement about the chip.
 
 The `gather` row is the clearest case of the pattern, because it is now known
 exactly what the two orders of magnitude are: the op def hands the device an
@@ -269,7 +274,14 @@ Four conclusions, in order of how much they matter:
   the measurement above rules it out. Prefill already runs a fused NKI flash
   kernel — turning it off costs 6.41x, so 32% of peak *is* the fused kernel's
   score. The remaining 2.1x is kernel quality inside a fused implementation, which
-  is a harder thing to close than a missing kernel but still software.
+  is a harder thing to close than a missing kernel but still software. **And it is
+  not a case of the wrong kernel being picked either:** the kernel the rewrite
+  lowers to is `nkilib`'s `attention_cte`, by object identity in
+  `decompositions.py`, and calling `attention_cte` by hand with the launch
+  arguments torch_neuronx uses reproduces the same latency to 0.97x
+  ([details](../NEURON/README.md#attention)). So the 3.1x is `attention_cte`
+  against cuDNN/FlashAttention at the same shape, with no better kernel sitting
+  unused on the Neuron side.
 - **Decode on Trainium is not bandwidth-limited, which means it is fixable.**
   The H100 reads its KV cache at 80-86% of HBM peak — that is a
   bandwidth-saturating kernel and there is nothing left to win. Trainium reads it
@@ -302,6 +314,7 @@ Peak per dtype, with the Trainium2 figures for the same file alongside:
 | float32 | 48.72 TF | 72.7% | 20480x8192x8192 | **37.67 TF** | **83.3%** | 48.7 / 150.7 = **0.32x** |
 | float8_e4m3 | **1,527.85** TF | 77.2% | 4096x8192x8192 | 3.85 TF | 1.2% | 1,527.9 / 15.4 = **~99x** |
 | float8_e5m2 | rejected | — | — | 4.77 TF | 1.5% | see below |
+| fp8, best each side can actually do | 1,527.85 TF (`e4m3fn`) | 77.2% | 4096x8192x8192 | **245.50 TF** (`e5m2`, compiled) | **75.6%** | 1,527.9 / 982 = **1.56x** |
 
 **On dense bf16 gemm, Trainium2 is competitive per chip — and extracts a *higher*
 fraction of its own peak than the H100 does.** Both backends peak at the identical
@@ -336,16 +349,37 @@ shapes never touch. The same tail shows up in the reductions and in `moe`
 ([below](#memory-bound-ops)), which is what makes it a property of small-shape
 dispatch rather than of any one op.
 
-**fp8 is the opposite story, and a difference in kind rather than degree.** On the
-H100 fp8 is a real datapath: 1,527.9 TFLOPS at 77.2% MFU, **1.89x** faster than
-bf16, close to the 2x the format promises. On Trainium2 the same op def at the same
-dtype peaks at 3.85 TFLOPS / 1.2% MFU — **39x slower** than that core's own bf16,
-on a format with a 2x *higher* nominal peak. `torch.matmul` does accept fp8 tensors
-there and return fp8, but what is being timed is a software widening to bf16, not a
-matmul; `../NEURON/README.md` gives three independent signatures for that, the most
-legible being that `e5m2` comes out *faster* than `e4m3` at all twelve shapes,
-which no tensor engine would do. Per chip the gap is ~99x. **Do not plan Trainium2
-capacity around fp8 on this stack.**
+**fp8 is where the two stacks are least comparable, and the ~99x in the table is a
+property of the sweep rather than of the chip.** On the H100 fp8 is a real
+datapath: 1,527.9 TFLOPS at 77.2% MFU, **1.89x** faster than bf16, close to the 2x
+the format promises. The Trainium2 cells next to it are 3.85 / 4.77 TFLOPS, 1.2-1.5%
+MFU — and two independent things produce that, neither of which is "the hardware
+has no fp8 gemm":
+
+- **The encoding is wrong.** `float8_e4m3` maps to `torch.float8_e4m3fn`, the
+  finite-only variant CUDA uses. Trainium1/2 implement the *other* e4m3, and the
+  compiler says so by name: `[NCC_EVRF051] Data type F8E4M3FN is not supported on
+  TRN1/TRN2.` The workaround flag that error recommends does not exist in
+  neuronx-cc 2.27.2878.0.
+- **The path is eager.** Eager has no fp8 gemm lowering for *either* encoding, so
+  both fall onto the same software widening at ~1-2 TFLOPS.
+
+Fix both — `torch.compile(backend="neuron", dynamic=False)`, in `e5m2` — and one
+logical core does **245.50 TFLOPS at 75.6% of its 324.75 TF fp8 peak**, 1.82x its
+own bf16 on a nominal 1.95x bar, 115.7x the eager number at the same shape. Unlike
+eager fp8, that path scales across cores cleanly (1.018x worst case over four
+concurrent runs), so **982 TFLOPS per chip and a real gap of 1.56x** where the
+nominal fp8 peak ratio is 1.52x
+([details](../NEURON/README.md#fp8-the-sweep-measures-the-eager-path-and-the-wrong-e4m3-encoding)).
+
+Two things follow. The ~99x row stays in the table because it is what
+`gemm.json` measures today and it is reproducible — closing it needs an fp8
+provider that compiles and `float8_e5m2` cases to point at, not new silicon. And
+**the fp8 row is not a like-for-like comparison and cannot be made into one within
+this op def**: the H100's number is `e4m3fn` via `torch._scaled_mm`, Trainium2 has
+no `e4m3fn` at all, and `torch._scaled_mm` rejects `e5m2 x e5m2` on CUDA. The two
+chips share no fp8 format that both stacks will multiply, so the 1.56x above
+compares each side's best fp8, in different encodings.
 
 Two implementation notes, because the fp8 numbers depend on them:
 
@@ -362,9 +396,12 @@ Two implementation notes, because the fp8 numbers depend on them:
   e5m2 is a gradient format and is only ever one side of a mixed pair, which this
   op def cannot express since `a` and `b` share one `dtype`. The provider now
   reports it unsupported instead of raising mid-sweep. Worth contrasting with the
-  Neuron result, where e5m2 is not merely supported but **faster** than e4m3 at
-  all twelve shapes — which is itself the tell that no fp8 kernel is involved
-  there.
+  Neuron result, where the asymmetry runs the other way: `e5m2` is the encoding
+  Trainium2 *does* implement, and the only one that compiles. On the eager path it
+  also comes out slightly faster than `e4m3` at all twelve shapes, consistent with
+  both rows timing a software widening whose cost tracks the conversion rather than
+  the multiply — though that is one reading among several, and the compiler's
+  refusal of `e4m3fn` is the harder evidence.
 
 Note also that `float32` and `tfloat32` are genuinely different hardware here and
 the provider keeps them apart: it sets matmul precision `highest` for float32

@@ -204,9 +204,10 @@ fp8 rows are read straight out of it). The denominators are the per-core peaks
 from [MFU](#mfu) — 166.75 for bf16/fp16, 45.25 for fp32, 324.75 for fp8.
 
 **The two fp8 rows are in the table for completeness and should not be read as
-fp8 hardware numbers** — 1.2% of peak is what a bf16 matmul preceded by a
-software up-cast costs, not what the fp8 engines do. See
-[fp8 runs but does not reach the fp8 datapath](#fp8-runs-but-does-not-reach-the-fp8-datapath).
+fp8 hardware numbers** — they are the eager path, in an e4m3 encoding this chip
+does not implement. Compiled, in `e5m2`, the same core does **245.50 TFLOPS at
+75.6% of its fp8 peak**. See
+[fp8: the sweep measures the eager path, and the wrong e4m3 encoding](#fp8-the-sweep-measures-the-eager-path-and-the-wrong-e4m3-encoding).
 
 **90% of the dense bf16 peak on one logical core is the headline number for this
 chip**, and it is 20 points above the 1024x4096x4096 row in the table above: that
@@ -250,7 +251,9 @@ H100's measured 2,985.
 1.525) and fp32 `reduce_sum` (median 1.369) are the only groups whose *median* does
 not scale, where every other dtype of every other op sits between 1.000 and 1.025.
 For fp8 that is consistent with it timing a software up-cast rather than the matmul
-engine ([details](#fp8-runs-but-does-not-reach-the-fp8-datapath)). fp32 `reduce_sum`
+engine — and the compiled path, which *does* reach the engines, scales cleanly
+instead: 1.018x worst case over four cores
+([details](#fp8-the-sweep-measures-the-eager-path-and-the-wrong-e4m3-encoding)). fp32 `reduce_sum`
 is a different thing: its *largest* shape scales perfectly (0.998, the 2,536 GB/s
 above), and it is the mid-sized shapes that contend — the same tail described next,
 reaching further up the size range for this one op than for any other.
@@ -527,6 +530,40 @@ prefill takes it from **9,443 us to 60,500 us — 6.41x**. So 21.7-32.4% MFU *is
 fused kernel's score, and closing the remaining gap to the H100's 61-69% means a
 better kernel rather than a first one.
 
+**And the kernel it rewrites to is `nkilib`'s `attention_cte`.** That is the
+obvious candidate for "surely there is a faster NKI kernel than this", so it is
+worth settling by identity rather than by benchmark. `decompositions.py:24` does
+`from nkilib.core.attention.attention_cte import attention_cte`, `:71` wraps that
+same object as `wrapped_flash_fwd`, and `:935` launches it with
+`grid = (logical_neuron_cores,)`, `tp_q=True`, `tp_k=True` and KV left at its own
+head count so the kernel does the GQA replication itself. Calling the kernel
+directly the same way reproduces the SDPA number, at the shape the table publishes:
+
+| Path | Latency | TFLOPS (causal) | % of 166.75 |
+|---|---|---|---|
+| SDPA — what the op def calls | 7,636.7 us | 44.99 | 27.0% |
+| `attention_cte[2]`, `tp_k=True`, kernel-side GQA | **7,407.4 us** | 46.39 | 27.8% |
+| `attention_cte` with the `lnc` argument left off | 13,688.3 us | 25.10 | 15.1% |
+
+0.97x, and bit-identical output — it is one kernel, reached two ways. (This probe
+expands KV by hand for the SDPA baseline, matching what the op def does, and gets
+7,636.7 us where the sweep reports 9,443; the sweep's figure includes the op def's
+own tensor handling.)
+
+Two traps that row three is in the table to name. `attention_cte`'s `__getitem__`
+takes the **bare int** — `attention_cte[2]`, not `attention_cte[(2,)]`, which
+raises `NkiValidationError: NKI only supports LNC 1 or 2, but got (2,)` — and
+leaving it off entirely costs **1.85x**, because the kernel then runs on one half of
+the LNC2 pair. A hand-rolled NKI provider that skips it would look like evidence
+that `attention_cte` is slower than what SDPA gets, and would be measuring half a
+core.
+
+So the prefill gap to the H100 is `attention_cte` against cuDNN/FlashAttention at
+the same shape. There is no unused kernel to reach for; `swa_fused_cte` and
+`attention_segmented_cte` are different problems (sliding-window and segmented
+attention), not faster paths for this one. Reproduce with
+`tools/probe_attention_kernel.py`.
+
 Every decode row fails that gate twice over and always will: `q_len == 1` can never
 satisfy `L % 512 == 0`, and their `B*H` is 1280 and 5120 against a limit of 512.
 That is what the 15-33% of bandwidth reflects. The named fix is
@@ -788,7 +825,7 @@ The practical consequences:
   (the re-run above moved individual peaks by up to 20% with the median flat).
   Do not read a difference of 0.2 GB/s between two rows as real.
 
-### fp8 runs but does not reach the fp8 datapath
+### fp8: the sweep measures the eager path, and the wrong e4m3 encoding
 
 `workloads/basic/tensor_gemm_ops/gemm.json` has `float8_e4m3` and `float8_e5m2`
 cases, and this backend's `gemm` accepts them (the base `GemmOp` gates `dtype` to
@@ -797,7 +834,18 @@ the four float formats, so no other backend reports them). They run:
 fp8 tensor. **The result is an fp8 storage number, not an fp8 arithmetic number**,
 and it lands two orders of magnitude below the 324.75 TFLOPS per-core fp8 peak.
 
-The measurement that pins down why, at 4096x4096x4096 on one core:
+> **This section used to conclude that Trainium2 reaches no fp8 datapath at all.
+> That was too broad, and the correction is large enough to lead with.** The
+> measurements below are all correct and all of the *eager* path. Compiled, and in
+> the encoding the hardware actually implements, one logical core does **245.50
+> TFLOPS at 75.6% of its fp8 peak — 1.82x its own bf16, on a nominal 1.95x bar.**
+> The per-chip gap to the H100 is therefore about **1.56x**, not 99x. Two separate
+> things had to be got wrong at once to see 1.2%, and both are worth understanding
+> because they are traps for real workloads too:
+> [see below](#the-two-things-that-produce-12).
+
+The measurement that pins down why the eager number looks the way it does, at
+4096x4096x4096 on one core:
 
 | What | Latency |
 |---|---|
@@ -808,9 +856,11 @@ The measurement that pins down why, at 4096x4096x4096 on one core:
 
 The control is the whole story: casting the operands up to bfloat16 by hand,
 outside any matmul, already costs 48× the bf16 matmul. So the fp8 lowering is
-*cast up, then run a bf16 matmul*, and the cast dominates — there is no fp8
-datapath being reached and nothing about the 84 ms is a property of the fp8
-engines. (Those four numbers come from a probe on a contended machine, so read
+*cast up, then run a bf16 matmul*, and the cast dominates — nothing about the 84 ms
+is a property of the fp8 engines. What that does *not* license is the conclusion
+this section used to draw from it: the eager path reaches no fp8 datapath, the
+hardware has one, and [the compiled path reaches
+it](#the-two-things-that-produce-12). (Those four numbers come from a probe on a contended machine, so read
 them as ratios. The clean figures are below.)
 
 All 24 fp8 cases, on an idle core, MFU against the 324.75 TFLOPS per-core fp8
@@ -836,11 +886,16 @@ Three things in that table confirm the cast, not the matmul, is being measured.
 - **MFU never leaves 0.2-1.5%.** The best fp8 case reaches 4.77 TFLOPS against
   149.42 for bf16 at the comparable 12288x8192x8192 — fp8 is **31x slower** on a
   format whose peak is 2x higher, so it is 63x off relative to its own ceiling.
-- **e5m2 beats e4m3 by 20-35% at every one of the 12 shapes.** No tensor engine
-  cares how a byte splits its exponent and mantissa — but an emulated
-  `float8 -> bfloat16` conversion does, because e5m2's 5-bit exponent and 2-bit
-  mantissa map onto bf16's 8/7 with a shift and a mask, while e4m3 needs its
-  4-bit exponent rebiased and its subnormals renormalised.
+- **e5m2 beats e4m3 by 20-35% at every one of the 12 shapes.** A `float8 ->
+  bfloat16` conversion is exactly the kind of thing that would care: e5m2's 5-bit
+  exponent and 2-bit mantissa map onto bf16's 8/7 with a shift and a mask, while
+  e4m3 needs its 4-bit exponent rebiased and its subnormals renormalised. This
+  bullet used to add "no tensor engine cares how a byte splits its exponent and
+  mantissa", offered as proof that no engine was involved. Delete that: Trainium2's
+  engines care a great deal, since they implement `f8e5m2` and `f8e4m3` but not the
+  `f8e4m3fn` this row is measuring. The conversion reading is still the better one
+  — a widening cost 20-35% apart is not an engine 20-35% apart — but it is now one
+  reading among several rather than a proof.
 - **Latency scales with elements, not with FLOPs.** Going from M=1024 to M=16384
   at 8192x8192 is 16x the arithmetic but only 4.1x the time, because the B operand
   (67 M elements) is re-cast once per call and dominates the small-M cases. That
@@ -854,11 +909,89 @@ each takes 20-570 seconds. A watchdog sized for the float cases will cut the run
 before it reaches them. Run fp8 as a separate workload file if you want these
 numbers.
 
+##### The two things that produce 1.2%
+
+Both of these have to be true at once. Fixing either one alone does nothing, which
+is why the eager table above is so uniformly flat across both formats.
+
+**1. `torch.float8_e4m3fn` is not a format Trainium2 has.** There are two e4m3
+encodings. `f8e4m3` has infinities and a conventional NaN set; `f8e4m3fn` is
+finite-only — no infinities, one NaN pattern, one extra exponent value of range.
+They are not interchangeable and hardware implements one or the other. Trainium1
+and Trainium2 implement `f8e4m3`. PyTorch's `torch.float8_e4m3fn` — which is what
+CUDA uses, and what `TORCH_DTYPE_MAPPING` gives the workload's `float8_e4m3` — is
+the other one. Ask the compiler for it and it says so by name:
+
+```
+[NCC_EVRF051] Data type F8E4M3FN is not supported on TRN1/TRN2. Target TRN3 or
+later hardware, or use the --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 flag to cast
+F8E4M3FN to F8E4M3.
+```
+
+That flag does not exist in the `neuronx-cc` these numbers were taken with
+(2.27.2878.0 — `compile --help` has no fp8 options at all), so on this stack
+`float8_e4m3` has **no route to the tensor engines by any means**. `float8_e5m2`
+has no such split and is supported directly.
+
+**2. The eager path has no fp8 gemm lowering for either format.** This is the part
+the cast measurement above was actually detecting, and it applies to e5m2 as much
+as to e4m3fn. Under `torch.compile(backend="neuron")` the e5m2 case reaches the
+engines; eager never does.
+
+| Shape | Dtype | Eager | Compiled | % of own peak, compiled |
+|---|---|---|---|---|
+| 2048³ | bf16 | 192.6 us / 89.18 TF | 187.3 us / 91.71 TF | 55.0% of 166.75 |
+| 2048³ | e5m2 | 9,274.9 us / 1.85 TF | **133.5 us / 128.71 TF** | 39.6% of 324.75 |
+| 2048³ | e4m3fn | 16,115.5 us / 1.07 TF | *compile error* | — |
+| 4096³ | bf16 | 1,031.4 us / 133.26 TF | 1,017.0 us / 135.15 TF | 81.0% of 166.75 |
+| 4096³ | e5m2 | 64,782.1 us / 2.12 TF | **559.8 us / 245.50 TF** | **75.6% of 324.75** |
+| 4096³ | e4m3fn | 95,637.2 us / 1.44 TF | *compile error* | — |
+
+At 4096³ that is **115.7x** from eager to compiled, and **1.82x** over the same
+core's bf16 where the nominal fp8/bf16 headroom is 1.95x. Both dtypes reach ~76-81%
+of their respective peaks, which is what a working datapath looks like. **The x4 to
+a per-chip figure holds here**, unlike for the eager fp8 rows: four concurrent
+single-core runs of the compiled 4096³ e5m2 case give 610.7 / 613.3 / 619.2 / 622.5
+us against 611.6 us alone, a worst case of 1.018x. So the honest per-chip fp8
+number for Trainium2 is **982 TFLOPS**, against the H100's measured 1,527.85 — a
+**1.56x** gap where the nominal fp8 peak ratio is 1.52x. There is no fp8 anomaly
+left to explain.
+
+Reproduce with `tools/probe_fp8_datapath.py`. Two things it has to do that are easy
+to get wrong: `torch.compile(..., dynamic=False)`, because compiling the same
+function body at a second shape otherwise specialises it dynamically and the Neuron
+compiler rejects `bf16[?,?]` outright; and the failing e4m3fn compile has to run
+**last**, because it latches an error that the next device op inherits — a
+`torch.randn` three lines later fails with the e4m3fn message still attached.
+
+**What is *not* claimed here.** The workload files are unchanged and the published
+rows are still eager, so the table above stands as what `gemm.json` measures.
+Getting the better number into the sweep needs `float8_e5m2` cases run through a
+compiled provider, which is a different provider rather than a flag. And it is a
+genuine cross-backend asymmetry that the H100's fp8 figure is an e4m3fn figure,
+Trainium2 has no e4m3fn at all, and Trainium2's figure has to be quoted in e5m2 —
+which `torch._scaled_mm` in turn rejects on CUDA
+([details](../GPU/README.md#gemm)). The two chips have no fp8 format in common
+that both stacks will multiply, which is worth knowing before planning a mixed
+fleet.
+
+##### `torch._scaled_mm` is not usable on this backend
+
 `torch._scaled_mm` is the API that would express a real fp8 gemm — fp8 operands,
-fp32 scales, bf16 accumulate. It does dispatch to the device, and returns at
-64x64x64 in ~2.1 ms. At 4096x4096x4096 it sat in `neuronx-cc` for over 40 minutes
-without returning, the same wedge `gather` and `scatter` hit, so it cannot back a
-sweep.
+fp32 scales, bf16 accumulate — and it is what the GPU provider is *forced* onto,
+since `torch.matmul` raises on fp8 under CUDA. So the two providers are not making
+the same call, and it is worth knowing what happens if you try to make them match.
+
+It dispatches, and it returns the right shape and dtype. It is also unusable: at
+512³ a steady-state call takes **690 ms**, about 5,500x the bf16 matmul at the same
+shape, and at 2048³ a single call did not return in three and a half minutes of
+wall clock while burning 19 minutes of CPU at 555% — which is where an apparently
+hung probe with 0% Neuron utilisation and ~50% host CPU comes from. `aten::mm`,
+`aten::matmul` and `aten::_scaled_mm` are all absent from `_NEURON_OPS_REGISTRY`,
+and `TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1` does not fire, so this is
+not the documented host-fallback path either. Whatever it is doing, it is not a
+route to the engines — use `torch.compile` on a plain `matmul` instead, which is
+what the numbers above do.
 
 **MXFP8 is not expressible in this harness at all.** `TORCH_DTYPE_MAPPING`
 (`core/utils.py`) aliases `mxfloat8`, `mxfloat8_e4m3` and `mxfloat8_e5m2` to plain
@@ -1069,7 +1202,7 @@ implementation through the `base` provider:
 
 | Op | Provider | Runtime | Why |
 |---|---|---|---|
-| `gemm` | `torch` | both | rejects `tfloat32` (an NVIDIA format) and `int8` (not lowered through `torch.matmul`); accepts `float8_e4m3` / `float8_e5m2`, which the base op def gates out — see [fp8 runs but does not reach the fp8 datapath](#fp8-runs-but-does-not-reach-the-fp8-datapath) |
+| `gemm` | `torch` | both | rejects `tfloat32` (an NVIDIA format) and `int8` (not lowered through `torch.matmul`); accepts `float8_e4m3` / `float8_e5m2`, which the base op def gates out — see [fp8 is measured on the eager path, in an encoding this chip does not implement](#fp8-the-sweep-measures-the-eager-path-and-the-wrong-e4m3-encoding) |
 | `all_gather` | `torch` | both | base uses `dist.all_gather_into_tensor`, unimplemented on the `xla` backend; the `neuron` backend implements it, so eager reproduces the base behaviour |
 | `flash_attention` | `nki` / `torch` | `xla` / `eager` | no base implementation exists; NKI `flash_fwd` on XLA, `scaled_dot_product_attention` on eager |
 
@@ -1086,21 +1219,32 @@ value per unit of work:
    and a single fused norm+quant kernel replaces the whole chain. This is the
    largest number of affected ops for the least new code, and it does not need a new
    op def.
-2. **`attention_tkg`, for decode.** Decode cannot reach the built-in NKI flash
-   rewrite (see [Attention](#attention)) and is leaving 2.6-5.7x of this core's
-   bandwidth unused. `nkilib` ships a token-generation attention kernel for exactly
-   this shape. It goes in as a third `flash_attention` provider, so it neither
-   perturbs the existing eager numbers nor needs the XLA runtime.
+2. **`attention_tkg`, for decode — and nothing for prefill.** Decode cannot reach
+   the built-in NKI flash rewrite (see [Attention](#attention)) and is leaving
+   2.6-5.7x of this core's bandwidth unused. `nkilib` ships a token-generation
+   attention kernel for exactly this shape. It goes in as a third
+   `flash_attention` provider, so it neither perturbs the existing eager numbers
+   nor needs the XLA runtime. **Prefill is a different case and is already done:**
+   the SDPA rewrite lowers to `nkilib`'s `attention_cte`, calling that kernel by
+   hand reproduces the same latency to 0.97x, and the 3.1x per-chip gap to the
+   H100 is therefore that kernel against cuDNN/FlashAttention. Writing a NKI
+   prefill provider would re-derive the number the table already has.
 3. **An int32 index, if a *downstream* workload owns its own indices.** `gather` is
    291-731x faster with one
    ([details](#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity)).
    This benchmark's op defs deliberately keep int64 for portability, so the fix
    belongs in real model code, not here — but it is the single largest measured
    speedup available on this stack, and it is free.
-4. **`matmul_mxfp8`, for fp8.** The 99x fp8 gap is that no fp8 datapath is reached
-   at all. This one needs the op def extended first to express a block-scale
-   tensor, since microscaling has no meaning without one — the largest piece of work
-   in the list, and the only one that changes shared code.
+4. **An fp8 `gemm` provider that compiles, for fp8 — and `float8_e5m2` cases to
+   point it at.** The published 99x is the eager path in an encoding this chip does
+   not implement; compiled `e5m2` reaches 75.6% of the fp8 peak and closes the
+   per-chip gap to 1.56x
+   ([details](#fp8-the-sweep-measures-the-eager-path-and-the-wrong-e4m3-encoding)).
+   The work is a provider that wraps the matmul in
+   `torch.compile(..., dynamic=False)`, not a new kernel. `matmul_mxfp8` from
+   `nkilib.experimental` is the further step and still needs the op def extended to
+   carry a block-scale tensor, since microscaling has no meaning without one — the
+   largest piece of work in the list, and the only one that changes shared code.
 
 Two known defects in `torch_neuronx` itself are recorded rather than worked around,
 because working around them in `vendor_ops` would hide them: the dropped

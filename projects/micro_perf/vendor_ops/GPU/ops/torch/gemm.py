@@ -30,9 +30,11 @@ class GPUGemmOp:
             # only all-e5m2 kernel that could exist does not. Both operands here
             # carry `dtype`, so an e5m2 case has no kernel and is reported as
             # unsupported rather than raising mid-sweep. (Worth contrasting with
-            # the NEURON result, where e5m2 is not merely supported but *faster*
-            # than e4m3 -- which is itself the tell that no fp8 kernel is
-            # involved there at all.)
+            # the NEURON result, where the asymmetry runs the other way: e5m2 is
+            # the encoding Trainium2 implements and the only one that compiles
+            # there, so the two backends share no fp8 format both stacks will
+            # multiply, and the fp8 row cannot be made like-for-like inside this
+            # op def.)
             if self.dtype == "float8_e5m2":
                 raise NotImplementedError(
                     "cuBLAS does not implement e5m2 x e5m2; e5m2 is only "

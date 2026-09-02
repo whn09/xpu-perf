@@ -27,6 +27,17 @@ try:
     # this comment used to say) ships attention_tkg for exactly that case; wiring it
     # would be a second provider, not a change to this one.
     #
+    # And the kernel this rewrite picks for prefill is already the best one nkilib
+    # has to offer: decompositions.py line 24 imports nkilib's attention_cte and
+    # line 71 wraps that same object, so `dc.attention_cte is attention_cte` holds.
+    # Calling attention_cte by hand with the launch arguments used at line 935
+    # (lnc=logical_neuron_cores, tp_k=True, KV left at its own head count) gives
+    # 7,407.4 us against SDPA's 7,636.7 us -- 0.97x, bit-identical output, one
+    # kernel reached two ways. So a hand-rolled NKI prefill provider would
+    # re-derive this number rather than improve on it; see
+    # tools/probe_attention_kernel.py. Note the trap it documents: omitting the lnc
+    # subscript runs the kernel on one half of the LNC2 pair and costs 1.85x.
+    #
     # This is registered only on the native runtime. On the XLA runtime the NKI
     # provider is the intended implementation, and adding a second one would
     # change results that have already been validated.
