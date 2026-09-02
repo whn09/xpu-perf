@@ -353,8 +353,8 @@ a kernel.
 | `vendor_test/flash_attention.json` | 588 | **0** | 420 rejected by the base op def, 168 by this backend (paged cache) |
 | `vendor_test_demo/flash_attention.json` | 9 | **0** | same, plus 2 `attn_mode=decode` |
 | `single_test_ops/fa_ops.json` | 11 | **0** | every case sets `block_size: 512` and GQA `[80, 8, 128]` |
-| `vendor_test/quant_matmul.json` | 736 | int8 only (184) | the other 552 are `float8`/`mxfloat8`/`mxfloat4`, rejected by the base op def |
-| `vendor_test/moe_quant_group_gemm.json` | 1380 | int8 only (276) | ditto |
+| `vendor_test/quant_matmul.json` | 736 | 85, of 184 runnable | only the int8 quarter is runnable — the other 552 cases are `float8`/`mxfloat8`/`mxfloat4` and the base op def rejects them. A 5 h timeout cut the rest |
+| `vendor_test/moe_quant_group_gemm.json` | 1380 | **15**, of 276 runnable | same dtype gate, but far worse per case: 15 in 4 h, ~16 min of wall clock each. See below |
 | `single_test_ops/ccl_ops.json` | — | **0** | asks for `world_size: 8`; a trn2.3xlarge has 4 logical cores |
 
 So the flash_attention figures in [Reference numbers](#reference-numbers-measured-on-trn23xlarge)
@@ -377,9 +377,14 @@ so this is what every backend reports. Two consequences:
 - `moe_quant_group_gemm` is worse than a simulation of the wrong dtype: it is a
   Python `for` loop over experts whose slice bounds are read out of device
   tensors, so it syncs to the host once per expert and recompiles for each
-  data-dependent shape. Its latency is **2.7 s and completely flat** from 1 token
-  to 640 tokens — a 640x range with no change, because none of the time is
-  arithmetic. Do not quote it as a MoE number for any accelerator.
+  data-dependent shape. Its latency is **2.67-2.84 s across every case measured**,
+  1 token to 1024 at `ep_size=4` — a 1024x range with no trend at all, because
+  none of the time is arithmetic. `calc_flops_power` reads 0.000 to 0.012 TFLOPS
+  over the same span. Do not quote it as a MoE number for any accelerator.
+
+  The recompilation is also why only 15 of the 276 runnable cases finished inside
+  four hours: ~16 minutes of wall clock per 2.7-second measurement. If you need
+  the whole file, budget three days or trim the shape list.
 
 ### Ops that run but are pathologically slow
 
@@ -464,6 +469,51 @@ micro_perf) of a 8192x4096x4096 bf16 gemm on one logical core reached 143
 TFLOPS, i.e. 86% of 166.75 — the right shape of number for a large gemm, which
 is the main reason to believe 166.75 is the correct per-core figure rather than
 667 or 83.375.
+
+## Reproducing the full sweep
+
+`tools/` holds what produced the eager full-sweep numbers below. Four scripts,
+because `launch.py --task all` does not survive this workload set — see the
+comment block at the top of `run_full_sweep.sh` for the four separate reasons.
+
+```bash
+# 1. Build the eager image: the native base ships no reporting stack, so
+#    launch.py dies on `import prettytable` before reaching the device.
+docker build -f vendor_ops/NEURON/tools/Dockerfile.eager \
+    -t xpu-perf-beta4:latest vendor_ops/NEURON/tools
+
+# 2. Sweep. From projects/micro_perf, on an idle trn2.3xlarge. Budget a day.
+setsid nohup vendor_ops/NEURON/tools/run_full_sweep.sh &
+
+# 3. Per-run accounting: cases tried, measured, and the grouped reason for
+#    every rejection.
+python3 vendor_ops/NEURON/tools/analyze_sweep.py /tmp/neuron_sweep.log
+
+# 4. One op's full scaling curve rather than a summary line.
+python3 vendor_ops/NEURON/tools/analyze_sweep.py /tmp/neuron_sweep.log all_to_all
+```
+
+The scripts override defaults from the environment (`IMAGE`, `REPO`, `LOG`,
+`RESULTS`, `DOCKER`), so a different image or a non-`sudo` docker needs no edit.
+
+Two things worth understanding before reading a report:
+
+- **A killed run writes no report, but its results are still recoverable.**
+  micro_perf only writes CSV/jsonl when a launch finishes, so a watchdog kill
+  loses everything on disk — but every case is printed to stdout as it
+  completes. `recover_from_log.py <log> <outdir>` rebuilds the CSVs from that,
+  and backfills `mfu` for logs taken before the backend emitted it. Several of
+  the numbers below come through this path rather than from a clean exit.
+- **Measured-case counts are not the enumerated case counts.** Most `workloads/llm/`
+  cases are rejected by their own op definition before reaching the device, so
+  compare what `analyze_sweep.py` reports as `measured` against the totals in
+  [What the shipped LLM workloads actually measure](#what-the-shipped-llm-workloads-actually-measure)
+  rather than against what the launcher printed at startup.
+
+`run_full_sweep.sh` deliberately leaves out `workloads/llm/single_test_ops/ccl_ops.json`
+(needs `world_size: 8`) and caps `workloads/xccl_ops/` sizes via
+`cap_xccl_workloads.py`. Both exclusions are load-bearing, not tidying: the
+second one is what keeps a rank from OOMing, which would hang the launch forever.
 
 ## Reference numbers (measured on trn2.3xlarge)
 
@@ -562,8 +612,10 @@ rather than as a hardware result:
 ### Eager runtime, full sweep
 
 Measured 2026-09-01 on the same host and image, sweeping every workload file in
-the repo. 3,000-odd cases; the per-workload accounting of what ran and what was
-rejected is under
+the repo: ~2,995 cases measured, ~1,100 rejected before reaching the device, and
+two workloads cut short by their watchdog. Reproduce with `tools/run_full_sweep.sh`
+(see [Reproducing the full sweep](#reproducing-the-full-sweep)); the per-workload
+accounting of what ran and what was rejected is under
 [What the shipped LLM workloads actually measure](#what-the-shipped-llm-workloads-actually-measure).
 `workloads/llm/single_test_ops/ccl_ops.json` is the only file with no runnable
 case here at all — it asks for `world_size: 8`.

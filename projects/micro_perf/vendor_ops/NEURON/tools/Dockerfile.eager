@@ -1,0 +1,17 @@
+# The PyTorch-native ("eager") Neuron stack plus the reporting dependencies
+# micro_perf needs. The base image ships the runtime, torch_neuronx and
+# neuronx-cc but no reporting stack, so `launch.py` dies on `import prettytable`
+# before it reaches the device.
+#
+# The base tag below is the beta image the eager reference numbers were measured
+# with (torch 2.12.1, torch-neuronx 2.12.3.0.1636, neuronx-cc 2.27.2878.0,
+# nki 0.6.0). It lives in an AWS-internal ECR repository and is not public; if
+# you cannot pull it, substitute whichever native image you have — nothing here
+# depends on the tag beyond `import torch_neuronx` working.
+#
+#   aws ecr get-login-password --region us-east-1 \
+#       | docker login --username AWS --password-stdin 421672808698.dkr.ecr.us-east-1.amazonaws.com
+#   docker build -f Dockerfile.eager -t xpu-perf-beta4:latest .
+FROM 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+
+RUN pip install --no-cache-dir prettytable jsonlines flask

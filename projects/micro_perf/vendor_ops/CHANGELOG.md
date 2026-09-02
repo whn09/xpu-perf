@@ -52,6 +52,16 @@ This changelog follows a Keep a Changelog style and semantic versioning.
   at fp32) exceed the 24 GiB a logical NeuronCore gets, and an OOM there hangs
   the launch permanently rather than failing it; and world_size 4 is the only
   size that runs every collective, since `all_to_all` rejects 2.
+- `NEURON/tools/`: the harness that produced those numbers, so the sweep is
+  reproducible rather than just described. `Dockerfile.eager` (the native image
+  plus the reporting deps `launch.py` needs), `run_full_sweep.sh` (per-workload
+  launches under a `docker kill` watchdog — `timeout docker run` cannot bound a
+  launch, since it signals the client while the container is a child of the
+  daemon), `cap_xccl_workloads.py` (size-capped `xccl_ops` copies that fit one
+  core), `analyze_sweep.py` (per-run accounting: tried / measured / grouped
+  rejection reason, plus a per-case curve mode) and `recover_from_log.py`
+  (rebuilds CSVs from stdout, since micro_perf writes reports only on a clean
+  finish and a killed run otherwise leaves nothing).
 - `NEURON/README.md`: documented the ops that run but are not worth reporting as
   hardware results — `gather` at 1.34 GB/s and `scatter` at 0.8 GB/s against
   `index_select`'s 631 GB/s, which is a 470x gap caused entirely by the base op
