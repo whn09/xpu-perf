@@ -182,31 +182,201 @@ their watchdog. Per-workload accounting is in
 `workloads/llm/single_test_ops/ccl_ops.json` is the only file with no runnable
 case at all (it asks for `world_size: 8`).
 
-Memory-bound ops. A quarter of the chip's 2.9 TB/s is ~725 GB/s, so that is the
-ceiling to read these against:
+#### Compute-bound peaks
 
-| Op | Best mem_bw | Cases |
-|---|---|---|
-| `device2device` | 648.7 GB/s | 76 |
-| `reduce_sum` | 639.0 GB/s | 33 |
-| `index_select` | 631.6 GB/s | 44 |
-| `embedding` | 631.5 GB/s | 44 |
-| `softmax` | 495.8 GB/s | 33 |
-| `topk` | 476.3 GB/s | 147 |
-| `reduce_max` / `reduce_min` | 177.0 / 176.6 GB/s | 33 each |
-| `index_add` | 98.4 GB/s | 66 |
-| `gather` | 1.34 GB/s | 16 of 44 (compiler wedge) |
-| `scatter` | 0.8 GB/s | 5 of 44 (compiler wedge) |
+Best case per dtype, over all 208 `gemm` shapes in
+`workloads/basic/tensor_gemm_ops/gemm.json`:
 
-`reduce_max`/`reduce_min` at 177 GB/s against `reduce_sum` at 639 is a 3.6x gap
-between three reductions over the same shapes, so the max/min lowering is leaving
-bandwidth on the table. `gather` and `scatter` are a different phenomenon — see
+| Op | Dtype | Best shape (MxKxN) | Latency | TFLOPS | MFU |
+|---|---|---|---|---|---|
+| `gemm` | bf16 | 12288x8192x8192 | 11,038.1 us | **149.42** | **90%** |
+| `gemm` | fp16 | 32768x1024x8192 | 3,755.8 us | **146.38** | **88%** |
+| `gemm` | fp32 | 3968x1024x8192 | 1,802.7 us | **36.93** | **82%** |
+| `gemm` | fp8 e5m2 | 16384x8192x8192 | 460,699.0 us | 4.77 | 1.5% |
+| `gemm` | fp8 e4m3 | 16384x8192x8192 | 570,968.6 us | 3.85 | 1.2% |
+| `moe_gating_gemm` | fp32 | 8192 tokens, 8192 hidden, 128 experts | 784.9 us | 21.89 | 48% |
+| `quant_matmul` | "int8" | 73728x8192x8192 | 627,062.4 us | 15.78 | n/a |
+
+The MFU column for the three float `gemm` rows is computed here rather than read
+out of the log: that sweep predates `peak_tflops`/`mfu` reaching the basic-gemm
+path, so its result blocks carry no `mfu` key (a run today does emit it, and the
+fp8 rows are read straight out of it). The denominators are the per-core peaks
+from [MFU](#mfu) — 166.75 for bf16/fp16, 45.25 for fp32, 324.75 for fp8.
+
+**The two fp8 rows are in the table for completeness and should not be read as
+fp8 hardware numbers** — 1.2% of peak is what a bf16 matmul preceded by a
+software up-cast costs, not what the fp8 engines do. See
+[fp8 runs but does not reach the fp8 datapath](#fp8-runs-but-does-not-reach-the-fp8-datapath).
+
+**90% of the dense bf16 peak on one logical core is the headline number for this
+chip**, and it is 20 points above the 1024x4096x4096 row in the table above: that
+shape is too small to hide the ~60 us dispatch floor, and it is the shape a quick
+smoke test uses. `quant_matmul` is not an int8 hardware number on any backend —
+see [the quantized ops are a bf16 simulation](#the-quantized-ops-are-a-bf16-simulation-on-every-backend).
+
+#### Memory-bound ops
+
+A quarter of the chip's 2.9 TB/s is ~725 GB/s, so that is the ceiling to read
+these against. Best `mem_bw` per op, with the dtype that reached it:
+
+| Op | fp32 | fp16 | bf16 |
+|---|---|---|---|
+| `device2device` | — | — | **648.7** |
+| `reduce_sum` | **639.0** | 314.9 | 315.4 |
+| `index_select` | 630.9 | — | **631.6** |
+| `embedding` | 629.2 | — | **631.5** |
+| `cast` | **616.7** | 594.0 | 593.3 |
+| `sub` | **608.6** | 600.3 | 600.0 |
+| `add` | 600.6 | **601.9** | 599.9 |
+| `mul` | 599.2 | 599.7 | **599.9** |
+| `silu` | **587.2** | 466.7 | 471.0 |
+| `exp` | 578.8 | 557.8 | **566.0** |
+| `div` | 379.0 | **579.9** | 573.7 |
+| `log` | 559.1 | **564.6** | 559.4 |
+| `sqrt` | 557.9 | **564.5** | 533.6 |
+| `softmax` | **495.8** | 291.4 | 295.7 |
+| `topk` | **476.3** | 239.7 | 239.4 |
+| `rms_norm` | **409.2** | 322.6 | 322.6 |
+| `layer_norm` | **259.3** | 172.2 | 172.7 |
+| `reduce_max` / `reduce_min` | **176.6 / 177.0** | 97.9 / 97.7 | 97.1 / 97.2 |
+| `sin` | **118.9** | 41.8 | 30.6 |
+| `cos` | **110.6** | 41.0 | 29.7 |
+| `index_add` | **98.6** | 86.1 | 86.3 |
+| `gelu` | **83.7** | 42.9 | 42.4 |
+| `rotary_embedding` | — | — | 42.8 |
+| `moe_gather` | — | — | 9.2 |
+| `gather` | **1.4** | — | 0.7 |
+| `scatter` | **0.8** | — | — |
+| `moe_scatter_dynamic_quant` | — | — | 0.7 |
+
+Five things in that table are lowering quality rather than hardware:
+
+- **`gelu` is 7-14x slower than `silu`** over identical shapes (83.7 vs 587.2 at
+  fp32, 42.4 vs 471.0 at bf16). Both are one elementwise pass over one tensor, so
+  a 14x gap is the `erf`-based expansion, not bandwidth. If a model can use
+  `silu`, that is 14x here.
+- **`sin` / `cos` at bf16 are 4x slower than at fp32** (30 GB/s vs 119) — the only
+  ops in the sweep that get *worse* with a narrower dtype, and the reason
+  `rotary_embedding` lands at 42.8 GB/s.
+- **`reduce_max`/`reduce_min` at 177 GB/s against `reduce_sum` at 639** is a 3.6x
+  gap between three reductions over the same shapes.
+- **`div` at fp32 is 379 GB/s where `mul` is 599**, but at fp16/bf16 both are
+  ~580-600. The fp32 divider is the outlier, not division as such.
+- **`rms_norm` and `layer_norm` report byte-identical fp16 and bf16 latencies**
+  (1665.2 us and 778.0/780.2 us): the compiler is emitting the same fp32-accumulate
+  kernel for both, so their bf16 rows are not measuring bf16 arithmetic.
+
+`gather` and `scatter` are a different phenomenon again — see
 [Two index ops are pathologically slow](#two-index-ops-are-pathologically-slow).
 
-Compute, best per op: `moe_gating_gemm` 21.9 TFLOPS at **MFU 48.4%**;
-`quant_matmul` plateaus at 12-16 "TOPS" but see
-[the quantized ops are a bf16 simulation](#the-quantized-ops-are-a-bf16-simulation-on-every-backend);
-`rms_norm` MFU 0.34%, which is correct for a memory-bound op.
+**A `gemm` narrow enough to be memory-bound reaches 500-573 GB/s** (M=128,
+K=N=8192: 573.3 fp16 / 559.2 bf16 / 499.8 fp32), i.e. 77-79% of the per-core
+ceiling. That is the cleanest bandwidth number in the sweep after
+`device2device`, because it comes from an op whose operands are read exactly once.
+
+#### Norm, activation and MoE gating ops
+
+2026-09-02, same instance and image. These twelve ops had an `op_defs`
+implementation but no workload JSON anywhere in the repo, so nothing had ever
+measured them on any backend; `workloads/llm/single_test_ops/norm_ops.json`,
+`activation_ops.json`, `moe_gating_ops.json` and `quant_ops.json` now do. Best
+`mem_bw`, against the same ~725 GB/s per-core ceiling:
+
+| Op | fp32 | fp16 | bf16 | Peak at |
+|---|---|---|---|---|
+| `head_rms_norm` | **429.9** | — | 95.7 | 1024 tokens, 96 heads, 80 normalised |
+| `qk_rms_norm` | **374.1** | — | 90.8 | 4096 tokens, 80 q / 8 kv heads |
+| `swiglu` | **312.1** | 291.1 | 292.1 | 4096 tokens, hidden 4096-8192 |
+| `moe_swiglu` | — | — | **306.2** | 10240 tokens, 128 experts, topk 8, ep 8 |
+| `add_rms_norm` | — | — | **269.6** | 4096 tokens, hidden 8192 |
+| `moe_softmax_topk` | **74.4** | — | — | 32768 tokens, 256 experts, post-softmax |
+| `add_rms_norm_dynamic_quant` | — | — | **2.4** | bf16 -> int8 |
+| `moe_swiglu_dynamic_quant` | — | — | **2.2** | bf16 -> int8 |
+| `swiglu_dynamic_quant` | — | — | **1.6** | bf16 -> int8 |
+| `quant_group_gemm_reduce_sum` | — | — | **1.5** | int8 -> bf16, 2.61 "TFLOPS" |
+| `head_rms_norm_dynamic_quant` | — | — | **1.1** | bf16 -> int8 |
+| `scale_dynamic_quant` | — | — | **0.7** | bf16 -> int8 |
+
+Dashes are dtypes the base op def refuses, not dtypes that failed:
+`add_rms_norm`, `moe_swiglu` and every `_dynamic_quant` op accept bfloat16 only,
+and `moe_softmax_topk` float32 only. Four things worth reading out of that table:
+
+- **`head_rms_norm` and `qk_rms_norm` are 4.1-4.5x faster at fp32 than at bf16.**
+  This is the `sin`/`cos` anomaly again, but much larger and on ops that matter
+  more: 429.9 vs 95.7 and 374.1 vs 90.8. `swiglu` over the same token counts shows
+  no such gap (312.1 fp32 vs 292.1 bf16), so it is not a general bf16 penalty. The
+  two slow ops are the two that normalise a *slice of heads* out of a wider
+  `[tokens, total_head_num, head_dim]` tensor, i.e. the ones whose input is a
+  strided view.
+- **Every `*_dynamic_quant` op is 87-183x slower than its unquantised sibling**,
+  on identical shapes, and all six are one unfused helper — see
+  [the `*_dynamic_quant` family](#the-_dynamic_quant-family-is-90-180x-off-and-it-is-one-shared-helper).
+- **Bandwidth peaks around 1024-4096 tokens and then falls back 20-40%.**
+  `head_rms_norm` at fp32 goes 429.9 (1024 tokens) -> 394.8 (4096) -> 326.9
+  (16384) -> 221.3 (32768); `add_rms_norm` goes 269.6 -> 201.8 -> 175.9. Every norm
+  and activation op does this. A sweep that only measures one large batch will
+  understate this hardware by a third.
+- **`moe_softmax_topk` is launch-bound, not bandwidth-bound.** Latency is flat at
+  120-270 us from 1 token to 16384 across all four expert counts, and only starts
+  to climb past that. `post-softmax` is consistently 1.5-1.9x cheaper than
+  `pre-softmax` (426.2 vs 649.0 us at 32768 tokens / 128 experts), which is
+  structural rather than a lowering artifact: `pre-softmax` softmaxes all `E`
+  experts, takes topk, then renormalises, while `post-softmax` takes topk first and
+  softmaxes only `k` values.
+
+#### Attention
+
+2026-09-02, same instance and image, `single_test_ops/fa_linear_ops.json` through
+the eager `torch` (SDPA) provider. Nine of the file's ten cases; the tenth is
+`q_len: 4` speculative decode, which this provider rejects on purpose (see
+[Known unsupported](#known-unsupported)). All bf16, `head_dim` 128.
+
+| Mode | q/kv heads | Batch | cache_len | q_len | Latency | TFLOPS | MFU | mem_bw |
+|---|---|---|---|---|---|---|---|---|
+| prefill | 80/8 (GQA) | 1 | 0 | 4,096 | 9,507.6 us | 36.15 | 21.7% | 19.4 GB/s |
+| prefill | 80/8 (GQA) | 4 | 0 | 4,096 | 34,422.1 us | 39.94 | 24.0% | 21.4 GB/s |
+| prefill | 80/8 (GQA) | 1 | 0 | 10,240 | 39,969.3 us | 53.73 | **32.2%** | 11.5 GB/s |
+| prefill | 80/80 (MHA) | 1 | 0 | 4,096 | 9,520.2 us | 36.10 | 21.7% | 35.2 GB/s |
+| prefill | 80/80 (MHA) | 4 | 0 | 4,096 | 34,757.8 us | 39.55 | 23.7% | 38.6 GB/s |
+| prefill | 80/80 (MHA) | 1 | 0 | 10,240 | 39,782.3 us | 53.99 | **32.4%** | 21.1 GB/s |
+| decode | 80/8 (GQA) | 16 | 4,096 | 1 | 1,976.7 us | 1.36 | 0.8% | 136.2 GB/s |
+| decode | 80/8 (GQA) | 64 | 4,096 | 1 | 4,511.3 us | 2.38 | 1.4% | **238.7 GB/s** |
+| decode | 80/8 (GQA) | 16 | 10,240 | 1 | 6,066.2 us | 1.11 | 0.7% | 110.7 GB/s |
+
+Read MFU for the prefill rows and `mem_bw` for the decode rows, not both for
+both. Prefill is compute-bound (`calc_mem_ratio` is in the hundreds), decode is
+memory-bound — one query row against the whole cache does ~10 FLOPs per byte
+moved, so a decode MFU of 0.8% is arithmetically unavoidable and says nothing
+about the chip. Three things the table does say:
+
+- **GQA and MHA cost the same here, to within 1%.** 9,507.6 vs 9,520.2 us at
+  `q_len 4096`, 39,969.3 vs 39,782.3 at 10,240 — and the MHA row is *faster* at
+  the longer length. That is the expected result rather than a suspicious one:
+  prefill is compute-bound and both configs do identical arithmetic, since GQA
+  saves KV *traffic*, not FLOPs. The traffic it saves (168 MB down to 16.8 MB) is
+  ~0.2 ms at this core's bandwidth, about 2% of a 9.5 ms latency. **This does not
+  demonstrate that `enable_gqa=True` avoids materialising the expanded cache** —
+  prefill cannot distinguish the two, because the copy would be hidden under the
+  same compute. Decode would show it, and the workload only covers GQA there, so
+  there is no MHA decode row to compare against.
+- **Prefill MFU improves with sequence length and saturates well below the
+  chip.** 21.7% at `q_len 4096` -> 32.2% at 10,240. Batching to 4 buys almost
+  nothing (24.0%), which is consistent: at `q_len 4096` one sequence already
+  fills the engine, so a batch is four sequential prefills (34,422 ≈ 4 x 9,508 x
+  0.905). Nothing here approaches the 90% the same core reaches on a large `gemm`,
+  and that gap is the SDPA lowering, not the tensor engine.
+- **Decode reaches 15-33% of this core's memory bandwidth, and that is the real
+  finding.** The decode rows move nothing but the KV cache, so `mem_bw` against
+  ~725 GB/s is the whole story: 110.7-238.7 GB/s, i.e. 15-33%. For scale, the
+  best plain memory-bound op measured on this core is `index_select` at 631 GB/s.
+  So decode here is *not* bandwidth-limited — it is leaving a factor of 2.6-5.7x
+  of available bandwidth unused, and a fused paged-attention kernel is what would
+  reclaim it. Larger batches help (238.7 at B=64 vs 136.2 at B=16) and longer
+  caches hurt (110.7 at 10,240), which is the signature of a per-call fixed cost
+  being amortised rather than of a bandwidth ceiling.
+
+For the same nine cases measured on an H100 with the same provider code, see
+[`../GPU/README.md`](../GPU/README.md).
 
 Collectives, best `bus_bw`:
 
@@ -338,21 +508,26 @@ measurement behind this, and why `torch.compile` does not fix it, is in
 |---|---|---|---|
 | `vendor_test/flash_attention.json` | 588 | **0** | 420 rejected by the base op def, 168 by this backend (paged cache) |
 | `vendor_test_demo/flash_attention.json` | 9 | **0** | same, plus 2 `attn_mode=decode` |
-| `single_test_ops/fa_ops.json` | 11 | **0** | every case sets `block_size: 512` and GQA `[80, 8, 128]` |
+| `single_test_ops/fa_ops.json` | 11 | **0** | every case sets `block_size: 512`, i.e. a paged cache. `single_test_ops/fa_linear_ops.json` covers the same head configurations over a linear one |
 | `vendor_test/quant_matmul.json` | 736 | 85, of 184 runnable | only the int8 quarter is runnable; the other 552 are `float8`/`mxfloat8`/`mxfloat4` and the base op def rejects them. A 5 h timeout cut the rest |
 | `vendor_test/moe_quant_group_gemm.json` | 1380 | **15**, of 276 runnable | same dtype gate, but far worse per case: 15 in 4 h, ~16 min of wall clock each |
 | `single_test_ops/ccl_ops.json` | — | **0** | asks for `world_size: 8`; a trn2.3xlarge has 4 logical cores |
 
-So the flash_attention figures above come from
-`workloads/neuron_smoke/flash_attention.json`, the only flash_attention workload
-in the repo with a runnable case here: no `block_size`, MHA `[8, 8, 128]`,
-all-bfloat16. `flash_fwd` takes one contiguous K/V block, so only prefill is
-expressible, and it also needs all-bfloat16 with a linear cache, MHA
-(`q_head_num == kv_head_num`), `batch_size == 1` and `cache_len == 0`. The eager
-`torch` provider accepts the same envelope so both
-runtimes report the same cases, even though SDPA is more general — GQA is
-excluded deliberately, because expanding kv heads needs a `repeat_interleave`,
-a real copy that would land inside the timed region.
+The XLA figures above come from `workloads/neuron_smoke/flash_attention.json`, the
+only flash_attention workload in the repo that the NKI path can run: no
+`block_size`, MHA `[8, 8, 128]`, all-bfloat16. `flash_fwd` takes one contiguous
+K/V block, so only prefill is expressible, and it also needs MHA
+(`q_head_num == kv_head_num`), `batch_size == 1` and `cache_len == 0`.
+
+The eager `torch` provider is wider than that and no longer mirrors it. It needs
+all-bfloat16 and a linear cache, but GQA, batched prefill and single-token decode
+all run — `scaled_dot_product_attention(..., enable_gqa=True)` consumes the
+unexpanded kv heads directly, so no `repeat_interleave` copy lands in the timed
+region. Two case families stay rejected, and for correctness rather than
+performance: PyTorch aligns `is_causal` to the **top-left** of a non-square score
+matrix, while chunked prefill (`cache_len > 0` with `q_len > 1`) and multi-token
+decode both need **bottom-right** alignment. Passing `is_causal=True` anyway does
+not fail — it silently attends to the wrong keys.
 
 ### The quantized ops are a bf16 simulation, on every backend
 
@@ -376,6 +551,146 @@ so this is what every backend reports.
   same span). Do not quote it as a MoE number for any accelerator. The
   recompilation is also why only 15 of 276 runnable cases finished in four hours:
   ~16 minutes of wall clock per 2.7-second measurement.
+
+### The `*_dynamic_quant` family is 90-180x off, and it is one shared helper
+
+Six ops in the norm/activation table are two orders of magnitude slower than the
+unquantised op they wrap, on identical shapes:
+
+| Quantising op | Its bandwidth | Unquantised sibling | Sibling's bandwidth | Ratio |
+|---|---|---|---|---|
+| `swiglu_dynamic_quant` | 1.6 GB/s | `swiglu` | 292.1 GB/s | 183x |
+| `moe_swiglu_dynamic_quant` | 2.2 GB/s | `moe_swiglu` | 306.2 GB/s | 139x |
+| `add_rms_norm_dynamic_quant` | 2.4 GB/s | `add_rms_norm` | 269.6 GB/s | 112x |
+| `head_rms_norm_dynamic_quant` | 1.1 GB/s | `head_rms_norm` (bf16) | 95.7 GB/s | 87x |
+
+**This is not six problems, and it is not a Neuron problem.** All six —
+`scale_dynamic_quant`, `add_rms_norm_dynamic_quant`,
+`head_rms_norm_dynamic_quant`, `swiglu_dynamic_quant`,
+`moe_swiglu_dynamic_quant` and `moe_scatter_dynamic_quant` — call one function,
+`smooth_per_token_dynamic_quant` in `core/utils.py`, and it is written as a chain
+of independent full-size tensor ops rather than as one fused pass. Reading it,
+a `[T, H]` bfloat16 input produces **six full-size float32 temporaries**:
+
+```
+hidden_states.contiguous().view(...).to(torch.float32)   # T1  [T,H] fp32
+smoothed_input = torch.mul(hidden_states, smooth_scale)  # T2  [T,H] fp32
+smoothed_input.abs()                                     # T3  [T,H] fp32
+torch.max(..., -1, keepdim=True)[0].reciprocal()         #     [T,1]
+torch.mul(smoothed_input, per_token_scale)               # T4  [T,H] fp32
+    .clamp(-max_dtype_val, max_dtype_val)                # T5  [T,H] fp32
+    .round()                                             # T6  [T,H] fp32
+    .type(dst_torch_dtype)                               # T7  [T,H] int8
+```
+
+Two costs follow, and they compound:
+
+- **The declared I/O is not the traffic.** `mem_bw` is computed from the op def's
+  `io_bytes`, i.e. what a fused kernel *would* move: 2 bytes in and 1 byte out per
+  element, `3TH`. Summing the reads and writes of the chain above gives about
+  `55TH` — roughly **18x** amplification, most of it because `.to(torch.float32)`
+  doubles the working set on the first line and every later stage pays it.
+- **Seven dispatches instead of one.** Each stage is a separate launch, and on the
+  eager runtime a launch has a ~60 us floor (see
+  [Small-op latencies](#small-op-latencies-measure-the-runtime-not-the-chip)).
+  That is a ~420 us floor before any arithmetic.
+
+18x of traffic and 7x of launches do not multiply out to 87-183x on their own, so
+some of the remainder is lowering quality on top. That split has **not** been
+measured stage by stage — the decomposition above is read off the source, and the
+only measured quantity is the end-to-end ratio in the table.
+
+The practical consequences:
+
+- **Do not quote these six as quantisation performance for any accelerator.** They
+  measure a helper, and they would be similarly bad on a GPU. If you need a real
+  per-token dynamic-quant number, fuse the helper first.
+- The reported figures **understate** the op slightly rather than flattering it:
+  an earlier version of the helper multiplied `smooth_scale` by `per_token_scale`
+  instead of `smoothed_input`, which broadcasts to the same shape and so never
+  failed, but made the output independent of `hidden_states`. That is fixed, and
+  the fix makes the op marginally *more* work.
+
+### fp8 runs but does not reach the fp8 datapath
+
+`workloads/basic/tensor_gemm_ops/gemm.json` has `float8_e4m3` and `float8_e5m2`
+cases, and this backend's `gemm` accepts them (the base `GemmOp` gates `dtype` to
+the four float formats, so no other backend reports them). They run:
+`torch.matmul` on `torch.float8_e4m3fn` dispatches to `neuron:0` and returns an
+fp8 tensor. **The result is an fp8 storage number, not an fp8 arithmetic number**,
+and it lands two orders of magnitude below the 324.75 TFLOPS per-core fp8 peak.
+
+The measurement that pins down why, at 4096x4096x4096 on one core:
+
+| What | Latency |
+|---|---|
+| `matmul(a_bf16, b_bf16)` | 1,041.7 us |
+| `matmul(a_e4m3, b_e4m3)` | 84,580 us |
+| `matmul(a_e5m2, b_e5m2)` | 64,223 us |
+| `matmul(a_e4m3.to(bf16), b_e4m3.to(bf16))` — the control | **49,761.9 us** |
+
+The control is the whole story: casting the operands up to bfloat16 by hand,
+outside any matmul, already costs 48× the bf16 matmul. So the fp8 lowering is
+*cast up, then run a bf16 matmul*, and the cast dominates — there is no fp8
+datapath being reached and nothing about the 84 ms is a property of the fp8
+engines. (Those four numbers come from a probe on a contended machine, so read
+them as ratios. The clean figures are below.)
+
+All 24 fp8 cases, on an idle core, MFU against the 324.75 TFLOPS per-core fp8
+peak:
+
+| K x N | M | e4m3 latency | e4m3 TFLOPS | e5m2 latency | e5m2 TFLOPS |
+|---|---|---|---|---|---|
+| 4096x4096 | 1024 | 32,567.8 us | 1.05 | 20,905.1 us | 1.64 |
+| 4096x4096 | 4096 | 76,748.5 us | 1.79 | 58,183.0 us | 2.36 |
+| 4096x4096 | 8192 | 133,869.5 us | 2.05 | 109,663.6 us | 2.51 |
+| 4096x4096 | 16384 | 244,568.8 us | 2.25 | 195,988.7 us | 2.81 |
+| 8192x1024 | 1024 | 26,495.7 us | 0.65 | 17,795.4 us | 0.96 |
+| 8192x1024 | 4096 | 75,388.6 us | 0.91 | 51,755.6 us | 1.33 |
+| 8192x1024 | 8192 | 142,229.6 us | 0.97 | 107,777.1 us | 1.27 |
+| 8192x1024 | 16384 | 259,510.5 us | 1.06 | 180,802.7 us | 1.52 |
+| 8192x8192 | 1024 | 139,329.7 us | 0.99 | 96,347.2 us | 1.43 |
+| 8192x8192 | 4096 | 225,997.0 us | 2.43 | 171,495.6 us | 3.21 |
+| 8192x8192 | 8192 | 346,166.1 us | 3.18 | 265,862.5 us | 4.14 |
+| 8192x8192 | 16384 | **570,968.6 us** | **3.85** | **460,699.0 us** | **4.77** |
+
+Three things in that table confirm the cast, not the matmul, is being measured.
+
+- **MFU never leaves 0.2-1.5%.** The best fp8 case reaches 4.77 TFLOPS against
+  149.42 for bf16 at the comparable 12288x8192x8192 — fp8 is **31x slower** on a
+  format whose peak is 2x higher, so it is 63x off relative to its own ceiling.
+- **e5m2 beats e4m3 by 20-35% at every one of the 12 shapes.** No tensor engine
+  cares how a byte splits its exponent and mantissa — but an emulated
+  `float8 -> bfloat16` conversion does, because e5m2's 5-bit exponent and 2-bit
+  mantissa map onto bf16's 8/7 with a shift and a mask, while e4m3 needs its
+  4-bit exponent rebiased and its subnormals renormalised.
+- **Latency scales with elements, not with FLOPs.** Going from M=1024 to M=16384
+  at 8192x8192 is 16x the arithmetic but only 4.1x the time, because the B operand
+  (67 M elements) is re-cast once per call and dominates the small-M cases. That
+  is why the TFLOPS column climbs monotonically with M instead of flattening: the
+  fixed cast cost is being amortised, which is not how a compute-bound gemm
+  behaves.
+
+Practical consequence: `gemm.json` enumerates **856** cases once the fp8 block is
+counted (`dtype` x `K.N` x `M` across both blocks), the fp8 ones are last, and
+each takes 20-570 seconds. A watchdog sized for the float cases will cut the run
+before it reaches them. Run fp8 as a separate workload file if you want these
+numbers.
+
+`torch._scaled_mm` is the API that would express a real fp8 gemm — fp8 operands,
+fp32 scales, bf16 accumulate. It does dispatch to the device, and returns at
+64x64x64 in ~2.1 ms. At 4096x4096x4096 it sat in `neuronx-cc` for over 40 minutes
+without returning, the same wedge `gather` and `scatter` hit, so it cannot back a
+sweep.
+
+**MXFP8 is not expressible in this harness at all.** `TORCH_DTYPE_MAPPING`
+(`core/utils.py`) aliases `mxfloat8`, `mxfloat8_e4m3` and `mxfloat8_e5m2` to plain
+`torch.float8_e4m3fn` / `float8_e5m2` with `dtype_size` 1, and no op def carries a
+block-scale tensor anywhere. Microscaling is a block exponent plus an element
+mantissa; with no E8M0 scale tensor there is nothing distinct to measure. So
+`ops/torch/gemm.py` accepts the three plain fp8 spellings and deliberately leaves
+the `mx` aliases rejected, rather than republishing these numbers under a label
+that promises microscaling.
 
 ### Two index ops are pathologically slow
 
@@ -410,25 +725,41 @@ Two different things are easy to conflate, so they are kept apart: a case the
 |---|---|---|
 | `flash_attention` with any quantized dtype | `op_defs/llm_ops/flash_attention.py` accepts all-bfloat16 or bfloat16 + `int8` cache, and raises on everything else | base op def |
 | `quant_matmul` / `moe_quant_group_gemm` with `float8` / `mxfloat8` / `mxfloat4` / `int4` weights | both base impls accept only `int8/int8/int8 -> bfloat16` | base op def |
-| `flash_attention` with a paged cache, `attn_mode=decode`, or GQA | neither the NKI `flash_fwd` kernel nor native SDPA covers those | this backend |
+| `flash_attention` with a paged cache (`block_size`) | neither the NKI `flash_fwd` kernel nor native SDPA takes a block table | this backend |
+| `flash_attention` chunked prefill (`cache_len > 0`, `q_len > 1`) or multi-token decode | `is_causal` is top-left aligned; these need bottom-right | this backend (correctness) |
+| `flash_attention` GQA / decode / `batch_size > 1` on the **XLA** runtime | the NKI `flash_fwd` kernel takes one contiguous K/V block for one head group; eager SDPA runs all three | this backend |
+| `flash_attention` prefill at `q_len: 32768` | no fused flash kernel exists on eager, and SDPA does not complete at that length — see below | this backend (capacity) |
 | `p2p` | needs send/recv across multiple NeuronDevices | this backend |
 | collectives above ~1 GiB per rank | the 24 GiB per-core ceiling above | this backend (capacity) |
 
-`scale_dynamic_quant`, `add_rms_norm_dynamic_quant`,
-`head_rms_norm_dynamic_quant`, `swiglu_dynamic_quant` and `dequant_kv_cache`
-appear in **no workload JSON in the repo**, on any backend. They are untested,
-not unsupported. Conversely `moe_scatter_dynamic_quant`,
+`dequant_kv_cache` appears in **no workload JSON in the repo**, on any backend. It
+is untested, not unsupported. Twelve other ops were in that position until this
+port added `single_test_ops/norm_ops.json`, `activation_ops.json`,
+`moe_gating_ops.json` and `quant_ops.json` for them — `add_rms_norm`,
+`head_rms_norm`, `qk_rms_norm`, `swiglu`, `moe_swiglu`, `moe_softmax_topk`,
+`scale_dynamic_quant`, `quant_group_gemm_reduce_sum` and the `_dynamic_quant`
+variants. Conversely `moe_scatter_dynamic_quant`,
 `moe_quant_group_gemm_combine`, `quant_matmul` and `moe_quant_group_gemm` all do
 run on the eager stack (int8 only for the last two) — an earlier version of the
 table claimed Neuron could not provide int8 tensors, which was true of the XLA
 path and is not true here.
+
+**Long-context prefill has no measurable path on eager, and it fails by not
+finishing rather than by erroring.** `q_len: 32768` at 80 q-heads was in
+`fa_linear_ops.json` and was removed: it ran for **55 minutes** on an idle core,
+83% CPU on one host thread, `walrus_driver` long since exited (so not a compile),
+and never produced a result or an error. The same provider does `q_len: 10240` in
+40.0 ms. There is nothing to fall back to — NKI's `flash_fwd` is HLO-traced and
+only loads under `torch_xla` — so the case was dropped rather than left in the
+file to look like a hung machine. If you need long-context attention numbers on
+Trainium, take them on the XLA runtime through the NKI provider, at MHA.
 
 Only three ops need vendor code at all; everything else runs its `op_defs` base
 implementation through the `base` provider:
 
 | Op | Provider | Runtime | Why |
 |---|---|---|---|
-| `gemm` | `torch` | both | rejects `tfloat32` (an NVIDIA format) and `int8` (not lowered through `torch.matmul`) |
+| `gemm` | `torch` | both | rejects `tfloat32` (an NVIDIA format) and `int8` (not lowered through `torch.matmul`); accepts `float8_e4m3` / `float8_e5m2`, which the base op def gates out — see [fp8 runs but does not reach the fp8 datapath](#fp8-runs-but-does-not-reach-the-fp8-datapath) |
 | `all_gather` | `torch` | both | base uses `dist.all_gather_into_tensor`, unimplemented on the `xla` backend; the `neuron` backend implements it, so eager reproduces the base behaviour |
 | `flash_attention` | `nki` / `torch` | `xla` / `eager` | no base implementation exists; NKI `flash_fwd` on XLA, `scaled_dot_product_attention` on eager |
 
@@ -448,6 +779,10 @@ docker build -f vendor_ops/NEURON/tools/Dockerfile.eager \
 # 2. Sweep, on an idle trn2.3xlarge. Budget a day.
 IMAGE=xpu-perf-eager:latest setsid nohup vendor_ops/NEURON/tools/run_full_sweep.sh &
 
+# 2b. Or just the workloads added after the first sweep, plus the 4-core runs.
+#     Same machinery, about an hour. Log: /tmp/neuron_new.log.
+IMAGE=xpu-perf-eager:latest setsid nohup vendor_ops/NEURON/tools/run_new_workloads.sh &
+
 # 3. Per-run accounting: cases tried, measured, and grouped rejection reasons.
 python3 vendor_ops/NEURON/tools/analyze_sweep.py /tmp/neuron_sweep.log
 
@@ -455,8 +790,15 @@ python3 vendor_ops/NEURON/tools/analyze_sweep.py /tmp/neuron_sweep.log
 python3 vendor_ops/NEURON/tools/analyze_sweep.py /tmp/neuron_sweep.log all_to_all
 ```
 
-`IMAGE`, `REPO`, `LOG`, `RESULTS` and `DOCKER` all come from the environment, so
-a different image or a non-`sudo` docker needs no edit. Two things to know:
+`IMAGE`, `REPO`, `LOG`, `RESULTS`, `DOCKER` and `WAIT_BUDGET_S` all come from the
+environment, so a different image or a non-`sudo` docker needs no edit. Three
+things to know:
+
+- **Both scripts refuse to start a run while anything else holds a NeuronCore**,
+  and wait `WAIT_BUDGET_S` (default 1800) for it to clear before skipping that
+  run. Raise it when you are queueing behind someone else's sweep. What they wait
+  on is a process with `/dev/neuron*` open, plus any container with a `python` in
+  it — an idle `docker run -it` shell left open after a sweep does not count.
 
 - **A killed run writes no report, but its results are recoverable.** micro_perf
   writes CSV/jsonl only when a launch finishes, so a watchdog kill loses
@@ -488,6 +830,19 @@ timeout on both runtimes.
 
 `find /var/tmp/neuron-compile-cache -name "*.neff" | wc -l` shows cache growth.
 Run under tmux or screen so an SSH drop does not kill a compile.
+
+`flash_attention` on the eager runtime is the case most likely to be mistaken for
+a hang, because it is slow exactly once. A cold `80/8/128` GQA prefill at
+`q_len: 4096` spent **over 13 minutes** in `walrus_driver --optlevel 2` and had
+produced no result when it was killed; the same case measured **9,512.6 us** on
+the next run, because `NKI_ENABLE_TRACE_CACHE=1` (the default) persists the kernel
+cache across processes and the first run had populated it. A bare
+`scaled_dot_product_attention` at that shape is ~33 ms, so if the first case of
+`fa_linear_ops.json` has been silent for ten minutes, that is a compile and not a
+broken vendor op — the check is a live `walrus_driver`, not elapsed time. Two
+practical consequences: give an FA sweep a per-case budget in hours rather than
+minutes, and warm each distinct shape once before timing anything you intend to
+publish.
 
 ### `timeout docker run` does not bound anything
 

@@ -39,6 +39,7 @@ LOG=${LOG:-/tmp/neuron_sweep.log}
 RESULTS=${RESULTS:-/tmp/sweep_results}
 WS4=${WS4:-/tmp/xccl_ws4}                 # capped copies of workloads/xccl_ops
 DOCKER=${DOCKER:-sudo docker}
+WAIT_BUDGET_S=${WAIT_BUDGET_S:-1800}
 TOOLS=$(cd "$(dirname "$0")" && pwd)
 
 mkdir -p "$RESULTS"
@@ -65,14 +66,34 @@ count_holders() {
       echo $n'
 }
 
+# Containers with a python process in them. Plain `docker ps -q | wc -l` is the
+# wrong test: an interactive `docker run -it` container that someone left open
+# after their sweep finished holds no NeuronCore and blocks nothing, but it would
+# make the count non-zero forever. A container about to grab a core, on the other
+# hand, already has python running before it opens /dev/neuron*, so this catches
+# the race that count_holders alone would miss.
+count_busy_containers() {
+    local c n=0
+    for c in $($DOCKER ps -q); do
+        # `-o args` alone is rejected: docker top insists the ps format include
+        # pid ("Couldn't find PID field in ps output").
+        if $DOCKER top "$c" -o pid,args 2>/dev/null | grep -q "[p]ython"; then
+            n=$((n + 1))
+        fi
+    done
+    echo $n
+}
+
+# Raise WAIT_BUDGET_S when someone else's job is already on the chip: the
+# default 30 min is enough to outlast a stuck teardown, not a neighbour's sweep.
 wait_for_free() {
     local waited=0 holders others
     while true; do
         holders=$(count_holders)
-        others=$($DOCKER ps -q | wc -l | tr -d ' ')
+        others=$(count_busy_containers)
         if [ "$holders" -eq 0 ] && [ "$others" -eq 0 ]; then return 0; fi
-        if [ "$waited" -ge 1800 ]; then
-            echo "[$(date -Is)] STILL BUSY after ${waited}s (holders=$holders containers=$others)"
+        if [ "$waited" -ge "$WAIT_BUDGET_S" ]; then
+            echo "[$(date -Is)] STILL BUSY after ${waited}s (holders=$holders busy_containers=$others)"
             return 1
         fi
         sleep 30
@@ -139,7 +160,8 @@ run_one demo_flash_attention      3600 0 - --workload $W/llm/vendor_test_demo/fl
 # 2. Single-op LLM workloads. ccl_ops.json is excluded on purpose: every case
 #    asks for world_size 8 and a trn2.3xlarge has 4 logical cores, so there is
 #    nothing in it this instance can run.
-for wl in gemm_ops fa_ops pre_fa_ops moe_dispatch_ops moe_combine_ops; do
+for wl in gemm_ops fa_ops fa_linear_ops pre_fa_ops moe_dispatch_ops moe_combine_ops \
+          norm_ops activation_ops moe_gating_ops quant_ops; do
     run_one "single_$wl" 5400 0 - --workload "$W/llm/single_test_ops/$wl.json"
 done
 
@@ -169,6 +191,29 @@ run_one xccl4 10800 0,1,2,3 \
 # 6. device2device separately, under ComputeEngine. See reason 4.
 run_one d2d 5400 0,1 "XPU_PERF_ENGINES=ComputeEngine" \
     --workload /xccl_ws4/device2device.json
+
+# 7. The whole chip: the same compute-bound and memory-bound cases with all four
+#    logical cores working at once.
+#
+#    Read this carefully before comparing it to the --device 0 runs above. A
+#    ComputeEngine spawns one worker per device and they all pull from a single
+#    shared input queue (ComputeEngine.start / BaseEngine.run in core/engine.py),
+#    so this is NOT four cores cooperating on one case -- four different cases
+#    run concurrently, and every latency reported is still a single-core latency,
+#    just measured while three other cores compete for the same HBM. That makes
+#    the diff against the single-core runs the measurement of interest: a per-chip
+#    2.9 TB/s over 4 logical cores is ~725 GB/s each, and one core alone already
+#    reaches 648, so if these numbers hold up the chip really does deliver ~2.6
+#    TB/s in aggregate, and if they fall towards a quarter then one core was
+#    already taking the whole budget.
+#
+#    XPU_PERF_ENGINES is required, not optional: with 4 devices and no filter the
+#    launch also starts an XCCLEngine worker on every core, and the second set
+#    cannot get cores.
+run_one chip4_gemm 5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
+    --task_dir $W/basic/tensor_gemm_ops --task all
+run_one chip4_mem  5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
+    --task_dir $W/basic/vector_linear_ops --task all
 
 echo ""
 echo "=============== sweep finished $(date -Is) ==============="
