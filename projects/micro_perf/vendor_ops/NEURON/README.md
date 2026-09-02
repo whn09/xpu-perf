@@ -312,6 +312,13 @@ sparse operand. Three things follow:
   TFLOPS: HBM is a per-chip resource shared by the four logical cores, so one
   core running alone can exceed a naive 1/4 share.
 
+- **On eager, the reported MFU is end-to-end and the ~60 us dispatch floor is
+  inside it.** A 1024x4096x4096 bf16 gemm needs 206 us at 166.75 TFLOPS and
+  measures 282; charge 60 us to dispatch and the tensor engine is at ~93%, not
+  the reported 73%. The gap closes as the shape grows — the 8192 gemm below loses
+  under 3 points to it — so a mid-size gemm at 0.70-0.75 is a healthy number
+  here, not a shortfall.
+
 Cross-check on the denominator: a standalone probe of a 8192x4096x4096 bf16 gemm
 on one logical core reached 143 TFLOPS, 86% of 166.75 — the right shape of number
 for a large gemm, which is the reason to believe 166.75 rather than 667 or 83.375.
@@ -501,6 +508,20 @@ happens (see the 24 GiB ceiling above).
 
 Its engine is not in `XPU_PERF_ENGINES`. See the note in
 [Quick start](#3-run) — `device2device` is the one that catches people.
+
+### `❌ 导入失败 ._<something>：attempted relative import beyond top-level package`
+
+macOS AppleDouble sidecars in the synced tree, not a code problem. `rsync`/`scp`
+from a Mac leaves a 220-byte `._foo.py` next to every `foo.py` it copied, and
+`parse_vendor_ops` (`core/common_utils.py`) imports every `*.py` it finds, so it
+tries `..foo` and gets two leading dots. The ops themselves still register —
+check the `Provider: torch` table for the real answer. `ls` hides these files
+because the name starts with a dot:
+
+```bash
+find ~/xpu-perf -name "._*" -delete
+rsync -a --exclude="._*" ...        # or pass --iconv=. / use COPYFILE_DISABLE=1
+```
 
 ### A killed run still holds the cores
 

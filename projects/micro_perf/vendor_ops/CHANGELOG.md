@@ -70,6 +70,12 @@ This changelog follows a Keep a Changelog style and semantic versioning.
   rejection reason, plus a per-case curve mode) and `recover_from_log.py`
   (rebuilds CSVs from stdout, since micro_perf writes reports only on a clean
   finish and a killed run otherwise leaves nothing).
+- `NEURON/README.md`: two notes on reading a single gemm result. The reported MFU
+  on the eager runtime is end-to-end and carries the ~60 us dispatch floor inside
+  it, so a 1024x4096x4096 bf16 gemm at 0.73 is a tensor engine at ~93%; and a
+  `❌ 导入失败 ._<op>` line is macOS AppleDouble sidecars in an rsync'd tree, not a
+  broken vendor op — `parse_vendor_ops` imports every `*.py` it finds, and `._x.py`
+  becomes the relative import `..x`.
 - `NEURON/README.md`: documented the ops that run but are not worth reporting as
   hardware results — `gather` at 1.34 GB/s and `scatter` at 0.8 GB/s against
   `index_select`'s 631 GB/s, which is a 470x gap caused entirely by the base op
