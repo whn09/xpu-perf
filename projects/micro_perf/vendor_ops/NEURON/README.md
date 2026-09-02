@@ -214,6 +214,72 @@ shape is too small to hide the ~60 us dispatch floor, and it is the shape a quic
 smoke test uses. `quant_matmul` is not an int8 hardware number on any backend —
 see [the quantized ops are a bf16 simulation](#the-quantized-ops-are-a-bf16-simulation-on-every-backend).
 
+#### Four-core scaling: what x4 is actually worth
+
+Every per-chip figure in this document and in
+[`../GPU/README.md`](../GPU/README.md) is a one-logical-core number times four.
+That is load-bearing enough to check per shape rather than at one point, so
+`gemm.json` and the reduction/selection files were run twice — once on `--device 0`
+and once on `--device 0,1,2,3`, where four *different* cases are in flight at once
+and each case's latency is therefore a single-core latency measured with the other
+three cores competing for the same HBM — and joined shape by shape.
+
+| Family | Shapes joined | Median 4c/1c latency | p90 | Worst |
+|---|---|---|---|---|
+| `gemm` bf16 | 208 | **1.004** | 1.170 | 9.011 |
+| `gemm` fp16 | 208 | **1.011** | 1.686 | 7.474 |
+| `gemm` fp32 | 208 | **1.011** | 1.087 | 5.165 |
+| `gemm` fp8 e4m3 | 12 | 1.464 | 1.723 | 1.775 |
+| `gemm` fp8 e5m2 | 12 | 1.525 | 2.309 | 2.531 |
+| `reduce_max` / `reduce_min` / `reduce_sum` | 33 each | **1.004-1.025** | 1.761-5.256 | 8.332 |
+| `topk` | 147 | **1.002** | 1.829 | 11.020 |
+| `moe_softmax_topk` | 56 | **1.029** | 4.020 | 8.892 |
+
+**At the plateau, x4 is exact.** The single-core bf16 peak of 150.21 TFLOPS at
+30720x8192x8192 becomes 149.59 TFLOPS per core with all four loaded — 0.4% — so
+598.4 TFLOPS per chip is a measurement, not an extrapolation. `topk` at its peak
+shape scales **4.01x** and `moe_softmax_topk` **4.00x**, which is what retires the
+"extrapolated" caveat those two rows used to carry. Memory-bound elementwise work
+holds 594-616 GB/s per core, ~2.4 TB/s of the chip's 2.9 TB/s.
+
+`reduce_sum` scales too — 632.73 GB/s per core becomes 634.00 with four loaded, so
+**2,536 GB/s per chip**, 87% of the 2.9 TB/s the chip has and within 1.18x of an
+H100's measured 2,985.
+
+**Two exceptions.** The first is dtype-specific: fp8 `gemm` (medians 1.464 and
+1.525) and fp32 `reduce_sum` (median 1.369) are the only groups whose *median* does
+not scale, where every other dtype of every other op sits between 1.000 and 1.025.
+For fp8 that is consistent with it timing a software up-cast rather than the matmul
+engine ([details](#fp8-runs-but-does-not-reach-the-fp8-datapath)). fp32 `reduce_sum`
+is a different thing: its *largest* shape scales perfectly (0.998, the 2,536 GB/s
+above), and it is the mid-sized shapes that contend — the same tail described next,
+reaching further up the size range for this one op than for any other.
+
+The second is shape: the smallest shape in every family degrades badly under
+concurrency, well beyond what the median suggests.
+
+| Worst case | 1 core | 4 cores, per case | Ratio |
+|---|---|---|---|
+| `gemm` bf16 M=2 K=1024 N=8192 | 70.2 us | 632.3 us | **9.01x** |
+| `gemm` fp16 M=4 K=4096 N=4096 | 85.3 us | 637.4 us | 7.47x |
+| `topk` bf16 `batch_size` 1024 `dim_size` 128 `k` 8 | 58.4 us | 644.1 us | **11.02x** |
+| `moe_softmax_topk` fp32 `num_tokens` 1, 8 experts | 132.9 us | 1,182.1 us | **8.89x** |
+| `reduce_max` fp32 1024x2048 | 82.9 us | 690.9 us | 8.33x |
+
+These are all runs dominated by dispatch and synchronisation rather than by
+arithmetic — the same ~60 us floor described in
+[small-op latencies](#small-op-latencies-measure-the-runtime-not-the-chip) — so
+they contend on something the large shapes never touch. The practical rule: **do
+not multiply a small-shape single-core number by four.** Every per-chip figure
+quoted here is from a plateau shape.
+
+One number moved between runs and is worth recording rather than hiding: this
+dedicated single-core `gemm.json` run peaked at **37.67 TFLOPS (83.3% MFU)** in
+fp32, at 10240x1024x8192, against the 36.93 at 3968x1024x8192 in the table above
+from the full sweep. Both are single-core measurements of the same file; the newer
+one is what `../GPU/README.md` compares against the H100's 48.72 TFLOPS, since it
+is the run that also has the four-core join behind it.
+
 #### Memory-bound ops
 
 A quarter of the chip's 2.9 TB/s is ~725 GB/s, so that is the ceiling to read
@@ -266,8 +332,11 @@ Five things in that table are lowering quality rather than hardware:
   (1665.2 us and 778.0/780.2 us): the compiler is emitting the same fp32-accumulate
   kernel for both, so their bf16 rows are not measuring bf16 arithmetic.
 
-`gather` and `scatter` are a different phenomenon again — see
-[Two index ops are pathologically slow](#two-index-ops-are-pathologically-slow).
+`gather` and `scatter` are a different phenomenon again, and `gather`'s is not a
+property of the hardware or even of the op — an int32 index instead of an int64 one
+makes it 291-731x faster and lands it within 8% of `index_select`. See
+[Two index ops are pathologically slow, and one is an int64 index away from
+parity](#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity).
 
 **A `gemm` narrow enough to be memory-bound reaches 500-573 GB/s** (M=128,
 K=N=8192: 573.3 fp16 / 559.2 bf16 / 499.8 fp32), i.e. 77-79% of the per-core
@@ -364,7 +433,8 @@ about the chip. Three things the table does say:
   nothing (24.0%), which is consistent: at `q_len 4096` one sequence already
   fills the engine, so a batch is four sequential prefills (34,422 ≈ 4 x 9,508 x
   0.905). Nothing here approaches the 90% the same core reaches on a large `gemm`,
-  and that gap is the SDPA lowering, not the tensor engine.
+  and that gap is the SDPA lowering, not the tensor engine — but it is the *quality*
+  of a fused lowering, not a missing one. See the bullet below.
 - **Decode reaches 15-33% of this core's memory bandwidth, and that is the real
   finding.** The decode rows move nothing but the KV cache, so `mem_bw` against
   ~725 GB/s is the whole story: 110.7-238.7 GB/s, i.e. 15-33%. For scale, the
@@ -374,6 +444,31 @@ about the chip. Three things the table does say:
   reclaim it. Larger batches help (238.7 at B=64 vs 136.2 at B=16) and longer
   caches hurt (110.7 at 10,240), which is the signature of a per-call fixed cost
   being amortised rather than of a bandwidth ceiling.
+
+**The prefill rows are already a fused NKI flash kernel; the decode rows provably
+cannot be.** This is worth stating flatly because an earlier version of this
+document, and of the two provider docstrings, claimed the eager runtime had no
+fused attention kernel at all. It does. `torch_neuronx` rewrites SDPA to a NKI
+flash kernel inside its own dynamo backend — `_can_use_nki_flash_attention` in
+`torch_neuronx/neuron_dynamo_backend/decompositions.py`, enabled by default via
+`TORCH_NEURONX_ENABLE_NKI_SDPA` — for any call satisfying all of:
+
+```
+key.shape == value.shape,  attn_bias is None,  dropout_p == 0,
+L % 512 == 0,  S % 512 == 0,  D <= 128,  B * H <= 512
+```
+
+Setting `TORCH_NEURONX_ENABLE_NKI_SDPA=0` and re-running the 80/8/128 `q_len 4096`
+prefill takes it from **9,443 us to 60,500 us — 6.41x**. So 21.7-32.4% MFU *is* the
+fused kernel's score, and closing the remaining gap to the H100's 61-69% means a
+better kernel rather than a first one.
+
+Every decode row fails that gate twice over and always will: `q_len == 1` can never
+satisfy `L % 512 == 0`, and their `B*H` is 1280 and 5120 against a limit of 512.
+That is what the 15-33% of bandwidth reflects. The named fix is
+`nkilib`'s `attention_tkg` (token-generation attention), which is installed in the
+beta images and would be wired as a second provider rather than a change to this
+one — see [What would close these gaps](#what-would-close-these-gaps).
 
 For the same nine cases measured on an H100 with the same provider code, see
 [`../GPU/README.md`](../GPU/README.md).
@@ -710,7 +805,7 @@ mantissa; with no E8M0 scale tensor there is nothing distinct to measure. So
 the `mx` aliases rejected, rather than republishing these numbers under a label
 that promises microscaling.
 
-### Two index ops are pathologically slow
+### Two index ops are pathologically slow, and one is an int64 index away from parity
 
 | Op | mem_bw | Note |
 |---|---|---|
@@ -723,11 +818,83 @@ that promises microscaling.
 how the index is expressed: `IndexSelectOp` passes a 1-D index of
 `dst_batch_size` int64s, which lowers to a whole-row DMA, while `GatherOp` passes
 an index the same shape as the output (`[dst_batch_size, dim_size]`, built with
-`.view(N, 1).expand(N, dim_size)`), which lowers to per-element indexed access.
-That is the whole 470x difference — **not a hardware property.**
+`.view(N, 1).expand(N, dim_size)`). That much is right, and it is **not a hardware
+property** — but the reason is narrower and far more actionable than "a 2-D index
+lowers to per-element access", which is what this section used to say.
 
-Both eventually hang the compiler outright, so give any run including them a hard
-timeout or exclude them by name (`parse_tasks` honours comma-separated
+**The cause is the index dtype.** The device has no int64. An int64 index is
+converted on the way into the graph by a
+`nki_kernels/stride2_gather.stride2_flat_gather_kernel` custom call, and that
+conversion *materialises* the index — which destroys the stride-0 broadcast that
+`.expand()` created and that the compiler needs in order to see whole rows. Pass an
+int32 index instead and the view survives into the graph as a direct argument, with
+these results (`xpu-perf-eager:latest`, one logical core, `src_batch_size = 1024`,
+outputs verified bit-identical against the int64 path):
+
+| Op | dtype | `dim_size` | int64 index | int32 index | speedup | int32 GB/s |
+|---|---|---|---|---|---|---|
+| `gather` | fp32 | 1024 | 6,363.6 us | 83.2 us | 76x | 100.8 |
+| `gather` | fp32 | 8192 | 49,714.8 us | 170.9 us | **291x** | 392.8 |
+| `gather` | fp32 | 32768 | 199,866.1 us | 460.8 us | **434x** | **582.6** |
+| `gather` | bf16 | 8192 | 49,715.7 us | 136.5 us | 364x | 245.9 |
+| `gather` | bf16 | 32768 | 199,789.4 us | 273.3 us | **731x** | 491.1 |
+| `scatter_add_` | fp32 | 8192 | 1,194,040.8 us | 737.4 us | **1,619x** | 91.0 |
+| `scatter_add_` | bf16 | 8192 | 1,191,633.4 us | 479.4 us | **2,486x** | 70.0 |
+
+At `dim_size` 32768 an int32 `gather` reaches 582.6 GB/s against `index_select`'s
+631 GB/s ceiling — **92%**. The 449x shortfall in the H100 comparison collapses to
+1.08x. The speedup grows with `dim_size` because the two paths have different
+units: the int64 path is per-element and holds ~5.9 ns/element flat, while the int32
+path is per-byte and scales.
+
+Three corollaries worth keeping straight:
+
+- **Materialising the view is as bad as int64.** `int32` plus an explicit
+  `.contiguous()` measures 6,191.6 us against the view's 72.3 us at
+  `dim_size` 1024. The stride-0 layout, not the dtype, is what the lowering reads;
+  int32 matters only because it is what lets the layout survive.
+- **1-D-index ops are unaffected**, which is why they were never slow:
+  `index_select` moves 77.8 → 69.9 us and `index_add_` 486.7 → 496.5 us. There is
+  nothing to materialise.
+- **`scatter` is not fixable this way and its 621x is real.** `ScatterOp` calls
+  `dst.scatter_()`, i.e. `aten::scatter_.src`, which has no NKI implementation at
+  all; both dtypes measure ~11 ms (0.75 vs 0.76 GB/s). Only `scatter_add` has a
+  kernel.
+
+The op defs are *not* changed to exploit this, because `torch.gather` requires an
+int64 index on CPU and CUDA and accepts int32 only here — switching would make the
+op def non-portable, and switching per backend would mean the two sides of the H100
+comparison no longer run the same op def. The published rows stay as the honest
+measurement of what the op def does today; this table is what the hardware can do,
+and the fix belongs either upstream or in model code.
+
+There is a second, independent reason the NKI path is unreachable, worth knowing
+before anyone concludes a missing kernel is the problem. `nki_kernels/gather.py`
+does ship a kernel, `GatherNKIImpl` guards it with exactly the condition our
+tensors satisfy (`index.ndim == 2 and index.stride(1) == 0`, verified returning
+True), and calling it directly measures 124.8 us against the shipped path's
+6,345.2 us — 50.8x, matching output. It never runs because
+`@neuron_op("aten::gather", priority=60)` **does not take effect**: the priority is
+applied by a subclass factory in `python_ops/auto_registration.py` that the
+registered instances bypass, so every implementation reports the class default 50
+and the tie falls to import order — and `python_ops/gather.py` imports
+`GatherMLIRImpl` at module top before its own decorator runs. All seven
+multi-implementation ops are affected; four resolve to the wrong impl
+(`aten::contiguous` picks `ContiguousBroadcastMLIRImpl` over
+`ContiguousEmptyHloImpl`'s declared 200, and `gather` / `scatter_add` /
+`scatter_add_` all pick MLIR over NKI). The dispatcher logs nothing, because
+`python_ops/base.py` only logs when an implementation *fails*, not when a
+lower-priority one wins — so silence here is not evidence that a gate rejected the
+case.
+
+Two things this rules out. It is **not** a CPU fallback: with
+`TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1`, which turns a failed Neuron
+implementation into a hard error instead of a silent host fallback, the run
+completes unchanged (6,324.4 us against 6,323.5 us) and prints nothing. And it is
+not the index construction: on CUDA the identical op def reaches 2,805 GB/s.
+
+Both ops eventually hang the compiler outright, so give any run including them a
+hard timeout or exclude them by name (`parse_tasks` honours comma-separated
 `--task` lists). One caveat on the numbers: `GatherOp` inherits `prepare_args`
 from `IndexSelectOp`, which declares a 1-D index, while `GatherOp.create_tensors`
 builds a 2-D one — so the declared `io_bytes` does not describe the tensors the op
@@ -746,7 +913,7 @@ Two different things are easy to conflate, so they are kept apart: a case the
 | `flash_attention` with a paged cache (`block_size`) | neither the NKI `flash_fwd` kernel nor native SDPA takes a block table | this backend |
 | `flash_attention` chunked prefill (`cache_len > 0`, `q_len > 1`) or multi-token decode | `is_causal` is top-left aligned; these need bottom-right | this backend (correctness) |
 | `flash_attention` GQA / decode / `batch_size > 1` on the **XLA** runtime | the NKI `flash_fwd` kernel takes one contiguous K/V block for one head group; eager SDPA runs all three | this backend |
-| `flash_attention` prefill at `q_len: 32768` | no fused flash kernel exists on eager, and SDPA does not complete at that length — see below | this backend (capacity) |
+| `flash_attention` prefill at `q_len: 32768` | SDPA does not complete at that length — see below | this backend (capacity) |
 | `p2p` | needs send/recv across multiple NeuronDevices | this backend |
 | collectives above ~1 GiB per rank | the 24 GiB per-core ceiling above | this backend (capacity) |
 
@@ -767,10 +934,13 @@ finishing rather than by erroring.** `q_len: 32768` at 80 q-heads was in
 `fa_linear_ops.json` and was removed: it ran for **55 minutes** on an idle core,
 83% CPU on one host thread, `walrus_driver` long since exited (so not a compile),
 and never produced a result or an error. The same provider does `q_len: 10240` in
-40.0 ms. There is nothing to fall back to — NKI's `flash_fwd` is HLO-traced and
-only loads under `torch_xla` — so the case was dropped rather than left in the
-file to look like a hung machine. If you need long-context attention numbers on
-Trainium, take them on the XLA runtime through the NKI provider, at MHA.
+40.0 ms. Note what this is *not*: 32768 is a multiple of 512 and `B*H` is 80, so
+this case clears every clause of the NKI flash gate described in
+[Attention](#attention) — it is failing **inside** a fused kernel, not for want of
+one, which is why there is nothing to fall back to. The case was dropped rather
+than left in the file to look like a hung machine. If you need long-context
+attention numbers on Trainium, take them on the XLA runtime through the NKI
+provider, at MHA.
 
 Only three ops need vendor code at all; everything else runs its `op_defs` base
 implementation through the `base` provider:
@@ -780,6 +950,41 @@ implementation through the `base` provider:
 | `gemm` | `torch` | both | rejects `tfloat32` (an NVIDIA format) and `int8` (not lowered through `torch.matmul`); accepts `float8_e4m3` / `float8_e5m2`, which the base op def gates out — see [fp8 runs but does not reach the fp8 datapath](#fp8-runs-but-does-not-reach-the-fp8-datapath) |
 | `all_gather` | `torch` | both | base uses `dist.all_gather_into_tensor`, unimplemented on the `xla` backend; the `neuron` backend implements it, so eager reproduces the base behaviour |
 | `flash_attention` | `nki` / `torch` | `xla` / `eager` | no base implementation exists; NKI `flash_fwd` on XLA, `scaled_dot_product_attention` on eager |
+
+## What would close these gaps
+
+Nothing in this list is speculative about *where* the time goes — each item names a
+measured gap above and the specific thing that would address it. In rough order of
+value per unit of work:
+
+1. **`rmsnorm_quant` from [nki-library](https://github.com/aws-neuron/nki-library),
+   for the six 3.8-38x quantised ops.** They all share one unfused Python helper
+   (`../../op_defs`'s `_dynamic_quant` path — see
+   [the `*_dynamic_quant` family is 90-180x off](#the-_dynamic_quant-family-is-90-180x-off-and-it-is-one-shared-helper)),
+   and a single fused norm+quant kernel replaces the whole chain. This is the
+   largest number of affected ops for the least new code, and it does not need a new
+   op def.
+2. **`attention_tkg`, for decode.** Decode cannot reach the built-in NKI flash
+   rewrite (see [Attention](#attention)) and is leaving 2.6-5.7x of this core's
+   bandwidth unused. `nkilib` ships a token-generation attention kernel for exactly
+   this shape. It goes in as a third `flash_attention` provider, so it neither
+   perturbs the existing eager numbers nor needs the XLA runtime.
+3. **An int32 index, if a *downstream* workload owns its own indices.** `gather` is
+   291-731x faster with one
+   ([details](#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity)).
+   This benchmark's op defs deliberately keep int64 for portability, so the fix
+   belongs in real model code, not here — but it is the single largest measured
+   speedup available on this stack, and it is free.
+4. **`matmul_mxfp8`, for fp8.** The 99x fp8 gap is that no fp8 datapath is reached
+   at all. This one needs the op def extended first to express a block-scale
+   tensor, since microscaling has no meaning without one — the largest piece of work
+   in the list, and the only one that changes shared code.
+
+Two known defects in `torch_neuronx` itself are recorded rather than worked around,
+because working around them in `vendor_ops` would hide them: the dropped
+`@neuron_op(priority=)` override that keeps four ops on a slower implementation, and
+`aten::scatter_.src` having no NKI kernel. Both are described in
+[the index-ops section](#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity).
 
 ## Reproducing the full sweep
 
@@ -806,6 +1011,18 @@ python3 vendor_ops/NEURON/tools/analyze_sweep.py /tmp/neuron_sweep.log
 
 # 4. One op's full scaling curve instead of a summary line.
 python3 vendor_ops/NEURON/tools/analyze_sweep.py /tmp/neuron_sweep.log all_to_all
+
+# 5. Is "x4" real? Join a 1-core report against a 4-core one, shape by shape.
+#    Only the matched pairs from step 2b are comparable; the labels are
+#    core1_gemm/chip4_gemm and core1_reduction/chip4_reduction.
+ONLY="core1_gemm chip4_gemm core1_reduction chip4_reduction chip4_moe" \
+    IMAGE=xpu-perf-eager:latest vendor_ops/NEURON/tools/run_new_workloads.sh
+python3 vendor_ops/NEURON/tools/analyze_scaling.py \
+    /tmp/new_results/core1_gemm /tmp/new_results/chip4_gemm
+
+# 6. The gather int64-vs-int32 finding, on device, in one file (~2 min).
+sudo docker run --rm --privileged -v "$PWD":/w -w /w xpu-perf-eager:latest \
+    python3 vendor_ops/NEURON/tools/probe_index_dtype.py
 ```
 
 `IMAGE`, `REPO`, `LOG`, `RESULTS`, `DOCKER` and `WAIT_BUDGET_S` all come from the

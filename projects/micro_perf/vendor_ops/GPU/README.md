@@ -20,8 +20,9 @@ different ones:
 | `gelu`, `sin`/`cos`, `reduce_max` | **3.5-7.7x** | single-op lowering gaps, each with a fast sibling op |
 | the 7 quantised ops | **3.8-38x** | on top of a shared unfused helper that costs the H100 3-14x too |
 | `gemm` at fp8 | **~99x** | no fp8 datapath is being reached at all |
-| `gather` / `scatter` | **449x / 621x** | neuronx-cc; the op def is exonerated |
-| `topk` | **~0.33x** | the one op where a Trainium2 chip beats an H100 |
+| `gather` / `scatter` | **449x / 621x** | the op def is exonerated; `gather` is one index dtype away from **1.08x**, `scatter` has no kernel |
+| `topk`, `moe_softmax_topk` | **0.33x / 0.27x** | Trainium2 ~3x ahead per chip, and the x4 is now measured at these shapes |
+| `gemm` at fp32 | **0.32x** | Trainium2 3.09x ahead; the nominal bar favours it 2.70x |
 
 So the headline is that **Trainium2's silicon is fine and the gap is bimodal in
 its software.** Nothing here lands between 1.4x and 3.1x, and nothing between
@@ -30,13 +31,22 @@ magnitude, which is the signature of missing kernels rather than slow hardware.
 On bf16 gemm it delivers 90% of its own peak against the H100's 82% and lands
 within 1.35x per chip — [and the four-core run confirms that x4 is
 real](#how-to-compare-these-to-the-trainium2-numbers). On attention it delivers
-32% against the H100's 69%, so half the 3.1x gap is a missing fused kernel. On
-fp8 nothing is reached at all: the op runs, returns fp8 tensors, and times a
-software widening to bf16.
+32% against the H100's 69% — and that 32% is *already* a fused NKI flash kernel,
+[measured by turning it off](#attention), so the remaining 2.1x is kernel quality
+rather than an absent kernel. On fp8 nothing is reached at all: the op runs,
+returns fp8 tensors, and times a software widening to bf16.
 
-Two results cut against the pattern and are worth knowing. Trainium2 uses *more*
-of its own bandwidth than an H100 does on the head/QK norms and `swiglu`, and it
-is ~3x faster per chip at `topk` — so this is not a uniform deficit. And the H100
+The `gather` row is the clearest case of the pattern, because it is now known
+exactly what the two orders of magnitude are: the op def hands the device an
+**int64** index, the device has no int64, and converting it materialises a
+stride-0 broadcast that the fast lowering needs to see intact. The same call with
+an int32 index is 291-731x faster and lands within 8% of `index_select` —
+[details](../NEURON/README.md#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity).
+
+Several results cut against the pattern and are worth knowing. Trainium2 uses
+*more* of its own bandwidth than an H100 does on the head/QK norms and `swiglu`, it
+is ~3x faster per chip at both selection ops, and it is 3.09x faster at fp32
+`gemm` — so this is not a uniform deficit. And the H100
 column repeatedly exonerates the benchmark: `gelu` matches `silu` there, `gather`
 matches `index_select` there, and `head_rms_norm` is broken on *both* backends by
 a hard-coded fp32 norm weight in the op def.
@@ -129,22 +139,36 @@ the other three cores are competing for the same HBM.
 | Measured on | 1 core | 4 cores, per case | Ratio |
 |---|---|---|---|
 | `gemm` bf16 peak | 149.42 TF (~90% MFU) | **149.59 TF (89.7% MFU)** | 1.001 |
-| `gemm` fp32 peak | — | 37.35 TF (82.5% MFU) | — |
+| `gemm` fp32 peak | 37.67 TF (83.3% MFU) | **37.35 TF (82.5% MFU)** | 1.009 |
+| `gemm`, 648 matched shapes, median by dtype | baseline | — | **1.004-1.011** |
 | `add`/`mul`/`sub`/`cast`, 12 dtype combos | 593-617 GB/s | **594-616 GB/s** | 1.00-1.02 |
+| `reduce_*` / `topk` / `moe`, median by op | baseline | — | **1.002-1.029** |
+| `topk` at the published shape | 475.6 GB/s | **476.8 GB/s** | 0.998 (x4 = **4.01**) |
+| `moe_softmax_topk` at the published shape | 74.4 GB/s | **74.4 GB/s** | 1.001 (x4 = **4.00**) |
 | `gemm` fp8, 24 matched shapes | baseline | 1.02-2.16x slower | median **1.37** |
 
-So for the two workload classes that matter to the headline, contention costs
-nothing measurable: four cores each hold ~600 GB/s, i.e. ~2.4 TB/s of the chip's
-2.9 TB/s aggregate (83-85%), and bf16 gemm holds ~90% MFU per core with all four
-loaded. **Multiplying by four is legitimate**, and 4 x 149.59 = 598.4 TFLOPS is a
-real per-chip bf16 number rather than an extrapolation.
+So for every workload class that matters to the headline, contention costs nothing
+measurable: four cores each hold ~600 GB/s, i.e. ~2.4 TB/s of the chip's 2.9 TB/s
+aggregate (83-85%), and bf16 gemm holds ~90% MFU per core with all four loaded.
+**Multiplying by four is legitimate**, and 4 x 149.59 = 598.4 TFLOPS is a real
+per-chip bf16 number rather than an extrapolation. The same now applies to the two
+selection ops, which used to carry an explicit "extrapolated" flag.
 
-Two things are still *not* measured this way, and both are noted where they
-appear: **attention** (the workload has no multi-core variant yet, so the 3.1x
-prefill gap keeps the "upper bound on Trainium, lower bound on the gap" caveat),
-and the ops that do *not* scale — the fp8 row above is the counter-example, where
-the software up-cast path slows by 1.37x median under contention precisely
-because it is moving bytes rather than using the matmul engine.
+Two classes of exception, both noted where they appear:
+
+- **fp8, and only fp8, fails to scale at the median** (1.37-1.53x slower under
+  contention). That is consistent with what it is actually doing — a software
+  up-cast that moves bytes instead of using the matmul engine.
+- **The smallest shapes in every family degrade 5-11x**, far worse than any median:
+  `gemm` `M=2 K=1024 N=8192` **9.01x**, `topk` at `dim_size 128` **11.02x**,
+  `moe_softmax_topk` at `num_tokens 1` **8.89x**. These are runs dominated by launch
+  and synchronisation rather than by arithmetic, so they contend on something the
+  large shapes never touch. Per-chip figures quoted from small shapes are not safe
+  to multiply by four; the figures quoted in this document are all from the plateau.
+
+**Attention** is still not measured this way — the workload has no multi-core
+variant yet, so the 3.1x prefill gap keeps the "upper bound on Trainium, lower
+bound on the gap" caveat.
 
 ## Attention
 
@@ -154,12 +178,28 @@ which the provider rejects on purpose because `is_causal=True` aligns the mask t
 the top-left and a multi-token decode step needs bottom-right.
 
 Both sides ran the **same provider source**: `scaled_dot_product_attention`
-against the same op def. That is deliberate. The NEURON eager runtime has no
-fused flash kernel at all (`neuronxcc.nki.kernels.attention.flash_fwd` is
-HLO-traced and only loads under `torch_xla`), so comparing it to `flash_attn`
+against the same op def. That is deliberate — comparing Neuron to `flash_attn`
 would compare two algorithms as well as two chips. On CUDA, SDPA is *not* a slow
-fallback — it dispatches to a fused FlashAttention or cuDNN kernel and never
+fallback: it dispatches to a fused FlashAttention or cuDNN kernel and never
 materialises the score matrix, which the 61-69% prefill MFU confirms.
+
+Nor is it a fallback on Neuron for the **prefill** rows, and an earlier version of
+this section said it was. `torch_neuronx` lowers SDPA to a NKI flash kernel inside
+its dynamo backend (`_can_use_nki_flash_attention` in
+`neuron_dynamo_backend/decompositions.py`, enabled by default through
+`TORCH_NEURONX_ENABLE_NKI_SDPA`) for any call satisfying `L % 512 == 0 and
+S % 512 == 0 and D <= 128 and B*H <= 512` with no attn_bias and no dropout.
+Setting that variable to 0 takes the 80/8/128 `q_len` 4096 prefill from
+**9,443.5 us to 60,499.9 us — 6.41x** — so the kernel is real and it is running.
+The narrower statement this section used to rest on is still true and is all that
+is true: `neuronxcc.nki.kernels.attention.flash_fwd` is HLO-traced and only loads
+under `torch_xla`, so *that* kernel is unreachable on the eager stack.
+
+The **decode** rows are a fallback, provably and permanently: `q_len == 1` can
+never satisfy `L % 512 == 0`, and their `B*H` is 1280 and 5120 against a limit of
+512, so the gate fails twice over. That is the asymmetry to keep in mind when
+reading the two halves of the table below — prefill compares a fused kernel against
+a fused kernel, decode compares a fused kernel against an unfused one.
 
 > **Installing `vllm` used to halve every prefill number in this section, and the
 > report gave no sign of it.** Worth reading even if you do not care about GPUs,
@@ -207,12 +247,16 @@ byte — so MFU is the wrong column there and `mem_bw` is the right one:
 
 Four conclusions, in order of how much they matter:
 
-- **Trainium2's attention gap is mostly software, not silicon.** Per *chip*, the
-  best prefill throughput is 678.97 TFLOPS on the H100 against 4 x 53.99 = 216.0
-  TFLOPS on a Trainium2 — a **3.1x** gap where the peak-FLOPS ratio is only
-  1.48x. The other 2.1x is that the H100 stack extracts 68% of its peak where the
-  Neuron eager stack extracts 32%. A fused attention kernel on Trainium is worth
-  about a factor of two here, and it is the single highest-value thing missing.
+- **Trainium2's attention gap is mostly software, not silicon — but not for the
+  reason that looks obvious.** Per *chip*, the best prefill throughput is 678.97
+  TFLOPS on the H100 against 4 x 53.99 = 216.0 TFLOPS on a Trainium2 — a **3.1x**
+  gap where the peak-FLOPS ratio is only 1.48x. The other 2.1x is that the H100
+  stack extracts 68% of its peak where the Neuron eager stack extracts 32%. It is
+  tempting to attribute that to a missing fused kernel, and this bullet used to;
+  the measurement above rules it out. Prefill already runs a fused NKI flash
+  kernel — turning it off costs 6.41x, so 32% of peak *is* the fused kernel's
+  score. The remaining 2.1x is kernel quality inside a fused implementation, which
+  is a harder thing to close than a missing kernel but still software.
 - **Decode on Trainium is not bandwidth-limited, which means it is fixable.**
   The H100 reads its KV cache at 80-86% of HBM peak — that is a
   bandwidth-saturating kernel and there is nothing left to win. Trainium reads it
@@ -242,7 +286,7 @@ Peak per dtype, with the Trainium2 figures for the same file alongside:
 | bfloat16 | **808.34** TF | 81.7% | 12288x8192x8192 | 149.42 TF | **~90%** | 808.3 / 597.7 = **1.35x** |
 | float16 | 774.35 TF | 78.3% | 3072x8192x8192 | — | — | — |
 | tfloat32 | 413.92 TF | **83.7%** | 3072x8192x8192 | rejected | — | — |
-| float32 | 48.72 TF | 72.7% | 20480x8192x8192 | 23.5 TF (XLA) | 52% | — |
+| float32 | 48.72 TF | 72.7% | 20480x8192x8192 | **37.67 TF** | **83.3%** | 48.7 / 150.7 = **0.32x** |
 | float8_e4m3 | **1,527.85** TF | 77.2% | 4096x8192x8192 | 3.85 TF | 1.2% | 1,527.9 / 15.4 = **~99x** |
 | float8_e5m2 | rejected | — | — | 4.77 TF | 1.5% | see below |
 
@@ -252,9 +296,32 @@ shape, 12288x8192x8192: the H100 reaches 81.7% of 989.4, a logical NeuronCore
 reaches ~90% of 166.75. Four cores is 597.7 TFLOPS against the H100's 808.3, a
 **1.35x** gap where the nominal silicon ratio is 1.48x. This is the one place in
 the comparison where Trainium2 needs no excuse — the matmul engine and its
-lowering are both in good shape, and what remains is silicon. It is also the one
-place where the per-chip 4x is directly testable rather than assumed, which is
-what a four-core `tensor_gemm_ops` run is for.
+lowering are both in good shape, and what remains is silicon.
+
+**At fp32, Trainium2 wins outright — 3.09x per chip.** This cell used to hold a
+stale 23.5 TF from an XLA run; the eager number for the same file is 37.67 TF per
+logical core, 150.7 TF per chip, at **83.3%** of its own fp32 peak against the
+H100's 72.7% of 67 TF. The nominal bar already favours Trainium2 here (2.70x on
+peak fp32, against the H100's 1.48x advantage at bf16), and the stack collects
+slightly more of it than CUDA does. fp32 gemm is not a shape most inference work
+runs, so this is not a headline — but it is the counter-example to "the gap is
+always in Trainium's software", and it is the reason the summary table's
+`gemm` row is scoped to bf16.
+
+**The x4 is measured, not assumed — with one caveat at tiny shapes.** Running
+`gemm.json` on one core and on four cores concurrently and joining the 648 shapes
+that both completed gives a median per-shape slowdown of **1.004-1.011x** by
+dtype: four cores each do essentially the work one core alone does, so multiplying
+a single-core figure by four is sound at the shapes that matter. The exceptions
+are real but narrow. fp8 is the only dtype whose *median* does not scale
+(1.46-1.53x) — unsurprising, since what it is timing is a software widening
+competing for the same scalar engines. And the smallest shapes degrade badly under
+concurrency: `M=2 K=1024 N=8192` takes **9.01x** longer per core with four cores
+busy. Those are shapes where the run is dominated by launch and sync overhead
+rather than by the matmul, so they contend on a shared resource that the large
+shapes never touch. The same tail shows up in the reductions and in `moe`
+([below](#memory-bound-ops)), which is what makes it a property of small-shape
+dispatch rather than of any one op.
 
 **fp8 is the opposite story, and a difference in kind rather than degree.** On the
 H100 fp8 is a real datapath: 1,527.9 TFLOPS at 77.2% MFU, **1.89x** faster than
@@ -348,13 +415,23 @@ suggest:
   `gelu` is 2,985.2 and `silu` 2,969.0 — `gelu` is marginally *faster*. The
   `erf`-based expansion therefore costs essentially nothing on hardware that
   compiles it well, and the entire Neuron gap is neuronx-cc.
-- **`gather`/`scatter` is not the op def.** The base `GatherOp` builds an
-  output-shaped index where `IndexSelectOp` passes a 1-D one, which was the
-  natural suspect. Measured, that costs nothing: on CUDA `gather` runs at 2,856
-  GB/s against `index_select`'s 2,862. Neuron's 1.4 and 0.8 GB/s — a 449x and
-  621x shortfall, the two largest in the whole comparison — are entirely a
-  compiler result, and the same two ops are the ones that wedge neuronx-cc for
-  hours at larger sizes.
+- **`gather`/`scatter` is not the op def's *shape*, and for `gather` it is not the
+  hardware either.** The base `GatherOp` builds an output-shaped index where
+  `IndexSelectOp` passes a 1-D one, which was the natural suspect. Measured, that
+  costs nothing on hardware that compiles it: on CUDA `gather` runs at 2,856 GB/s
+  against `index_select`'s 2,862. What the shape *does* do on Neuron is expose a
+  dtype problem — the index is built as int64 and expanded with `.expand()`, the
+  device has no int64, and the int64→int32 conversion inserted on the way into the
+  graph materialises the stride-0 broadcast that the fast lowering needs to see
+  intact. Constructing the same index as int32 keeps it a view and runs **291-731x
+  faster**, within 8% of `index_select`; forcing `.contiguous()` on the int32
+  version makes it slow again, which is what identifies layout rather than dtype as
+  the proximate cause. `scatter` is not fixable that way — `aten::scatter_.src` has
+  no NKI implementation at all, so its 621x is real. The op def is deliberately
+  *not* changed, since `torch.gather` requires int64 on CPU and CUDA; see
+  [the NEURON README](../NEURON/README.md#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity)
+  for the measured table and for the separate registration bug that keeps the NKI
+  gather kernel unreachable even when the index is right.
 - **The narrow-dtype and reduction anomalies are Neuron-only.** `sin`/`cos` are
   4x *slower* at bf16 than fp32 on Neuron; on the H100 `sin` is 2,884.9 bf16
   against 2,974.7 fp32, a 1.03x difference. `reduce_max` against `reduce_sum` is
@@ -363,10 +440,10 @@ suggest:
 - **Selection and sorting are where the H100 is the weak side**, and it is two ops
   rather than one, which is what makes it a pattern instead of an oddity:
 
-  | Op | H100 | % of 3.35 TB/s | Trn2 core | % of 725 GB/s | Absolute | Per chip, if x4 |
+  | Op | H100 | % of 3.35 TB/s | Trn2 core | % of 725 GB/s | Absolute | Per chip (measured) |
   |---|---|---|---|---|---|---|
-  | `topk` (fp32, k=4) | 629.9 | 18.8% | 476.3 | 65.7% | H100 1.32x | **Trn2 3.0x** |
-  | `moe_softmax_topk` (fp32) | 80.7 | **2.4%** | 74.4 | 10.3% | H100 1.08x | **Trn2 3.7x** |
+  | `topk` (fp32, k=4) | 629.9 | 18.8% | 476.3 | 65.7% | H100 1.32x | 1,907.2 GB/s — **Trn2 3.03x** |
+  | `moe_softmax_topk` (fp32) | 80.7 | **2.4%** | 74.4 | 10.3% | H100 1.08x | 297.5 GB/s — **Trn2 3.69x** |
 
   A whole H100 is only 8% faster than a *quarter of a Trainium2 chip* at
   `moe_softmax_topk`, on a 4.6x bandwidth advantage — and 2.4% of HBM peak is the
@@ -374,13 +451,16 @@ suggest:
   clock: `moe_gating_ops.json` is 56 cases and took the H100 **1,191 s**, three
   times the 403 s the entire 856-case `gemm.json` needed. Large-k selection over
   256 experts is a genuinely bad fit for a GPU, and the Neuron vector engine
-  handles it comparatively well. Two caveats before anyone plans around this: no
-  single NeuronCore actually *beats* the H100 on either op in absolute terms, so
-  the win depends entirely on the x4, and the four-core run measured that x4 for
-  `vector_linear_ops` and `gemm` but **not** for these two. The "Per chip" column
-  is an extrapolation, flagged as such. It is the highest-value thing left to
-  measure on the Neuron side, because if it holds it is a real MoE-routing
-  advantage.
+  handles it comparatively well. The win depends entirely on the x4, since no single
+  NeuronCore *beats* the H100 in absolute terms on either op — and the x4 is now
+  measured at exactly these shapes rather than extrapolated: four concurrent cores
+  give **4.01x** on `topk` and **4.00x** on `moe_softmax_topk`, so a Trainium2 chip
+  really is ~3x an H100 at MoE routing. What the same run also found is that this
+  holds only away from the smallest shapes: `topk` at `dim_size 128` degrades
+  **11.02x** per core under four-core concurrency and `moe_softmax_topk` at
+  `num_tokens 1` degrades **8.89x**, the same small-shape dispatch tail the
+  [gemm section](#gemm) describes. Routing a single token per step will not see this
+  advantage; routing a batch will.
 
 ## Norm, activation and MoE ops
 

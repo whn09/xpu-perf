@@ -7,11 +7,25 @@ from xpu_perf.micro_perf.backends.NEURON.backend_neuron import (
 )
 
 try:
-    # The PyTorch-native stack has no NKI attention kernel to offer: the bundled
-    # neuronxcc.nki.kernels.attention.flash_fwd is HLO-traced and only runs under
-    # torch_xla, and nki 0.6.0 ships no kernel library for torch_neuronx.wrap_nki
-    # to wrap. Native scaled_dot_product_attention does dispatch to the device,
-    # so it is what flash_attention can be measured with there.
+    # There is no NKI attention kernel for *this file* to call on the PyTorch-native
+    # stack: the bundled neuronxcc.nki.kernels.attention.flash_fwd is HLO-traced and
+    # only runs under torch_xla. Native scaled_dot_product_attention does dispatch to
+    # the device, so it is what flash_attention is measured with here.
+    #
+    # That does not make these unfused numbers, and an earlier version of this
+    # comment wrongly implied it did. torch_neuronx lowers SDPA to a NKI flash kernel
+    # inside its own dynamo backend -- _can_use_nki_flash_attention in
+    # neuron_dynamo_backend/decompositions.py, enabled by default through
+    # TORCH_NEURONX_ENABLE_NKI_SDPA -- for any call with
+    # `L % 512 == 0 and S % 512 == 0 and D <= 128 and B*H <= 512`, no attn_bias and
+    # no dropout. Measured on one logical core with the 80/8/128 GQA prefill at
+    # q_len 4096: 9,443 us by default against 60,500 us with the variable set to 0,
+    # so prefill here is fused and worth 6.41x. Decode cannot reach it -- q_len 1
+    # never satisfies `L % 512 == 0`, and B*H is 1280/5120, over the 512 limit --
+    # which is what the decode rows' 15-33% of HBM peak reflects. nkilib (installed
+    # in the beta images, so wrap_nki does have kernels to wrap now, contrary to what
+    # this comment used to say) ships attention_tkg for exactly that case; wiring it
+    # would be a second provider, not a change to this one.
     #
     # This is registered only on the native runtime. On the XLA runtime the NKI
     # provider is the intended implementation, and adding a second one would

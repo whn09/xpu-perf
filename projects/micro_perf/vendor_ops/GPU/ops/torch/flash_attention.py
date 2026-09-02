@@ -18,11 +18,24 @@ class GPUSDPAFlashAttentionOp:
     actually needs.
 
     The second is that it is the only attention comparison against Neuron that is
-    like-for-like. The NEURON eager runtime has no fused flash kernel at all
-    (`neuronxcc.nki.kernels.attention.flash_fwd` is HLO-traced and only loads
-    under torch_xla), so its reference numbers come from a provider that is this
-    same code against the same op def. Comparing those to `flash_attn` would be
+    like-for-like: its reference numbers come from a provider that is this same
+    code against the same op def. Comparing those to `flash_attn` would be
     comparing two different algorithms as well as two chips.
+
+    Both sides are fused, though not symmetrically, and the asymmetry is in the
+    Neuron numbers rather than in this file. `torch_neuronx` lowers SDPA to a NKI
+    flash kernel inside its dynamo backend (`_can_use_nki_flash_attention` in
+    `neuron_dynamo_backend/decompositions.py`, on by default via
+    `TORCH_NEURONX_ENABLE_NKI_SDPA`) whenever `L % 512 == 0 and S % 512 == 0 and
+    D <= 128 and B*H <= 512` with no attn_bias and no dropout. Every prefill case
+    in `fa_linear_ops.json` satisfies that -- setting the variable to 0 takes the
+    80/8/128 `q_len` 4096 case from 9,443 us to 60,500 us, 6.41x -- and no decode
+    case can, since `q_len == 1` never satisfies `L % 512 == 0` and `B*H` is
+    1280/5120 there. So Neuron prefill is a fused-kernel number and Neuron decode
+    is not; the earlier claim in this docstring that the eager runtime had no fused
+    kernel at all was wrong. What is true is the narrower statement it rested on:
+    `neuronxcc.nki.kernels.attention.flash_fwd` is HLO-traced and only loads under
+    torch_xla, so that particular kernel is unreachable there.
 
     That is *not* the same as saying this is a slow fallback on CUDA. SDPA
     dispatches to a fused backend -- FlashAttention or cuDNN, both of which do
