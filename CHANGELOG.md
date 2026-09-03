@@ -82,7 +82,97 @@ This changelog follows semantic versioning and Keep a Changelog style.
   above: they measure the op defs' per-sequence Python loop on both backends, and their
   224 ms / 2.3 ms ratio is launch overhead, not a chip result.
 
+- **Three of the four gaps above are now closed as far as they go without new
+  kernels**, each by a different mechanism, and each verified end-to-end through the
+  harness on both backends rather than in a standalone script:
+
+  | gap | before | after | mechanism |
+  | --- | --- | --- | --- |
+  | `gelu` | 15.41x per chip | **4.35x** | the benchmark was measuring the wrong function |
+  | `topk` | 14.2x per chip worst | **2.91x** | wire up a kernel nkilib already ships |
+  | attention `head_dim 256` | 153.6x raw worst | **38.4x** | tile the query axis; no kernel at all |
+
+- `projects/micro_perf/op_defs/basic_ops/vector_activation_ops.py`: `GeluOp` now takes
+  an `approximate` argument, torch's own, defaulting to `"none"` so every pre-existing
+  `gelu` row keeps its meaning. `models/qwen3_5_27b/activation_ops.json` asks for both
+  modes (42 → 48 cases; the directory total is 392 → 398). This matters because
+  Qwen3.5's config specifies `gelu_pytorch_tanh` while
+  `torch.nn.functional.gelu` defaults to the **erf** form, so the published `gelu`
+  numbers were of an activation this model does not use — and the two are 3.75x apart on
+  Trainium2. Same chip, same shapes, one launch: 16384 × 4304 bf16 goes from 6698.7 us
+  / 42.1 GB/s to **1749.0 us / 161.3 GB/s**, i.e. 61.65x raw against the H100's
+  `approximate="tanh"` becomes 17.40x, **15.41x → 4.35x per chip**.
+
+  The cause is `erf` alone and it is isolated by measurement: at 16384 × 4304 bf16 on
+  one logical core `erf` costs **6387.1 us at 44.2 GB/s** — 6387 of erf-gelu's 6699 —
+  while `tanh` (499.5 us, 564.7 GB/s), `sigmoid` (493.5, 571.6) and `exp` (508.6,
+  554.6) all sit on the SFU activation-table roofline. One missing lowering, not a
+  bandwidth property. Two results from `vendor_ops/NEURON/tools/probe_gelu_lowering.py`
+  worth keeping: **do not hand-write the polynomial** (6496.6 us against 1795.8 for the
+  fused call — 3.6x *worse*, because each elementwise step is its own device round trip
+  on an eager backend), and the residue is real (161.3 GB/s is still ~2.9x under `silu`
+  on the same chip, so a fused NKI gelu is worth that much again).
+
+- `projects/micro_perf/vendor_ops/NEURON/ops/nkilib/topk.py`: a second `topk` provider
+  calling `nkilib.core.topk.rotational_topk`, which is **flat in `k`** — 607.6 us at
+  k=50 against 605.5 at k=8 over the 248320 vocabulary, where `torch.topk` steps from
+  559.8 to 5310.2. `sorted` makes no measurable difference on either side, so the cliff
+  is torch's algorithm switch and not the sort; values match `torch.topk` exactly.
+  Neither provider wins everywhere and both now run every case: nkilib takes all 12
+  `k=50` rows (2.43-8.81x) and loses all 24 `k ≤ 8` rows (0.27-0.99x), and its cost
+  grows with `BxS` where torch's is flat in batch. Dispatching to the better of the two
+  moves the op from a worst row of 56.9x raw / 14.2x per chip to **11.6x / 2.91x**, and
+  the geomean over 36 rows from 1.28x to **0.71x per chip** — from behind the H100 to
+  ahead of it. Two notes for use outside the benchmark: the indices carry nkilib's own
+  `index_dtype`, not `torch.int64`, so a sampler must cast; and the config takes an
+  `nl` dtype, never a numpy one — `np.float32` fails at *lowering* time with `error:
+  numpy dtypes are not supported as arguments`, which reads like a shape limitation
+  rather than the one-word type bug it is.
+
+- `projects/micro_perf/vendor_ops/NEURON/ops/torch_tiled/`: a third `flash_attention`
+  provider for the `head_dim > 128` prefill shapes that reach **no** fused path — same
+  SDPA, called once per query tile. The motivation is the superquadratic scaling
+  recorded above: the score matrix at the worst shape is `24 × 10240 × 10240 × 2 B` =
+  **5.03 GB** against 24 GB of usable HBM per core, and tiling the query axis caps that
+  at `tile / q_len` of it. Measured: 24/4/256 at `q_len` 10240 goes 282.0 ms → **70.4
+  ms** (4.00x), 6/1/256 → **19.0 ms** (3.72x), so the section's worst ratio drops from
+  **153.6x to 38.4x** and stops growing with context. Output is numerically identical.
+
+  Gated off below a 1 GiB score matrix, which the measurements bracket tightly: 201 MB
+  **regresses 31%**, 805 MB is a wash at 1.00x, 1.17 GB wins 3.72x. `torch` stays the
+  implementation for those rows. Splitting `head_dim` instead cannot work at all —
+  softmax sits between the two matmuls, so two fused `D=128` calls cannot compose into
+  a `D=256` result — and the ceiling is unchanged: the `head_dim 128` control reaches
+  61.3 TFLOPS where this reaches 18.3, so a real 256-partition NKI kernel is still
+  worth ~3x more. One trap, recorded because it fails silently: `is_causal=True` cannot
+  be reused per tile, since PyTorch aligns the implied mask to the **top-left** of a
+  non-square score matrix while a query tile against its prefix needs bottom-right.
+
+- `projects/micro_perf/vendor_ops/NEURON/tools/probe_gelu_lowering.py`,
+  `probe_attention_head_dim_256.py`, `probe_topk_rotational.py`: the three measurements
+  the fixes above were decided from, kept because each answers a question that recurs.
+  Respectively: which formulation of an activation the backend actually lowers well;
+  whether a `head_dim` over the partition limit can be rescued by tiling rather than by
+  a kernel; and whether a nkilib kernel clears a `torch` cliff. Note the
+  attention probe's numbers are 8-10% pessimistic against the provider's, because it
+  expands GQA with `repeat_interleave` where the provider passes `enable_gqa`.
+
 ### Fixed
+
+- `projects/micro_perf/vendor_ops/NEURON/ops/torch/topk.py`: registering a vendor
+  provider for an op **silently removes the `base` one**, and the `topk` provider above
+  hit it. `core/op.py:153-155` inserts `base` only for ops with no vendor provider at
+  all, so `OP_MAPPING["topk"]` existing at all was enough to stop `torch.topk` being
+  measured — the run produced `topk/nkilib/` and no `topk/base/` at all, with no error
+  message, quietly dropping the baseline the `k` cliff was diagnosed from. Reading
+  `engine.py:128` (which does loop every provider) and `common_utils.py:455-480` (which
+  does write one file per provider) suggests the opposite, so this is worth stating
+  plainly: **a vendor provider replaces the base implementation, it does not join it.**
+  Fixed by registering the inherited implementation under its own name, `torch`, which
+  is the convention `flash_attention` already followed with its
+  `ops/torch/flash_attention.py` beside `ops/nkilib/flash_attention.py`. Both providers
+  now run all 36 cases. Note the path rename: these rows land in `topk/torch/` where
+  they used to land in `topk/base/`.
 
 - `projects/micro_perf/vendor_ops/NEURON/ops/nkilib/flash_attention.py`: the prefill
   rejection message told the reader that prefill "is measured by the `torch` provider,

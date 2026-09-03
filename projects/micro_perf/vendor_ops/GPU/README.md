@@ -28,7 +28,7 @@ workload tree, and what is missing is listed with the reason
 | `rms_norm`, `layer_norm` | **1.7x** | **1.5x** | the only two of those 24 that are neither at parity nor pathological |
 | `gelu`, `sin`, `cos`, `reduce_max`, `reduce_min`, `index_add` | **4.0-8.9x** | **3.5-7.7x** | single-op lowering gaps, each with a fast sibling on the same chip — `silu` 1.09x against `gelu` 7.7x, `reduce_sum` 1.01x against `reduce_max` 3.5x, `index_select` 0.98x against `index_add` 3.8x |
 | `gather`, `scatter` | **510x / 715x** | **449x / 621x** | the op def is exonerated — the H100 runs both at 68-85% of peak. `gather` is one index dtype away from **1.08x**; `scatter` has no kernel at all. Basic-op forms: no `llm_ops` def calls either one, so read this as a lowering signal rather than a cost an LLM pays today ([why](#memory-bound-ops)) |
-| `topk`, `moe_softmax_topk` | **0.33x / 0.27x** | **0.29x / 0.23x** | Trainium2 3.0x and 3.7x ahead per chip, and the x4 behind that is measured at these shapes (4.01x, 4.00x) rather than assumed |
+| `topk`, `moe_softmax_topk` | **0.33x / 0.27x** | **0.29x / 0.23x** | Trainium2 3.0x and 3.7x ahead per chip, and the x4 behind that is measured at these shapes (4.01x, 4.00x) rather than assumed. `k`-dependent, though: this is `k = 4`, and over a real vocabulary `torch.topk` steps **9.5x** between k=8 and k=50 (see the note below this table) |
 | `add_rms_norm`, `qk_rms_norm`, `head_rms_norm`, `swiglu`, `moe_swiglu` | **0.40-1.46x** | **0.35-1.26x** | Trainium2 ahead on 8 of these 9 dtype/op rows, by up to 2.9x on `head_rms_norm` at fp32; the exception is `add_rms_norm` |
 | `rotary_embedding` | **1.15x** | **0.99x** | exactly the memory-bound bar — both backends get 5.9% of their own peak, so the missing 94% is the op def, not either chip |
 | `*_dynamic_quant` (5 ops), `quant_group_gemm_reduce_sum` | **4.4-44x** | **3.8-38x** | `scale_`, `swiglu_`, `add_rms_norm_`, `head_rms_norm_`, `moe_swiglu_dynamic_quant`, plus `quant_group_gemm_reduce_sum` at fp8 and int8 — seven rows over six ops, all on top of one shared unfused helper, `smooth_per_token_dynamic_quant`, which costs the H100 3-14x too |
@@ -77,10 +77,23 @@ prefill is **37.6x** at `q_len` 4096 and **153.9x** at 10240 — against the 3.1
 table reports — with Neuron's throughput *falling* 15.0 → 4.6 TFLOPS as the H100's
 rises, so the gap grows with context rather than converging. The 3.1x row is a
 statement about `attention_cte` at a head_dim it accepts, not about attention in
-general. That directory's [README](../../workloads/models/qwen3_5_27b/README.md) carries
-the per-model comparison, including a `gelu` result (13-15x per chip at the vision
-tower's shapes) that is the same lowering gap this table's `gelu` row names, measured
-larger at larger shapes.
+general.
+
+Part of that is recoverable without a kernel. Tiling the query axis, so the 5.03 GB score
+matrix never lands whole in HBM, takes the worst row from **153.6x to 38.4x** and stops
+it growing with context (`vendor_ops/NEURON/ops/torch_tiled/flash_attention.py`, a third
+provider, gated to score matrices over 1 GiB because below that it is a wash or worse).
+The rest is not: the `head_dim 128` control on the same shapes reaches 61.3 TFLOPS where
+the tiled 256 reaches 18.3, so a genuine 256-partition flash kernel is worth ~3x more
+again.
+
+That directory's [README](../../workloads/models/qwen3_5_27b/README.md) carries the
+per-model comparison. Two of its findings qualify rows in this table: a `gelu` result
+that is the same `erf` lowering gap the `gelu` row names but 3.75x smaller once the
+model's own `approximate="tanh"` is asked for (**4.35x per chip**), and a `topk` cliff
+above `k = 8` that this table's 0.33x row cannot show because it is measured at `k = 4`
+— on the vocabulary-sized shapes `torch.topk` steps 9.5x between k=8 and k=50, and
+nkilib's `rotational_topk` (now a second provider) removes it.
 
 On bf16 gemm it delivers 90% of its own peak against the H100's 82% and lands
 within 1.35x per chip — [and the four-core run confirms that x4 is
@@ -805,11 +818,20 @@ one H100.
 The GPU column settles four claims that the Neuron numbers alone could only
 suggest:
 
-- **`gelu`'s 7-14x deficit is lowering, not `erf`.** `NEURON/README.md` flags
-  `gelu` at 83.7 GB/s against `silu` at 587.2 over identical shapes. On the H100
-  `gelu` is 2,985.2 and `silu` 2,969.0 — `gelu` is marginally *faster*. The
-  `erf`-based expansion therefore costs essentially nothing on hardware that
-  compiles it well, and the entire Neuron gap is neuronx-cc.
+- **`gelu`'s 7-14x deficit is a lowering gap, and the missing lowering is `erf`'s.**
+  `NEURON/README.md` flags `gelu` at 83.7 GB/s against `silu` at 587.2 over identical
+  shapes. On the H100 `gelu` is 2,985.2 and `silu` 2,969.0 — `gelu` is marginally
+  *faster* — so the `erf` expansion costs essentially nothing on hardware that compiles
+  it, and the whole gap is neuronx-cc's. It has since been isolated to the one op:
+  measured alone at 16384 × 4304 bf16 on one logical core, `erf` costs **6387.1 us at
+  44.2 GB/s**, while `tanh` (564.7 GB/s), `sigmoid` (571.6) and `exp` (554.6) all reach
+  the SFU activation-table roofline on the same chip. So this row is not "transcendentals
+  are slow on Trainium2"; it is one function without a fast path, and the three siblings
+  that share the unit are fine. Asking for `approximate="tanh"` — which is what most
+  models, including Qwen3.5, actually specify — recovers **3.75x** of it; see
+  [`models/qwen3_5_27b/README.md`](../../workloads/models/qwen3_5_27b/README.md). The row
+  above stays at the erf form because that is `torch`'s default and what
+  `basic/vector_activation_ops/` asks for.
 - **`gather`/`scatter` is not the op def's *shape*, and for `gather` it is not the
   hardware either.** The base `GatherOp` builds an output-shaped index where
   `IndexSelectOp` passes a 1-D one, which was the natural suspect. Measured, that

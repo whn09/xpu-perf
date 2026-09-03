@@ -35,7 +35,7 @@ attention+MLP blocks. Qwen3.5-27B is not that:
 | `hidden_size` | 5120 | every `hidden_size` and every GEMM K below |
 | `intermediate_size` | 17408 | not a power of two; `gemm.json`'s `K.N` pairs never touch it |
 | `num_attention_heads` / `num_key_value_heads` | 24 / 4 | GQA 6:1; TP=4 is the maximum clean TP |
-| `head_dim` | **256** | above every Neuron flash kernel's 128-partition limit, so no fused attention path exists there (measured: up to 154x); the H100's SDPA takes it for free |
+| `head_dim` | **256** | above every Neuron flash kernel's 128-partition limit, so no fused attention path exists there (measured: up to 154x, cut to 38x by tiling the query axis); the H100's SDPA takes it for free |
 | `attn_output_gate` | true | q projection is 2x wide: 24×256×2 = 12288, not 6144 |
 | `partial_rotary_factor` | 0.25 | rotary covers 64 of the 256 dims — `rope_dim: 64` |
 | `vocab_size`, `tie_word_embeddings` | 248320, false | a 2.54 GB embedding *and* a separate 2.54 GB lm_head |
@@ -119,8 +119,9 @@ Two caveats to read the output with:
   reaches. On Trainium2 it misses *every* fused path (`nkilib`'s `P_MAX = 128` and
   torch_neuronx's SDPA rewrite gate both cap at 128), and the measured result is 37.6x
   at `q_len` 4096 rising to 153.9x at 10240. The published attention comparison
-  (prefill 3.1x, decode 1.9-3.2x) therefore does **not** describe these 16 layers. See
-  the Trainium2 section.
+  (prefill 3.1x, decode 1.9-3.2x) therefore does **not** describe these 16 layers. The
+  10240 rows now also run a third provider, `torch_tiled`, which recovers 4x of that
+  without a kernel. See the Trainium2 section.
 * **`is_causal=True` is hardcoded** in `op_defs/llm_ops/flash_attention.py`, and
   vision attention is not causal. The vision rows are therefore an upper bound on a
   cheaper op, not a faithful measurement. Fixing that needs an op-def change.
@@ -133,14 +134,22 @@ the two head sets; `head_rms_norm` at `[48, 128, 0, 48]` / `[12, 128, 0, 12]` fo
 GDN's gated output norm and `[16, 128, 0, 16]` / `[4, 128, 0, 4]` for its q/k
 normalisation. `num_tokens` follows the same six-point ladder as the GEMMs.
 
-### `activation_ops.json` — 42 cases
+### `activation_ops.json` — 48 cases
 
 `swiglu` at `hidden_size` 17408 / 4352 — note the op def's `hidden_size` is the
 *output* width, so the input tensor is `[num_tokens, 2 × hidden_size]`, which is
 already how the fused gate+up projection lands. `silu` at the GDN gate and conv
 widths (6144 / 1536 / 10240 / 2560), and `gelu` at the vision intermediate
-(4304 / 1076) — the config says `gelu_pytorch_tanh`, and the op def's plain `gelu`
-is the closest registered form.
+(4304 / 1076) in **both** of the formulations torch offers,
+`approximate: ["tanh", "none"]`.
+
+That second key is new, and it is the reason this file grew from 42 cases. The config
+says `gelu_pytorch_tanh`, and `torch.nn.functional.gelu` defaults to
+`approximate="none"`, which is the *erf* form — a different function, and on Trainium2
+a 3.75x more expensive one (see the measured section). Measuring only the default was
+therefore measuring an activation this model does not use. Both are kept rather than
+switching the default, so the pre-existing `gelu` rows in every other workload keep
+their meaning.
 
 ### `pre_attention_ops.json` — 24 cases
 
@@ -397,25 +406,83 @@ kernel-coverage gap rather than a silicon one.
 Consequence for the model: these are 16 of 64 layers and ~1.68B of 27.31B params, but
 at 10240-token prefill they would dominate total time outright.
 
-### `gelu` is pinned at ~40 GB/s — a software fault, not bandwidth
+#### Partly recovered: 153x → 38x by tiling the query axis, no kernel needed
 
-| shape | Trn2 | H100 | raw |
-| --- | --- | --- | --- |
-| 16384 × 4304 | 6698.9 us, **42.1 GB/s** | 108.5 us, 2599.6 GB/s | 61.7x |
-| 4096 × 4304 | 1660.8 us, **42.5 GB/s** | 32.0 us, 2206.3 GB/s | 52.0x |
-| 16384 × 1076 | 1826.9 us, **38.6 GB/s** | 31.9 us, 2208.9 GB/s | 57.2x |
+`vendor_ops/NEURON/ops/torch_tiled/flash_attention.py` is a third provider that calls
+the same SDPA once per query tile instead of once per call. It exists because of the
+"cost grows faster than O(n²)" observation above: the score matrix at the worst shape is
+`24 × 10240 × 10240 × 2 B` = **5.03 GB** against 24 GB of usable HBM per core, and
+tiling the query axis caps that at `tile / q_len` of it. Measured through the harness:
 
-Trn2's `gelu` is flat at **31-42 GB/s across every size** — it does not scale at all.
-The control is `silu` on the same chip, same dtype, comparable shapes, also the `base`
-provider: **475-489 GB/s**, which is ~1.9 TB/s per chip against the H100's 2.9 and
-lands exactly on the expected 1.45x chip ratio. So the elementwise roofline is healthy
-and `gelu` specifically is **12-15x below it**. Nothing about the hardware explains a
-12x spread between two activations that read and write the same bytes; this is a
-missing or scalar-decomposed `erf`/`tanh` path.
+| shape | q_len | `torch` | `torch_tiled` | gain | vs H100 was | now |
+| --- | --- | --- | --- | --- | --- | --- |
+| 24/4/256 | 10240 | 282.0 ms | **70.4 ms** | **4.00x** | 153.6x | **38.4x** |
+| 6/1/256 (TP=4) | 10240 | 70.5 ms | **19.0 ms** | **3.72x** | 125.1x | **33.7x** |
+| 24/4/256 | 4096 | 13.7 ms | gated off | — | 37.6x | — |
+| 6/1/256 (TP=4) | 4096 | 3.5 ms | gated off | — | 21.9x | — |
 
-It is confined to the 27-layer vision tower (`gelu_pytorch_tanh` at intermediate 4304),
-so it does not touch text-only decode — but it makes the vision encoder the second
-thing to fix, and it is likely the cheapest of the three to fix.
+Output is numerically identical to SDPA. The gain is confined to the shapes whose score
+matrix is large: with the gate forced open, 805 MB is a wash (1.00x) and 201 MB
+**regresses 31%**, so the provider gates itself off below 1 GiB and reports those two
+rows unsupported — `torch` remains the implementation for them. That also means the
+*worst* ratio in this whole section drops from 153.6x to 38.4x while the ratio no longer
+grows with context, which was the more alarming half of the original finding.
+
+Two things it does not fix. First, splitting `head_dim` instead would not work at all:
+`QK^T` can accumulate as `Q1@K1^T + Q2@K2^T`, but softmax sits between the two matmuls,
+so two fused `D=128` calls cannot compose into a `D=256` result. Tiling the *query* axis
+is the only decomposition that survives. Second, the ceiling: the `head_dim 128` control
+on these same shapes reaches 61.3 TFLOPS where tiled `head_dim 256` reaches 18.5. So
+this recovers ~4x of a ~22x gap, and a genuine 256-partition NKI flash kernel is still
+worth roughly 3x more on top. It is what can be had without writing one. Run-to-run
+spread on the two tiled rows is about 2%.
+
+One implementation trap, recorded because it fails silently: `is_causal=True` cannot be
+reused per tile. PyTorch aligns the implied mask to the **top-left** of a non-square
+score matrix, and a query tile against its whole prefix needs bottom-right alignment, so
+the tiled path has to build `ki <= qi` explicitly with `qi` offset by the tile start.
+Passing `is_causal` anyway does not error — it attends to the wrong keys.
+
+### `gelu` was 15.4x per chip; it is now 4.35x — FIXED, and the cause was `erf`
+
+**The first measurement was of the wrong function.** `torch.nn.functional.gelu` defaults
+to `approximate="none"`, the erf form, while Qwen3.5's config asks for
+`gelu_pytorch_tanh`. `op_defs/basic_ops/vector_activation_ops.py` now exposes torch's
+own `approximate` argument, and this file measures both. Same chip, same shapes, one
+launch:
+
+| shape | Trn2 erf | Trn2 tanh | H100 tanh | raw (erf) | raw (tanh) | per chip |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16384 × 4304 | 6698.7 us, 42.1 GB/s | **1749.0 us, 161.3 GB/s** | 100.5 us, 2806.3 | 61.65x | **17.40x** | **4.35x** |
+| 16384 × 1076 | 1831.1 us, 38.5 GB/s | **519.5 us, 135.7 GB/s** | 30.1 us, 2345.8 | 56.71x | 17.28x | 4.32x |
+| 4096 × 4304 | 1658.1 us, 42.5 GB/s | **455.0 us, 155.0 GB/s** | 29.9 us, 2355.8 | 51.95x | 15.20x | 3.80x |
+| 1024 × 4304 | 432.9 us, 40.7 GB/s | **134.7 us, 130.9 GB/s** | 25.4 us, 694.4 | 17.87x | 5.30x | 1.33x |
+| 1024 × 1076 | 141.3 us, 31.2 GB/s | **61.3 us, 71.9 GB/s** | 25.7 us, 171.2 | 3.91x | 2.38x | 0.60x |
+
+So the headline number for this op goes from **15.41x to 4.35x per chip** by asking for
+the function the model actually specifies. Both columns are honest — the H100 column is
+`approximate="tanh"` too, so this is like for like.
+
+The cause is `erf`, and it is isolated: measured alone at 16384 × 4304 bf16 on one
+logical core, `erf` costs **6387.1 us at 44.2 GB/s**, while `tanh` (499.5 us,
+564.7 GB/s), `sigmoid` (493.5, 571.6) and `exp` (508.6, 554.6) all sit on the SFU
+activation-table roofline. `erf` is 6387 of erf-gelu's 6699 us. There is no fast
+lowering for it; the other three transcendentals on the same unit are fine. That is a
+one-op coverage gap, not a bandwidth property, and it explains why erf-gelu was flat at
+31-42 GB/s at every size while `silu` on the same chip reaches 475-489 GB/s.
+
+Two results worth keeping from `vendor_ops/NEURON/tools/probe_gelu_lowering.py`:
+
+* **Do not hand-write the polynomial.** Spelling out
+  `0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))` costs **6496.6 us** against 1795.8 for the
+  fused `F.gelu(x, approximate="tanh")` — **3.6x worse**, because on an eager backend
+  every elementwise step is its own device round trip.
+* **The residue is real.** 161.3 GB/s is still ~2.9x under `silu`'s 464 GB/s on the same
+  chip and dtype, and both are one SFU pass over the same bytes. So a fused NKI gelu
+  would be worth roughly another 2.9x on top of this 3.75x. The 4.35x above is what is
+  available without writing one.
+
+This is confined to the 27-layer vision tower, so it does not touch text-only decode.
 
 ### `topk` falls off a cliff above `k = 8`
 
@@ -432,6 +499,40 @@ is 1.4-6.2x raw, i.e. at or ahead of parity per chip; at k=50 it is 28-57x. Ther
 evidently a small-k path and a general sort above it. Typical top-k sampling uses
 k=50, so production sampling hits the slow side: 5.3 ms per decode step at TP=1, still
 1.4 ms at TP=4, against a ~36.5 ms step budget.
+
+**Fixed by a kernel: nkilib's `rotational_topk`, which is flat in `k`.** It is now
+registered as a second provider (`vendor_ops/NEURON/ops/nkilib/topk.py`), so both run
+every case. `sorted` makes no measurable difference on either side, so the cliff is
+torch's algorithm switch and not the sort. Latency in us, bf16:
+
+| vocab | B | k | torch | nkilib | gain |
+| --- | --- | --- | --- | --- | --- |
+| 248320 | 1 | 8 | 559.8 | 605.5 | 0.92x |
+| 248320 | 1 | 50 | 5310.2 | **607.6** | **8.74x** |
+| 248320 | 16 | 50 | 5336.0 | **606.2** | **8.80x** |
+| 248320 | 64 | 50 | 5366.7 | 2205.5 | 2.43x |
+| 62080 | 1 | 50 | 1367.6 | **193.3** | **7.08x** |
+| 62080 | 64 | 50 | 1360.5 | 343.8 | 3.96x |
+
+The kernel is a multi-stage rotational reduction, so `k` changes how much is carried
+between stages rather than which algorithm runs — 607.6 us at k=50 against 605.5 at k=8,
+i.e. the cliff is gone. Values match `torch.topk` exactly. Neither provider wins
+everywhere, which is why this is a second provider and not a replacement: nkilib takes
+all 12 `k=50` rows (2.43-8.81x) and loses all 24 `k≤8` rows (0.27-0.99x), and its cost
+grows with `BxS` where torch's is flat in batch. Dispatching to the better of the two:
+
+| | worst row | geomean over 36 rows |
+| --- | --- | --- |
+| raw | 56.9x → **11.6x** | 5.13x → **2.86x** |
+| per chip | 14.2x → **2.91x** | 1.28x → **0.71x** |
+
+So per chip the whole op moves from slightly behind the H100 to slightly ahead of it.
+
+Two notes for anyone using the kernel outside this benchmark. Its indices carry nkilib's
+own `index_dtype`, not `torch.int64`, so a sampler feeding them into a gather must cast.
+And it takes an `nl` dtype, never a numpy one — passing `np.float32` fails at *lowering*
+time, inside the kernel call, with `error: numpy dtypes are not supported as arguments`,
+which reads like a shape limitation rather than the one-word type bug it is.
 
 ### `rms_norm`'s 14x is mostly a provider mismatch, but not entirely
 
@@ -505,9 +606,24 @@ for this *model*:
   Collectives at TP=4 add a fourth.
 
 So parity is a statement about the chip, not a prediction about this checkpoint. All
-four items are fixable in kernels; none requires different hardware. The head_dim-256
-limit is the one that would need real work — a 256-partition flash kernel, or a
-two-pass split over the partition axis.
+four items are fixable in kernels; none requires different hardware.
+
+**Three of the four have since been worked, and the results are in the sections above.**
+Each was a different kind of fix, which is the useful part:
+
+| gap | before | after | what the fix was |
+| --- | --- | --- | --- |
+| `gelu` | 15.41x per chip | **4.35x** | the benchmark was measuring the erf form; the model asks for the tanh form. `erf` has no fast lowering, `tanh`/`sigmoid`/`exp` all reach the roofline. Op def now exposes torch's `approximate`. |
+| `topk` | 14.2x per chip worst | **2.91x** | nkilib already ships `rotational_topk`, which is flat in `k`. 40-line provider, up to 8.8x. |
+| attention `head_dim 256` | 153.6x raw worst | **38.4x** | tile the query axis so the 5.03 GB score matrix never lands whole. No kernel, and it no longer grows with context. |
+| `all_reduce` at TP=4 | 4.1x over budget | — | not attempted; it is fixed overhead, not bandwidth. |
+
+None of the three needed new hardware and only one needed a NKI kernel that someone had
+already written. The residues are all still real and all still software: a fused NKI gelu
+is worth ~2.9x more, a 256-partition flash kernel ~3x more, and `rms_norm` has an
+unwired `rmsnorm_tkg` kernel worth ~2.5x. The honest revised claim is that the parity
+expectation holds for the chip and holds for this model *to within the coverage of the
+kernel library*, which is a moving target rather than a limit.
 
 ## Runtime hazard: `max_data_cnt` on the GPU backend
 
@@ -569,3 +685,26 @@ not here.
 Three of the eight items above (conv1d, cumsum, triangular inverse) are exactly the
 three places the working vllm-neuron port had to write a workaround. That coincidence
 is the strongest available argument that these gaps are real rather than cosmetic.
+
+### The missing op defs are missing here, not on the chip
+
+An earlier version of this section implied Neuron had nothing to run these with. It
+does. `nkilib`, as installed in the PyTorch-native beta images
+(`/usr/local/lib/python3.12/site-packages/nkilib`), ships a kernel for most of the list
+above, so what is missing is the op def that would call it, not the kernel:
+
+| item above | nkilib kernel |
+| --- | --- |
+| 1. GDN / delta-rule scan | `experimental/scan/{linear_scan,selective_scan,ssd,ssd_block,ssd_head_outer}.py` |
+| 2. `conv1d` | `experimental/conv/{conv1d,depthwise_conv1d,conv3d}.py` |
+| 3. `cumsum` | `core/cumsum/cumsum.py` |
+| 7. `where`, and 8. `pad` | `experimental/pad/pad.py`, `experimental/misc/{gather,scatter_add}.py` |
+| `topk` (fixed above) | `core/topk/rotational_topk.py`, `experimental/topk/{gpsimd_topk}.py` |
+| `rms_norm` (see its section) | `core/subkernels/rmsnorm_tkg.py`, `core/rmsnorm/{rmsnorm_quant,rmsnorm_mx_prefill}.py` |
+| `rotary_embedding` | `core/embeddings/rope.py` |
+
+Item 4 (triangular inverse) and item 5 (`softplus`) have no obvious counterpart. The
+`topk` row is the worked example of what wiring one costs: an op def already existed, so
+it took a 40-line provider and produced up to 8.8x. `rms_norm` is the next such case —
+that section's 14x is a `flashinfer`-vs-`base` provider mismatch, and
+`rmsnorm_tkg.py` is what would make it like for like.
