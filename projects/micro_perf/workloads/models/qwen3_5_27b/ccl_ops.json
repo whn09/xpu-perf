@@ -1,0 +1,11 @@
+{
+    "all_reduce": [
+        {
+            "arg_type": "llm",
+            "world_size": [4],
+            "dtype": ["bfloat16"],
+            "num_tokens": [1, 16, 64, 1024, 4096, 10240],
+            "hidden_size": [5120]
+        }
+    ]
+}

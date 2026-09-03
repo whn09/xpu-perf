@@ -1,0 +1,42 @@
+{
+    "rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": ["bfloat16", "float32"],
+            "num_tokens": [1, 16, 64, 1024, 4096, 10240],
+            "hidden_size": [5120]
+        }
+    ],
+    "add_rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": ["bfloat16"],
+            "num_tokens": [1, 16, 64, 1024, 4096, 10240],
+            "hidden_size": [5120]
+        }
+    ],
+    "qk_rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": ["bfloat16", "float32"],
+            "q_head_num.kv_head_num.qk_head_dim": [
+                [24, 4, 256],
+                [6, 1, 256]
+            ],
+            "num_tokens": [1, 16, 64, 1024, 4096, 10240]
+        }
+    ],
+    "head_rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": ["bfloat16", "float32"],
+            "total_head_num.head_dim.norm_head_start.norm_head_num": [
+                [48, 128, 0, 48],
+                [12, 128, 0, 12],
+                [16, 128, 0, 16],
+                [4, 128, 0, 4]
+            ],
+            "num_tokens": [1, 16, 64, 1024, 4096, 10240]
+        }
+    ]
+}

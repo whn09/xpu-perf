@@ -233,6 +233,25 @@ if [ -n "$ONLY" ] || [ -n "$LIST" ]; then
     run_one single_pre_fa_ops       5400 --workload $W/llm/single_test_ops/pre_fa_ops.json
 fi
 
+# 6. Model-shaped workloads, also gated. Not part of the published comparison
+#    table: every other label above sweeps powers of two, and these sweep one real
+#    model's config.json instead, so mixing them into the default run would blur
+#    what the table means. See workloads/models/qwen3_5_27b/README.md for where each
+#    shape comes from.
+#
+#    qwen3_5_27b_ccl needs 4 devices and does nothing on a one-GPU box.
+if [ -n "$ONLY" ] || [ -n "$LIST" ]; then
+    Q=$W/models/qwen3_5_27b
+    run_one qwen3_5_27b_gemm          7200 --workload $Q/gemm_ops.json
+    run_one qwen3_5_27b_attention     5400 --workload $Q/attention_ops.json
+    run_one qwen3_5_27b_norm          3600 --workload $Q/norm_ops.json
+    run_one qwen3_5_27b_activation    3600 --workload $Q/activation_ops.json
+    run_one qwen3_5_27b_pre_attention 3600 --workload $Q/pre_attention_ops.json
+    run_one qwen3_5_27b_sampling      3600 --workload $Q/sampling_ops.json
+    run_one qwen3_5_27b_deltanet      3600 --workload $Q/deltanet_ops.json
+    run_one qwen3_5_27b_ccl           1800 --workload $Q/ccl_ops.json
+fi
+
 if [ -z "$LIST" ]; then
     echo ""
     echo "=============== GPU comparison sweep finished $(date -Is) ==============="

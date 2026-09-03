@@ -1,0 +1,44 @@
+{
+    "cast": [
+        {
+            "arg_type": "default",
+            "dtype": ["bfloat16"],
+            "dst_dtype": ["float32"],
+            "batch_size": [1024, 4096, 10240],
+            "dim_size": [6144, 1536]
+        }
+    ],
+    "exp": [
+        {
+            "arg_type": "default",
+            "dtype": ["float32"],
+            "batch_size": [16384, 65536, 262144],
+            "dim_size": [48, 12]
+        }
+    ],
+    "mul": [
+        {
+            "arg_type": "default",
+            "dtype": ["float32", "bfloat16"],
+            "batch_size": [1024, 4096, 10240],
+            "dim_size": [6144, 1536]
+        }
+    ],
+    "reduce_sum": [
+        {
+            "arg_type": "default",
+            "dtype": ["float32"],
+            "batch_size": [16384, 65536, 262144],
+            "dim_size": [128]
+        }
+    ],
+    "index_select": [
+        {
+            "arg_type": "default",
+            "dtype": ["float32"],
+            "src_batch_size": [64],
+            "dst_batch_size": [1, 16, 64],
+            "dim_size": [786432]
+        }
+    ]
+}

@@ -1,0 +1,73 @@
+{
+    "flash_attention": [
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype.cache_dtype.qk_compute_dtype.pv_compute_dtype.dst_dtype": [
+                ["bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16"]
+            ],
+            "q_head_num.kv_head_num.head_dim": [
+                [24, 4, 256],
+                [6, 1, 256]
+            ],
+            "batch_size.cache_len.q_len": [
+                [1, 0, 4096],
+                [1, 0, 10240]
+            ]
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "decode",
+            "dtype.cache_dtype.qk_compute_dtype.pv_compute_dtype.dst_dtype": [
+                ["bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16"]
+            ],
+            "q_head_num.kv_head_num.head_dim": [
+                [24, 4, 256],
+                [6, 1, 256]
+            ],
+            "batch_size.cache_len.q_len": [
+                [16, 4096, 1],
+                [16, 10240, 1],
+                [64, 4096, 1],
+                [16, 10240, 4]
+            ]
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype.cache_dtype.qk_compute_dtype.pv_compute_dtype.dst_dtype": [
+                ["bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16"]
+            ],
+            "q_head_num.kv_head_num.head_dim": [
+                [16, 16, 72],
+                [4, 4, 72]
+            ],
+            "batch_size.cache_len.q_len": [
+                [1, 0, 1024],
+                [1, 0, 4096]
+            ]
+        }
+    ],
+    "softmax": [
+        {
+            "arg_type": "llm",
+            "dtype": ["bfloat16", "float32"],
+            "batch_size": [1],
+            "head_num": [24, 6],
+            "q_seq_len.kv_seq_len": [
+                [1024, 1024],
+                [2048, 2048]
+            ]
+        },
+        {
+            "arg_type": "llm",
+            "dtype": ["bfloat16", "float32"],
+            "batch_size": [16],
+            "head_num": [24, 6],
+            "q_seq_len.kv_seq_len": [
+                [1, 4096],
+                [1, 10240]
+            ]
+        }
+    ]
+}

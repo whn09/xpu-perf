@@ -270,22 +270,28 @@ class StoreKVCacheOp(BasicOp):
                 cache_start = cache_len
                 cache_end = cache_len + q_len
 
+                # The packed source is [q_len, kv_head_num * head_dim] and the cache
+                # slice is [kv_head_num, q_len, head_dim], so the head dimension has to
+                # be split out before the transpose: a plain transpose(0, 1) leaves
+                # [kv_head_num * head_dim, q_len], which copy_ cannot broadcast onto the
+                # destination at any shape. Quantisation happens first, while the tensor
+                # is still token-major, because that is static_quant's contract --
+                # [num_tokens, hidden_size] against a [1, hidden_size] scale.
+                def _to_cache_layout(src, scale):
+                    if self.use_quant:
+                        src = static_quant(src, scale, self.cache_torch_dtype)
+                    return src.contiguous().view(
+                        q_len, self.kv_head_num, self.head_dim
+                    ).transpose(0, 1)
+
                 if self.store_mode == "both" or self.store_mode == "k":
                     src_k_data = packed_qkv[token_start:token_end, self.k_dim_start:self.k_dim_end]
-                    src_k_data = src_k_data.contiguous().transpose(0, 1)
                     dst_k_cache = k_cache[kv_slot_id, :, cache_start:cache_end, :]
-                    if self.use_quant:
-                        dst_k_cache.copy_(static_quant(src_k_data, k_scale, self.cache_torch_dtype))
-                    else:
-                        dst_k_cache.copy_(src_k_data)
+                    dst_k_cache.copy_(_to_cache_layout(src_k_data, k_scale))
                 if self.store_mode == "both" or self.store_mode == "v":
                     src_v_data = packed_qkv[token_start:token_end, self.v_dim_start:self.v_dim_end]
-                    src_v_data = src_v_data.contiguous().transpose(0, 1)
                     dst_v_cache = v_cache[kv_slot_id, :, cache_start:cache_end, :]
-                    if self.use_quant:
-                        dst_v_cache.copy_(static_quant(src_v_data, v_scale, self.cache_torch_dtype))
-                    else:
-                        dst_v_cache.copy_(src_v_data)
+                    dst_v_cache.copy_(_to_cache_layout(src_v_data, v_scale))
 
         return k_cache, v_cache
 

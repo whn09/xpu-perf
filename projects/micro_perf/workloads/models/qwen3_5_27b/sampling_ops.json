@@ -1,0 +1,28 @@
+{
+    "softmax": [
+        {
+            "arg_type": "default",
+            "dtype": ["float32", "bfloat16"],
+            "batch_size": [1, 16, 64],
+            "dim_size": [248320, 62080]
+        }
+    ],
+    "topk": [
+        {
+            "arg_type": "default",
+            "dtype": ["float32", "bfloat16"],
+            "batch_size": [1, 16, 64],
+            "dim_size": [248320, 62080],
+            "k": [1, 8, 50]
+        }
+    ],
+    "embedding": [
+        {
+            "arg_type": "default",
+            "dtype": ["bfloat16"],
+            "src_batch_size": [248320],
+            "dst_batch_size": [1, 16, 64, 1024, 4096, 10240],
+            "dim_size": [5120]
+        }
+    ]
+}

@@ -322,6 +322,30 @@ run_one chip4_reduction 5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
 run_one chip4_moe       5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
     --workload "$W/llm/single_test_ops/moe_gating_ops.json"
 
+# 9. Model-shaped workloads, gated behind ONLY. Every label above sweeps powers of
+#    two; these sweep one real model's config.json instead, so they answer a
+#    different question and are kept out of the default run rather than blurring
+#    the comparison table. See ../../../workloads/models/qwen3_5_27b/README.md for
+#    the provenance of each shape and for what the files deliberately omit.
+#
+#    Budgets are generous because every distinct shape pays the ~2.9 s per-shape
+#    warmup plus a neuronx-cc compile on a cold cache, and none of these shapes is
+#    in any cache from an earlier label -- that is the whole point of the file.
+if [ -n "$ONLY" ] || [ -n "$LIST" ]; then
+    Q=$W/models/qwen3_5_27b
+    run_one qwen3_5_27b_gemm          21600 0 - --workload $Q/gemm_ops.json
+    run_one qwen3_5_27b_attention     10800 0 - --workload $Q/attention_ops.json
+    run_one qwen3_5_27b_norm          7200  0 - --workload $Q/norm_ops.json
+    run_one qwen3_5_27b_activation    7200  0 - --workload $Q/activation_ops.json
+    run_one qwen3_5_27b_pre_attention 7200  0 - --workload $Q/pre_attention_ops.json
+    run_one qwen3_5_27b_sampling      7200  0 - --workload $Q/sampling_ops.json
+    run_one qwen3_5_27b_deltanet      7200  0 - --workload $Q/deltanet_ops.json
+    # world_size 4, so all four logical cores and the XCCL engine, same as xccl4.
+    run_one qwen3_5_27b_ccl 5400 0,1,2,3 \
+        "XPU_PERF_ENGINES=XCCLEngine XPU_PERF_XCCL_READY_TIMEOUT_S=2400" \
+        --workload $Q/ccl_ops.json
+fi
+
 if [ -z "$LIST" ]; then
     echo ""
     echo "=============== sweep finished $(date -Is) ==============="

@@ -8,6 +8,54 @@ This changelog follows semantic versioning and Keep a Changelog style.
 
 ### Added
 
+- `projects/micro_perf/workloads/models/qwen3_5_27b/`: eight workload files (392
+  cases) shaped from `Qwen/Qwen3.5-27B`'s real `config.json` rather than from powers
+  of two, at TP=1 and TP=4, plus a README documenting the provenance of every shape.
+  The model's nine distinct GEMM `K.N` pairs and `basic/tensor_gemm_ops/gemm.json`'s
+  four have an **empty intersection**, which is why per-op numbers could not previously
+  be attached to a per-model claim without interpolating. Covers `head_dim 256`
+  attention, `intermediate_size 17408`, the 248320 vocabulary, partial rotary
+  (`rope_dim 64` against a `rope_dim 256` control), the gated-delta-net path
+  decomposed into registered ops, and the TP=4 all_reduce message shape. Reachable
+  from both sweep scripts as gated `qwen3_5_27b_*` labels; excluded from the default
+  runs so the published comparison table keeps meaning one thing.
+  The README also lists the nine things the model executes that **no op def can
+  express** — the delta-rule scan itself, `conv1d`, `cumsum`, triangular inverse,
+  `softplus`/`tanh`, `bmm`, `where`, `index_copy_`/`pad`/`cat`, and a paged
+  `store_kv_cache`. Three of those are exactly where the working vllm-neuron port had
+  to hand-roll a workaround.
+
+  Measured on one H100 80GB HBM3 (Trainium2 pending, so this is not yet a
+  comparison): 348 of 384 cases in 4 min 45 s. **`head_dim 256` costs the H100
+  nothing** — 701.9 TFLOPS / 70.9% MFU on prefill at `q_len` 10240, and decode is
+  bandwidth-bound at 2698 GB/s (92% of achievable), which sharpens the question for
+  Trainium2 rather than softening it. GEMM peaks at 81.9% MFU and the non-power-of-two
+  17408 costs nothing, but the tiny-N GDN projections (`N` 96 and 24) run at 1-21% of
+  peak and the 128×128 delta-rule scan tile reaches only 13.5% MFU — the concrete form
+  of the claim that the GDN path is utilisation-bound, not FLOP-bound. Partial rotary
+  is worth 2.8-3.6x in prefill. `swiglu` peaks at 1041 GB/s against `silu`'s 2952 on
+  the same card, and `topk` over the vocabulary costs 90-300 us almost independently
+  of `k`.
+
+### Fixed
+
+- `projects/micro_perf/op_defs/llm_ops/store_kv_cache.py`: the linear-cache branch
+  could never run. It copied a `[q_len, kv_head_num * head_dim]` slice onto a
+  `[kv_head_num, q_len, head_dim]` cache slice — `transpose(0, 1)` without first
+  splitting the head dimension out — which `copy_` cannot broadcast at **any** shape,
+  so every case failed with a size-mismatch `RuntimeError`. The quantised path was
+  separately wrong: `static_quant`'s contract is `[num_tokens, hidden_size]` against a
+  `[1, hidden_size]` scale, and it was being handed an already-transposed tensor.
+  Fixed by quantising while the data is still token-major and splitting the head
+  dimension before the transpose. This is the real reason
+  `llm/single_test_ops/pre_fa_ops.json` had no runnable `store_kv_cache` case on
+  either backend — the int8 cache dtype was only the second reason — and the eight
+  rows in `models/qwen3_5_27b/pre_attention_ops.json` are the first that execute.
+  Note that this op's *decode* rows still measure the op def's per-sequence Python
+  loop (`store_kv_cache.py:260`, and `rotary_embedding.py:152` has the same shape):
+  at batch 64 that is 2310 us and a reported 0.2 GB/s, so a cross-backend ratio taken
+  from those rows would mostly compare kernel-launch overhead.
+
 - `projects/micro_perf/vendor_ops/NEURON/ops/nkilib/`: a second NEURON
   `flash_attention` provider, `nkilib`, calling `nkilib.core.attention.attention_tkg`
   (token-generation attention) for the **decode** rows. The existing `torch`/SDPA
