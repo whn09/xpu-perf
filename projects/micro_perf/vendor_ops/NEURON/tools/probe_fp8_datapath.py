@@ -7,19 +7,23 @@ it was too broad: it is a property of the *eager* path, not of the hardware.
 
 Two independent things are going on, and this probe separates them.
 
-1. **Format.** There are two e4m3 encodings. `torch.float8_e4m3fn` is the
+1. **Format.** There are two e4m3 encodings. `torch.float8_e4m3fn` is the OCP
    finite-only one -- no infinities, one NaN pattern -- and it is what CUDA uses
-   and what `TORCH_DTYPE_MAPPING` gives `float8_e4m3`. Trainium1/2 implement the
-   *other* one, `f8e4m3`. The compiler says so by name rather than failing
-   obscurely:
+   and what `TORCH_DTYPE_MAPPING` gives `float8_e4m3`. Trainium1/2 multiply the
+   *other* one, legacy `f8e4m3`: `nki.isa.nc_matmul` takes `float8_e4m3` and
+   `float8_e5m2` on NeuronCore-v3 and adds `float8_e4m3fn` only "starting
+   NeuronCore-v4" (v3 is Trn2, v4 is Trn3), and the two cannot be mixed in one
+   matmul. The compiler says the same by name rather than failing obscurely:
 
        [NCC_EVRF051] Data type F8E4M3FN is not supported on TRN1/TRN2. Target
        TRN3 or later hardware, or use the --experimental-unsafe-fp8e4m3fn-as-fp8e4m3
        flag to cast F8E4M3FN to F8E4M3.
 
-   (That flag does not exist in neuronx-cc 2.27.2878.0 -- `compile --help` has no
-   fp8 options at all -- so on this stack e4m3fn has no route to the tensor
-   engines.) `torch.float8_e5m2` has no such split and is supported directly.
+   (That flag *casts* OCP into the legacy encoding rather than reaching an OCP
+   datapath -- hence `unsafe`, since inf/NaN and range differ -- and it does not
+   exist in neuronx-cc 2.27.2878.0 either: `compile --help` has no fp8 options at
+   all. So on this chip e4m3fn has no route to the tensor engines, and a newer SDK
+   is not expected to change that.) `torch.float8_e5m2` has no such split and is supported directly.
 
 2. **Eager vs compiled.** Eager has no fp8 gemm lowering for *either* format, so
    both fall onto the same software path at ~1 TFLOPS. Under
