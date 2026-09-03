@@ -204,10 +204,10 @@ fp8 rows are read straight out of it). The denominators are the per-core peaks
 from [MFU](#mfu) — 166.75 for bf16/fp16, 45.25 for fp32, 324.75 for fp8.
 
 **The two fp8 rows are in the table for completeness and should not be read as
-fp8 hardware numbers** — they are the eager path, in an `e4m3fn` that
-neuronx-cc 2.27 refuses to compile. Compiled, in `e5m2`, the same core does
-**245.50 TFLOPS at 75.6% of its fp8 peak**. See
-[fp8: the sweep measures the eager path, in a dtype this SDK will not compile](#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-sdk-will-not-compile).
+fp8 hardware numbers** — they are the eager path, in an `e4m3fn` that this
+chip's Tensor Engine cannot multiply (OCP fp8 matmul starts at NeuronCore-v4).
+Compiled, in `e5m2`, the same core does **245.50 TFLOPS at 75.6% of its fp8 peak**. See
+[fp8: the sweep measures the eager path, in a dtype this chip cannot multiply](#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply).
 
 **90% of the dense bf16 peak on one logical core is the headline number for this
 chip**, and it is 20 points above the 1024x4096x4096 row in the table above: that
@@ -253,7 +253,7 @@ not scale, where every other dtype of every other op sits between 1.000 and 1.02
 For fp8 that is consistent with it timing a software up-cast rather than the matmul
 engine — and the compiled path, which *does* reach the engines, scales cleanly
 instead: 1.018x worst case over four cores
-([details](#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-sdk-will-not-compile)). fp32 `reduce_sum`
+([details](#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply)). fp32 `reduce_sum`
 is a different thing: its *largest* shape scales perfectly (0.998, the 2,536 GB/s
 above), and it is the mid-sized shapes that contend — the same tail described next,
 reaching further up the size range for this one op than for any other.
@@ -911,7 +911,7 @@ The practical consequences:
   (the re-run above moved individual peaks by up to 20% with the median flat).
   Do not read a difference of 0.2 GB/s between two rows as real.
 
-### fp8: the sweep measures the eager path, in a dtype this SDK will not compile
+### fp8: the sweep measures the eager path, in a dtype this chip cannot multiply
 
 `workloads/basic/tensor_gemm_ops/gemm.json` has `float8_e4m3` and `float8_e5m2`
 cases, and this backend's `gemm` accepts them (the base `GemmOp` gates `dtype` to
@@ -1000,39 +1000,50 @@ numbers.
 Both of these have to be true at once. Fixing either one alone does nothing, which
 is why the eager table above is so uniformly flat across both formats.
 
-**1. `neuronx-cc` 2.27 rejects `torch.float8_e4m3fn`.** Note what that sentence
-does *not* say — an earlier version of this section said "`torch.float8_e4m3fn` is
-not a format Trainium2 has" and explained it as the hardware implementing one of the
-two e4m3 encodings and not the other. **That was an over-reading of the compiler
-error below, and AWS's own documentation contradicts it.** The corrected picture:
+**1. Trainium2's Tensor Engine cannot multiply `float8_e4m3fn`. That starts at
+Trainium3.** The authoritative statement is the `nc_matmul` contract, identical in
+the installed `nki` 0.6.0 docstring and in the [online
+reference](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.isa.nc_matmul.html):
 
-* **The hardware fp8 is configurable, not one fixed encoding.** [Data
-  Types](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-features/data-types.html)
-  gives NeuronCore v2 "8-bit Floating point with configurable range and precision
-  (cFP8)" and tabulates *three* splits — `FP8_e5m2`, `FP8_e4m3` and `FP8_e3m4` —
-  and says NeuronCore v3 (Trn2) "supports all of the data types available on
-  NeuronCore v2". So there is no "Trainium implements one e4m3" fact to appeal to.
-* **`e4m3` vs `e4m3fn` is a type-system distinction, not a multiplier one.**
-  `f8e4m3` has infinities and a conventional NaN set; `f8e4m3fn` is finite-only —
-  no infinities, one NaN pattern, one extra exponent value of range. The workaround
-  the error message itself suggests is named
-  `--experimental-unsafe-fp8e4m3fn-as-fp8e4m3`, i.e. a reinterpretation onto the
-  same engines, which is the opposite of a hardware gap.
-* **Current Neuron supports `e4m3fn` on Trn2.** In the 2.32 docs
-  `nl.float8_e4m3fn` is tagged "relevant for: Trn2, Trn3" alongside
-  `nl.float8_e4m3`, `nl.float8_e5m2`, `nl.float8_e8m0fnu` and the `_x4` MX
-  variants, and it is the **default** `dtype` of the [FP8 Quantize
-  kernel](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/library/api/fp8-quantize.html),
-  whose page is also tagged Trn2.
+> The input `stationary` and `moving` tiles can be one of these supported data
+> types: `float8_e4m3/float8_e5m2/bfloat16/float16/tfloat32/float32`. **Starting
+> NeuronCore-v4, `float8_e4m3fn` (OCP FP8) is also supported**; `float8_e4m3`
+> (legacy) and `float8_e4m3fn` cannot be mixed in the same matmul.
 
-What is left is a plain version fact, and it is what these measurements ran into:
-in the SDK they were taken with, `neuronxcc.nki.language` exposes only
-`float8_e4m3` and `float8_e5m2` — no `e4m3fn` — and the compiler refuses it by
-name. Verified on every image on these hosts: `xpu-perf-eager` and
-`xpu-perf-beta4` (both neuronx-cc 2.27.2878.0) and the older concourse image
-(2.25.1280.0). PyTorch's `torch.float8_e4m3fn` is what CUDA uses and what
-`TORCH_DTYPE_MAPPING` gives the workload's `float8_e4m3`, so this is the dtype the
-sweep asks for:
+Trn2 is NeuronCore-v3; Trn3 is v4. So the matmul datapath here takes **legacy
+`e4m3` and `e5m2`**, and OCP `e4m3fn` is a next-generation feature — which is
+exactly what the compiler error below says in its own words. The `double_row`
+performance mode repeats the split: v3 and v4 both restrict it to `float8_e4m3` or
+`float8_e5m2`, "plus `float8_e4m3fn` on NeuronCore-v4".
+
+Two things make this easy to get wrong, and both misled an earlier revision of this
+section into claiming Trn2 *does* support e4m3fn:
+
+* **The dtype symbol exists in our image.** `nki.language` (standalone `nki`
+  0.6.0, which the eager image ships *alongside* the older
+  `neuronxcc.nki.language`) exposes `float8_e4m3fn`, `float8_e4m3fn_x4`,
+  `float8_e5m2_x4`, `float8_e8m0fnu` and `float4_e2m1fn_x4`, where
+  `neuronxcc.nki.language` has only `float8_e4m3` and `float8_e5m2`. NKI is one
+  language across v2/v3/v4, so **a dtype being nameable says nothing about which
+  generation can multiply it** — `nc_matmul`'s contract is where that lives.
+* **The [FP8 Quantize
+  kernel](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/library/api/fp8-quantize.html)
+  defaults to `dtype=nl.float8_e4m3fn` and its page is tagged "relevant for: Trn2,
+  Trn3"** — and `nkilib.core.quantization` really is importable in this image with
+  that default. But quantization is a scale-and-clip cast, not a matmul, so a Trn2
+  tag there does not imply an e4m3fn matmul on Trn2.
+
+What *is* true about the wider fp8 family, and worth knowing separately: [Data
+Types](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-features/data-types.html)
+describes NeuronCore v2's fp8 as "8-bit Floating point with configurable range and
+precision (cFP8)" over *three* splits — `FP8_e5m2`, `FP8_e4m3` and `FP8_e3m4` —
+with v3 supporting all of v2's types. So Trainium's fp8 is configurable, and `e3m4`
+exists and is never exercised in this repo; the `e4m3` in that family is the legacy
+encoding, not the OCP one.
+
+PyTorch's `torch.float8_e4m3fn` is what CUDA uses and what `TORCH_DTYPE_MAPPING`
+gives the workload's `float8_e4m3`, so the OCP encoding is the one the sweep asks
+for, and the compiler refuses it by name:
 
 ```
 [NCC_EVRF051] Data type F8E4M3FN is not supported on TRN1/TRN2. Target TRN3 or
@@ -1040,17 +1051,20 @@ later hardware, or use the --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 flag to ca
 F8E4M3FN to F8E4M3.
 ```
 
-That flag does not exist in the `neuronx-cc` these numbers were taken with
-(2.27.2878.0 — `compile --help` has no fp8 options at all), so **on 2.27 the
-workload's `float8_e4m3` has no route to the tensor engines**. `float8_e5m2` has no
-such split and is supported directly, which is why the compiled measurement below
-is quoted in e5m2.
+Read that flag's name carefully — `...-fp8e4m3fn-as-fp8e4m3` **casts** the OCP
+encoding into the legacy one so the v3 engine can multiply it, and it is labelled
+`unsafe` because the two differ in infinities, NaN set and range. It is a numerics
+compromise, not a hidden native path. It also does not exist in the `neuronx-cc`
+these numbers were taken with (2.27.2878.0 — `compile --help` has no fp8 options at
+all), so **the workload's `float8_e4m3` has no route to the tensor engines here by
+any means**. `float8_e5m2` has no such split and is supported on v3 directly, which
+is why the compiled measurement below is quoted in e5m2.
 
-**This is the one claim here that a newer SDK is expected to change.** No image on
-these hosts is newer than 2.27, so whether 2.32 compiles an `e4m3fn` gemm from
-PyTorch — and at what fraction of peak — is **not measured**, only documented as
-supported. If it does, the cross-backend asymmetry noted at the end of this section
-goes away, because e4m3fn is exactly what the H100 number uses.
+**A newer SDK is not expected to change this**, unlike most version-scoped claims in
+this document: the 2.32 `nc_matmul` reference states the v4 boundary in the same
+words as the 0.6.0 docstring shipped here. What a newer SDK could add is the
+`--experimental-unsafe-...` cast route, which would give an e4m3fn *interface* on
+top of legacy-e4m3 arithmetic rather than an e4m3fn datapath.
 
 **2. The eager path has no fp8 gemm lowering for either format.** This is the part
 the cast measurement above was actually detecting, and it applies to e5m2 as much
@@ -1086,14 +1100,15 @@ compiler rejects `bf16[?,?]` outright; and the failing e4m3fn compile has to run
 **What is *not* claimed here.** The workload files are unchanged and the published
 rows are still eager, so the table above stands as what `gemm.json` measures.
 Getting the better number into the sweep needs `float8_e5m2` cases run through a
-compiled provider, which is a different provider rather than a flag. And on **this
-SDK** the two sides' fp8 numbers are in different encodings: the H100's is e4m3fn,
-2.27 will not compile e4m3fn at all, and Trainium2's has to be quoted in e5m2 —
-which `torch._scaled_mm` in turn rejects on CUDA
-([details](../GPU/README.md#gemm)). So *as measured here* the two chips have no fp8
-format in common that both stacks will multiply. Do not carry that forward as a
-property of the chips: AWS documents e4m3fn on Trn2 in 2.32, and on an SDK where it
-compiles, e4m3-vs-e4m3fn stops being a difference between the two sides.
+compiled provider, which is a different provider rather than a flag. And the two
+sides' fp8 numbers are necessarily in different encodings: the H100's is e4m3fn,
+Trainium2's Tensor Engine does not take e4m3fn at all, and Trainium2's has to be
+quoted in e5m2 — which `torch._scaled_mm` in turn rejects on CUDA
+([details](../GPU/README.md#gemm)). **So the two chips have no fp8 format in common
+that both stacks will multiply, and this is a generation fact rather than an SDK
+one** — it would take a Trainium3 (NeuronCore-v4) on the Neuron side, or an `e5m2 x
+e5m2` path on the CUDA side, to make the fp8 row like-for-like. Worth knowing before
+planning a mixed fleet.
 
 One accuracy point that no TFLOPS figure shows: e5m2 has **2 mantissa bits** where
 e4m3fn has 3. Real fp8 inference generally wants e4m3 for weights, so 982 TFLOPS
@@ -1329,7 +1344,7 @@ implementation through the `base` provider:
 
 | Op | Provider | Runtime | Why |
 |---|---|---|---|
-| `gemm` | `torch` | both | rejects `tfloat32` (an NVIDIA format) and `int8` (not lowered through `torch.matmul`); accepts `float8_e4m3` / `float8_e5m2`, which the base op def gates out — see [fp8 is measured on the eager path, in a dtype this SDK will not compile](#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-sdk-will-not-compile) |
+| `gemm` | `torch` | both | rejects `tfloat32` (an NVIDIA format) and `int8` (not lowered through `torch.matmul`); accepts `float8_e4m3` / `float8_e5m2`, which the base op def gates out — see [fp8 is measured on the eager path, in a dtype this chip cannot multiply](#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply) |
 | `all_gather` | `torch` | both | base uses `dist.all_gather_into_tensor`, unimplemented on the `xla` backend; the `neuron` backend implements it, so eager reproduces the base behaviour |
 | `flash_attention` | `nki` / `torch` | `xla` / `eager` | no base implementation exists; NKI `flash_fwd` on XLA, `scaled_dot_product_attention` on eager |
 
@@ -1363,10 +1378,10 @@ value per unit of work:
    belongs in real model code, not here — but it is the single largest measured
    speedup available on this stack, and it is free.
 4. **An fp8 `gemm` provider that compiles, for fp8 — and `float8_e5m2` cases to
-   point it at.** The published 99x is the eager path in an `e4m3fn` that
-   neuronx-cc 2.27 refuses to compile; compiled `e5m2` reaches 75.6% of the fp8 peak
-   and closes the per-chip gap to 1.56x
-   ([details](#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-sdk-will-not-compile)).
+   point it at.** The published 99x is the eager path in an `e4m3fn` this chip
+   cannot multiply; compiled `e5m2` reaches 75.6% of the fp8 peak and closes the
+   per-chip gap to 1.56x
+   ([details](#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply)).
    The work is a provider that wraps the matmul in
    `torch.compile(..., dynamic=False)`, not a new kernel. `matmul_mxfp8` from
    `nkilib.experimental` is the further step and still needs the op def extended to

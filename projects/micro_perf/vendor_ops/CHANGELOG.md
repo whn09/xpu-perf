@@ -332,33 +332,42 @@ This changelog follows a Keep a Changelog style and semantic versioning.
 
 ### Fixed
 
-- `NEURON/README.md`, `GPU/README.md`: **corrected the explanation of the fp8 row.**
-  Both files said the ~99x was partly because "Trainium1 and Trainium2 implement
-  `f8e4m3`" and not `f8e4m3fn`, i.e. a hardware encoding gap. That was inferred from
-  one compiler error and AWS's documentation contradicts it. [Data
-  Types](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-features/data-types.html)
-  gives NeuronCore v2 "8-bit Floating point with configurable range and precision
-  (cFP8)" over *three* splits — `FP8_e5m2`, `FP8_e4m3`, `FP8_e3m4` — and NeuronCore
-  v3 (Trn2) "supports all of the data types available on NeuronCore v2"; the e4m3 /
-  e4m3fn difference is inf/NaN and range semantics in the type system, which is why
-  the workaround the error itself names is `--experimental-unsafe-fp8e4m3fn-as-fp8e4m3`,
-  a reinterpretation onto the same engines. And in the current SDK
-  `nl.float8_e4m3fn` is tagged "relevant for: Trn2, Trn3" and is the default dtype
-  of the [FP8 Quantize kernel](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/library/api/fp8-quantize.html).
-  What survives is a version fact, now stated as one: on the SDK these numbers were
-  taken with, `neuronxcc.nki.language` exposes only `float8_e4m3` and `float8_e5m2`
-  and the compiler refuses `F8E4M3FN` by name — verified on all three images on
-  these hosts (neuronx-cc 2.27.2878.0 twice, 2.25.1280.0 once), none newer than
-  2.27, so the 2.32 behaviour is documented but **unmeasured**. The measurements are
-  unchanged and so is the conclusion (99x is the eager path; compiled e5m2 gives
-  245.50 TFLOPS per core, 982 per chip, a 1.56x per-chip gap), because that rests on
-  the *eager lowering* cause rather than on the encoding one. Two downstream claims
-  were also scoped: "the two chips share no fp8 format both stacks will multiply" is
-  true as measured on 2.27, not a property of the chips; and the section heading
-  "the wrong e4m3 encoding" became "in a dtype this SDK will not compile". Added the
-  accuracy caveat the TFLOPS figures hide — e5m2 has 2 mantissa bits to e4m3fn's 3,
-  so 982 TFLOPS/chip is the throughput of the format 2.27 offers, not necessarily of
-  a shippable configuration.
+- `NEURON/README.md`, `GPU/README.md`: **sourced the fp8 encoding claim properly.**
+  Both files said the ~99x was partly because Trainium2 implements `f8e4m3` and not
+  `f8e4m3fn`, which was inferred from one compiler error alone. It is now sourced to
+  the ISA contract, which says the same thing with the boundary made explicit —
+  [`nki.isa.nc_matmul`](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.isa.nc_matmul.html)
+  takes `float8_e4m3` (legacy) and `float8_e5m2`, and "starting NeuronCore-v4,
+  `float8_e4m3fn` (OCP FP8) is also supported", the two "cannot be mixed in the same
+  matmul". NeuronCore-v3 is Trn2 and v4 is Trn3, so **the gap is generational, not a
+  version one**, and `--experimental-unsafe-fp8e4m3fn-as-fp8e4m3` is a lossy cast into
+  the legacy encoding rather than a hidden OCP datapath — evidence for the boundary,
+  not against it. A newer SDK is not expected to change this: the 2.32 reference
+  states the v4 boundary in the same words as the docstring in the image these
+  numbers were taken on. Two things that mislead here are documented so the next
+  reader does not repeat them: a *nameable* dtype proves nothing, since NKI is one
+  language across v2/v3/v4 and the standalone `nki` 0.6.0 in this image exposes
+  `float8_e4m3fn` while the compiler-bundled `neuronxcc.nki.language` does not; and
+  the [FP8 Quantize kernel](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/library/api/fp8-quantize.html)
+  defaults to `float8_e4m3fn` on a Trn2-tagged page because quantisation is a
+  scale-and-clip *cast*, not a matmul. Two genuine additions from re-reading [Data
+  Types](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-features/data-types.html):
+  Trainium's fp8 is *configurable* (cFP8) over three splits — `FP8_e5m2`,
+  `FP8_e4m3`, `FP8_e3m4` — and `e3m4` is never exercised in this repo, a real gap;
+  and "hardware implements one or the other" was too crude, since v4 does both and
+  still cannot mix them. Measurements and conclusion are unchanged (99x is the eager
+  path; compiled e5m2 gives 245.50 TFLOPS per core, 982 per chip, a 1.56x per-chip
+  gap), because that rests on the eager-lowering cause rather than on the encoding.
+  Added the accuracy caveat the TFLOPS figures hide — e5m2 has 2 mantissa bits to
+  e4m3fn's 3, so 982 TFLOPS/chip is the throughput of the format this chip offers,
+  not necessarily of a shippable configuration.
+- `NEURON/ops/nki/__init__.py`: the provider banner reported `neuronx-cc` only,
+  which names the *compiler-bundled* `neuronxcc.nki` — but the kernel this provider
+  actually runs is `nkilib.core.attention.attention_cte`, built on the **standalone
+  `nki`** package. It now reports whichever of `nki` and `neuronx-cc` is installed,
+  so a sweep log says which NKI the numbers came from (beta4 image: `nki`
+  0.6.0+30289107548.gd2d9cc57 alongside neuronx-cc 2.27.2878.0). `nkilib` itself
+  ships without dist-info and cannot be reported.
 - `GPU/README.md`: the `Reproduce one row at a time` table called its 2,496 s total
   "device time". It is wall clock, and the probe above measures device execution at
   about 13% of a case on this backend (52.6% goes to `create_tensors`, 33.6% to the
