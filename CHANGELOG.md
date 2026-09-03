@@ -25,19 +25,73 @@ This changelog follows semantic versioning and Keep a Changelog style.
   `store_kv_cache`. Three of those are exactly where the working vllm-neuron port had
   to hand-roll a workaround.
 
-  Measured on one H100 80GB HBM3 (Trainium2 pending, so this is not yet a
-  comparison): 348 of 384 cases in 4 min 45 s. **`head_dim 256` costs the H100
-  nothing** — 701.9 TFLOPS / 70.9% MFU on prefill at `q_len` 10240, and decode is
-  bandwidth-bound at 2698 GB/s (92% of achievable), which sharpens the question for
-  Trainium2 rather than softening it. GEMM peaks at 81.9% MFU and the non-power-of-two
-  17408 costs nothing, but the tiny-N GDN projections (`N` 96 and 24) run at 1-21% of
-  peak and the 128×128 delta-rule scan tile reaches only 13.5% MFU — the concrete form
-  of the claim that the GDN path is utilisation-bound, not FLOP-bound. Partial rotary
-  is worth 2.8-3.6x in prefill. `swiglu` peaks at 1041 GB/s against `silu`'s 2952 on
-  the same card, and `topk` over the vocabulary costs 90-300 us almost independently
-  of `k`.
+  Measured on one H100 80GB HBM3: 348 of 384 cases in 4 min 45 s. **`head_dim 256`
+  costs the H100 nothing** — 701.9 TFLOPS / 70.9% MFU on prefill at `q_len` 10240, and
+  decode is bandwidth-bound at 2698 GB/s (92% of achievable). GEMM peaks at 81.9% MFU
+  and the non-power-of-two 17408 costs nothing, but the tiny-N GDN projections (`N` 96
+  and 24) run at 1-21% of peak and the 128×128 delta-rule scan tile reaches only 13.5%
+  MFU — the concrete form of the claim that the GDN path is utilisation-bound, not
+  FLOP-bound. Partial rotary is worth 2.8-3.6x in prefill. `swiglu` peaks at 1041 GB/s
+  against `silu`'s 2952 on the same card, and `topk` over the vocabulary costs
+  90-300 us almost independently of `k`.
+
+  Measured on one Trn2 chip (`trn2.3xlarge`, PyTorch-native Beta 4, eager), all 384
+  overlapping cases plus 6 Trainium-only `all_reduce`, in 41 min. Ratios are per
+  **logical core**, of which a chip has four (the harness's own `peak_tflops` is
+  166.75, one quarter of 667), so ~4-6x raw is per-chip parity against the two chips'
+  989.4/667 = 1.48x bf16 peak ratio. **The parity claim holds for the arithmetic and
+  fails for this model**, for reasons that are all kernel coverage rather than silicon:
+
+  - **Dense GEMM confirms parity, in Trainium2's favour**: 152.7 TFLOPS on one logical
+    core is **91.6% MFU**, better than the H100's 81.9%. Median 4.42x raw ≈ 1.1x per
+    chip. The fp32 128×128 scan tile is ~1.9x *faster* per chip, which is the dtype
+    `mamba_ssm_dtype: float32` puts 48 of 64 layers' scan in. Exception: `lm_head`
+    (5120→248320) degrades as tokens rise, 147 → 94 → 71 TFLOPS at 1024 → 4096 →
+    10240, where the H100 holds ~750 — 2.56x per chip at the top. Tiny-N is a
+    non-issue: Trn2 is absolutely *faster* at ≤1024 tokens.
+  - **`head_dim 256` reaches no fused attention path at all**: `nkilib`'s
+    `attention_tkg` rejects decode (`P_MAX = 128` partitions) *and* prefill
+    (token-generation only), and torch_neuronx's SDPA rewrite gate also needs
+    `D <= 128`, so the union is empty and the fallback materialises the score matrix.
+    Prefill 24/4/256 is **37.6x at `q_len` 4096 and 153.9x at 10240**, with throughput
+    *falling* 15.0 → 4.6 TFLOPS as the H100's rises 566 → 702 — superquadratic, so the
+    gap grows with context and cannot be extrapolated from a short measurement. The
+    vision tower's head_dim 72 sits in the normal 4.0-9.6x band precisely because it is
+    under the limit.
+  - **`gelu` is 12-15x below its own chip's roofline**: flat at **31-42 GB/s at every
+    size**, 52x median / 61.7x max. The control is `silu`, same chip, same dtype, same
+    `base` provider, at **475-489 GB/s** — ~1.9 TB/s per chip against the H100's 2.9,
+    exactly the expected 1.45x. Confined to the vision tower's `gelu_pytorch_tanh`.
+  - **`topk` has a cliff above `k = 8`**: 557 us at k=1 and k=8, **5312 us at k=50**,
+    at every vocabulary size and batch, while the H100 is flat in `k`. At k ≤ 8
+    Trainium2 is at or ahead of parity per chip; k=50 is what production sampling uses.
+  - **`rms_norm`'s 13.8-14.4x at 10240 tokens is mostly a provider mismatch** — the
+    H100 runs `flashinfer`/`vllm` fused kernels, Neuron runs `base` — but its 190.9
+    GB/s is still 2.5x under `silu` on the same chip. `add_rms_norm`, `qk_rms_norm` and
+    `head_rms_norm` run `base` on both sides and land at 1.6-3.7x raw, i.e. Trainium2
+    ahead per chip, which is the cleaner comparison.
+  - **Partial rotary buys Trainium2 1.2-1.4x where it buys the H100 3.6x**, so
+    `partial_rotary_factor: 0.25` is close to being ignored.
+  - **`all_reduce` at TP=4 is 4.1x over the decode budget**: the 160 KiB message the
+    step sends 128 times measures 118.1 us against the 28.5 us needed to stay under 10%
+    of a 36.5 ms step — 15.1 ms, or 41% of the step, in collectives. Latency is flat at
+    105-118 us from 10 KiB to 640 KiB, so this is fixed overhead, not bandwidth
+    (which reaches a respectable 106.6 GB/s at 100 MB).
+
+  `store_kv_cache` and `rotary_embedding` **decode** rows are excluded from all of the
+  above: they measure the op defs' per-sequence Python loop on both backends, and their
+  224 ms / 2.3 ms ratio is launch overhead, not a chip result.
 
 ### Fixed
+
+- `projects/micro_perf/vendor_ops/NEURON/ops/nkilib/flash_attention.py`: the prefill
+  rejection message told the reader that prefill "is measured by the `torch` provider,
+  which reaches a fused NKI kernel there (`attention_cte`)" without qualification. That
+  is only true for `head_dim <= 128` — torch_neuronx's SDPA rewrite gate has the same
+  128 limit `attention_tkg` does — so at `head_dim 256` the message was promising
+  coverage that does not exist, which is exactly the case where someone reads it.
+  Now states the head_dim condition and cites the measured consequence (prefill falls
+  to 4.6 TFLOPS and gets *worse* with sequence length).
 
 - `projects/micro_perf/op_defs/llm_ops/store_kv_cache.py`: the linear-cache branch
   could never run. It copied a `[q_len, kv_head_num * head_dim]` slice onto a

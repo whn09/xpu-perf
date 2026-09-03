@@ -172,10 +172,17 @@ try:
             super().vendor_parser()
 
             if self.attn_mode != "decode":
+                # The `torch` provider reaches attention_cte for prefill only when
+                # torch_neuronx's SDPA rewrite gate fires, and that gate also needs
+                # head_dim <= 128. Above it there is no fused prefill path on this
+                # backend at all -- measured at head_dim 256, prefill falls to
+                # 4.6 TFLOPS and gets *worse* with sequence length -- so do not read
+                # this message as a promise that prefill is covered.
                 raise ValueError(
                     "attention_tkg is the token-generation kernel; prefill is "
-                    "measured by the `torch` provider, which does reach a fused "
-                    "NKI kernel there (attention_cte)."
+                    "measured by the `torch` provider, which reaches a fused NKI "
+                    f"kernel there (attention_cte) only for head_dim <= {P_MAX}; "
+                    f"this case has head_dim {self.head_dim}."
                 )
 
             if self.cache_type != "linear":

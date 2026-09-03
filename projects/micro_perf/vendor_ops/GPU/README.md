@@ -68,6 +68,20 @@ weaker and more useful one: **nothing in the far group is explained by peak FLOP
 or peak bandwidth**, and every row in it has a named cause — an int64 index, an
 absent kernel, an unfused helper, a dtype the Tensor Engine cannot take.
 
+**Do not read the attention rows as model-independent.** Every row above is measured
+at `head_dim 128`, and that is the value both of Trainium2's fused paths are gated on:
+`nkilib` puts head_dim on 128 partitions (`P_MAX`), and torch_neuronx's SDPA rewrite
+gate requires `D <= 128` as well. A model whose head_dim exceeds 128 misses *both*, and
+there is no third path. Measured on `workloads/models/qwen3_5_27b/` (head_dim **256**),
+prefill is **37.6x** at `q_len` 4096 and **153.9x** at 10240 — against the 3.1x this
+table reports — with Neuron's throughput *falling* 15.0 → 4.6 TFLOPS as the H100's
+rises, so the gap grows with context rather than converging. The 3.1x row is a
+statement about `attention_cte` at a head_dim it accepts, not about attention in
+general. That directory's [README](../../workloads/models/qwen3_5_27b/README.md) carries
+the per-model comparison, including a `gelu` result (13-15x per chip at the vision
+tower's shapes) that is the same lowering gap this table's `gelu` row names, measured
+larger at larger shapes.
+
 On bf16 gemm it delivers 90% of its own peak against the H100's 82% and lands
 within 1.35x per chip — [and the four-core run confirms that x4 is
 real](#how-to-compare-these-to-the-trainium2-numbers). On attention **prefill** it

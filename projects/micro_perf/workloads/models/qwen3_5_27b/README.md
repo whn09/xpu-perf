@@ -35,7 +35,7 @@ attention+MLP blocks. Qwen3.5-27B is not that:
 | `hidden_size` | 5120 | every `hidden_size` and every GEMM K below |
 | `intermediate_size` | 17408 | not a power of two; `gemm.json`'s `K.N` pairs never touch it |
 | `num_attention_heads` / `num_key_value_heads` | 24 / 4 | GQA 6:1; TP=4 is the maximum clean TP |
-| `head_dim` | **256** | above the Neuron flash-attention kernels' `MAX_HEAD_DIM` of 128; the H100's SDPA path takes it (measured below) |
+| `head_dim` | **256** | above every Neuron flash kernel's 128-partition limit, so no fused attention path exists there (measured: up to 154x); the H100's SDPA takes it for free |
 | `attn_output_gate` | true | q projection is 2x wide: 24×256×2 = 12288, not 6144 |
 | `partial_rotary_factor` | 0.25 | rotary covers 64 of the 256 dims — `rope_dim: 64` |
 | `vocab_size`, `tie_word_embeddings` | 248320, false | a 2.54 GB embedding *and* a separate 2.54 GB lm_head |
@@ -114,13 +114,13 @@ kept in on-chip memory, so its standalone cost is a floor on what the fallback p
 
 Two caveats to read the output with:
 
-* **`head_dim: 256` is the point of these cases, and whether it falls off the fast path
-  is backend-specific.** On the H100 it does not — 82% of the peak a power-of-two
-  head_dim reaches (see the measured section). On Trainium2 the kernels cap head_dim at
-  128 (`MAX_HEAD_DIM`) and torch_neuronx's NKI SDPA rewrite gate also requires
-  `D <= 128`, so the 16 attention layers are expected to fall back to torch there. If
-  that holds, the published attention comparison (prefill 3.1x, decode 1.9-3.2x) does
-  not describe these layers and the real gap is wider, not narrower.
+* **`head_dim: 256` is the point of these cases, and it is where the two backends
+  diverge most.** On the H100 it costs nothing — 82% of the peak a power-of-two head_dim
+  reaches. On Trainium2 it misses *every* fused path (`nkilib`'s `P_MAX = 128` and
+  torch_neuronx's SDPA rewrite gate both cap at 128), and the measured result is 37.6x
+  at `q_len` 4096 rising to 153.9x at 10240. The published attention comparison
+  (prefill 3.1x, decode 1.9-3.2x) therefore does **not** describe these 16 layers. See
+  the Trainium2 section.
 * **`is_causal=True` is hardcoded** in `op_defs/llm_ops/flash_attention.py`, and
   vision attention is not causal. The vision rows are therefore an upper bound on a
   cheaper op, not a faithful measurement. Fixing that needs an op-def change.
@@ -189,8 +189,8 @@ the output against. Needs 4 devices; it does nothing on a one-GPU box.
 ## Measured: H100 80GB HBM3, 2026-09-03
 
 348 of 384 cases ran, in 4 min 45 s for all seven single-device files. The 36 that did
-not are accounted for at the end of this section. Trainium2 numbers are not here yet —
-the machine was busy — so nothing below is a comparison, only the GPU column.
+not are accounted for at the end of this section. The Trainium2 column, and the
+comparison, are in the section after this one.
 
 **`head_dim: 256` is not a problem on the H100.** This was the open question, and the
 answer is that the torch SDPA provider takes it and reaches 82% of the peak a
@@ -283,6 +283,231 @@ kernel-launch overhead.
 * 2 `flash_attention` MTP cases (`q_len: 4`) rejected with "SDPA attention decode only
   supports q_len == 1; a multi-token decode step needs a bottom-right aligned causal
   mask." That is the predicted result and the file keeps them deliberately.
+
+## Measured: Trainium2 vs H100, 2026-09-03
+
+`trn2.3xlarge` (one Trn2 chip, PyTorch-native Beta 4, eager runtime) against the H100
+above. 384 cases overlap; the 6 `all_reduce` cases are Trainium-only, since the GPU box
+has one card. All eight files finished in 41 min (attention 393 s, gemm 967 s,
+pre_attention 456 s, norm 294 s, activation 164 s, deltanet 106 s, ccl 41 s).
+
+### How to read a ratio here
+
+The harness runs one **logical core**, and a Trn2 chip has four. Its own
+`peak_tflops` field says so: 166.75 TFLOPS per logical core, one quarter of the chip's
+667. The same division applies to bandwidth. So a raw Trn2/H100 latency ratio has to be
+divided by 4 before it can be compared against the 989.4/667 = **1.48x** ratio of the
+two chips' bf16 peaks:
+
+| raw per-core ratio | per-chip meaning |
+| --- | --- |
+| ~4-6x | parity — this is the expected band, not a finding |
+| ~1.5-4x | Trainium2 is **ahead** per chip |
+| >8x | a real gap; something is off the fast path |
+
+Every number below is per-core-raw with the per-chip reading given alongside. The band
+is what makes the outliers legible: most of this model is in it, and the three things
+that are not are the whole result.
+
+### Verdict per op
+
+| op | raw ratio (median) | per chip | reading |
+| --- | --- | --- | --- |
+| `gemm`, dense bf16 | 4.42x | ~1.1x | **parity**, Trn2 slightly ahead |
+| `head_rms_norm` | 1.63x | 0.41x | Trn2 ahead |
+| `rms_norm` (small) / `qk_rms_norm` | 2.2x | 0.56x | Trn2 ahead — but see the caveat |
+| `reduce_sum`, `embedding`, `cast` | 2.4-3.2x | 0.6-0.8x | Trn2 ahead |
+| `swiglu`, `add_rms_norm` | 3.3-3.7x | ~0.9x | parity |
+| `silu`, `mul`, `exp` | 4.7-6.1x | 1.2-1.5x | parity, at the bandwidth ratio |
+| `topk`, `k <= 8` | 3.1-6.2x | 0.8-1.6x | parity |
+| `softmax` (vocab) | 6.7x | 1.7x | slightly behind |
+| `flash_attention`, `head_dim 256` | **9.7x median, 154x max** | up to **38x** | **broken** |
+| `gelu` | **52x median, 61.7x max** | **13-15x** | **broken** |
+| `topk`, `k = 50` | **28-57x** | **7-14x** | **cliff above k=8** |
+
+`store_kv_cache` and `rotary_embedding` decode rows are excluded from that table; they
+measure the op defs' per-sequence Python loop on both backends (`store_kv_cache` at
+B=64 is 224 ms on Trn2 against 2.3 ms on the H100, which is a launch-overhead ratio,
+not a chip result). Their prefill rows are kept and discussed below.
+
+### GEMM is not the problem — Trainium2 wins it on MFU
+
+Trn2 reaches **152.7 TFLOPS on one logical core, 91.6% MFU** against its 166.75 peak.
+The H100's best on the same file is 810.6 TFLOPS, **81.9% MFU**. On the arithmetic the
+model is actually built out of, this chip is the more efficient of the two, and the
+non-power-of-two `17408` costs it nothing. Two shapes fall off:
+
+| K → N | tokens | Trn2 TFLOPS | H100 TFLOPS | raw | per chip |
+| --- | --- | --- | --- | --- | --- |
+| 5120 → 17408 (MLP gate/up) | 10240 | 148.9 | 781.0 | 5.25x | 1.31x |
+| 17408 → 5120 (MLP down) | 10240 | 152.7 | 810.6 | 5.31x | 1.33x |
+| **5120 → 248320 (lm_head)** | 1024 | 147.0 | 664.5 | 4.52x | 1.13x |
+| **5120 → 248320 (lm_head)** | 4096 | 94.2 | 755.9 | 8.03x | 2.01x |
+| **5120 → 248320 (lm_head)** | 10240 | 71.0 | 726.7 | 10.3x | **2.56x** |
+| 128 → 128 bf16 (scan tile) | 262144 | 31.8 | 133.1 | 4.19x | 1.05x |
+| 128 → 128 **fp32** (scan tile) | 262144 | 15.8 | 33.2 | 2.10x | **0.53x** |
+
+The lm_head **degrades as tokens rise** — 147 → 94 → 71 TFLOPS where the H100 holds
+~750 — so a large-batch prefill pays 2.6x per chip on the single biggest GEMM in the
+model. N=248320 at TP=1 is a 2.54 GB weight against 24 GB of usable HBM per core; the
+shape is legal but clearly not tiled for. At TP=4 (N=62080) it behaves.
+
+The fp32 128×128 scan tile is the good news the other way: **Trainium2 is ~1.9x faster
+per chip**, and `mamba_ssm_dtype: float32` means that is the dtype 48 of the 64 layers
+actually run their scan in.
+
+Tiny-N is a non-issue: at ≤1024 tokens `5120 → 96` and `5120 → 24` are 0.75-0.8x raw,
+i.e. Trn2 is **absolutely faster**, and only reach 4-5x at 10240 tokens.
+
+### `head_dim: 256` has no fused attention path on Neuron at all
+
+This is the finding that overturns the parity expectation for this specific model.
+
+| shape | Trn2 | H100 | raw ratio |
+| --- | --- | --- | --- |
+| prefill 24/4/256, q_len 4096 | 13.7 ms, 15.0 TFLOPS | 364 us, 566.2 | **37.6x** |
+| prefill 24/4/256, q_len 10240 | 282.6 ms, 4.6 TFLOPS | 1836 us, 701.9 | **153.9x** |
+| prefill 6/1/256 (TP=4), q_len 4096 | — | — | 21.9x |
+| prefill 6/1/256 (TP=4), q_len 10240 | — | — | 125.3x |
+| decode 24/4/256, various | — | — | 4.6-10.4x |
+| vision prefill 16/16/72 | — | — | 4.0-9.6x |
+
+Two things make this qualitatively different from a slow kernel. Neuron's throughput
+**falls** with sequence length, 15.0 → 4.6 TFLOPS, while the H100's rises 566 → 702:
+cost is growing faster than the O(n²) the algorithm implies, which is the signature of
+a materialised score matrix rather than a tiled one. And the ratio therefore *grows*
+with context — 37.6x at 4096, 153.9x at 10240 — so it cannot be extrapolated from a
+short-sequence measurement.
+
+The provider log says why, from three directions at once:
+
+* `nkilib`'s `attention_tkg` rejects every decode case — "head_dim 256 exceeds the 128
+  partitions the kernel puts it on" (`P_MAX = 128`);
+* `attention_tkg` is token-generation only, so it rejects all prefill by design;
+* `torch_neuronx`'s NKI SDPA rewrite gate (`_can_use_nki_flash_attention`) also
+  requires `D <= 128`, so the `torch` provider's fallback is an unfused score matrix.
+
+The union of those three conditions is empty for this model. `attention_tkg` — the
+kernel that *wins* the published decode row by 4.09x — is unreachable at head_dim 256,
+and the vision tower's head_dim 72 lands in the normal 4-9.6x band precisely because it
+is under the limit. The H100's SDPA takes 256 with no penalty (82% of the peak a
+power-of-two head_dim reaches), so the entire gap is on the Neuron side, and it is a
+kernel-coverage gap rather than a silicon one.
+
+Consequence for the model: these are 16 of 64 layers and ~1.68B of 27.31B params, but
+at 10240-token prefill they would dominate total time outright.
+
+### `gelu` is pinned at ~40 GB/s — a software fault, not bandwidth
+
+| shape | Trn2 | H100 | raw |
+| --- | --- | --- | --- |
+| 16384 × 4304 | 6698.9 us, **42.1 GB/s** | 108.5 us, 2599.6 GB/s | 61.7x |
+| 4096 × 4304 | 1660.8 us, **42.5 GB/s** | 32.0 us, 2206.3 GB/s | 52.0x |
+| 16384 × 1076 | 1826.9 us, **38.6 GB/s** | 31.9 us, 2208.9 GB/s | 57.2x |
+
+Trn2's `gelu` is flat at **31-42 GB/s across every size** — it does not scale at all.
+The control is `silu` on the same chip, same dtype, comparable shapes, also the `base`
+provider: **475-489 GB/s**, which is ~1.9 TB/s per chip against the H100's 2.9 and
+lands exactly on the expected 1.45x chip ratio. So the elementwise roofline is healthy
+and `gelu` specifically is **12-15x below it**. Nothing about the hardware explains a
+12x spread between two activations that read and write the same bytes; this is a
+missing or scalar-decomposed `erf`/`tanh` path.
+
+It is confined to the 27-layer vision tower (`gelu_pytorch_tanh` at intermediate 4304),
+so it does not touch text-only decode — but it makes the vision encoder the second
+thing to fix, and it is likely the cheapest of the three to fix.
+
+### `topk` falls off a cliff above `k = 8`
+
+| dim | B | k=1 | k=8 | k=50 |
+| --- | --- | --- | --- | --- |
+| 248320 | 1 | 557.0 us | 558.3 us | **5312.1 us** |
+| 248320 | 64 | 621.3 us | 593.9 us | **5367.9 us** |
+| 62080 | 1 | 164.9 us | 165.1 us | **1368.2 us** |
+| 62080 | 64 | 191.3 us | 169.7 us | **1361.0 us** |
+
+A 9.5x step between k=8 and k=50, at every vocabulary size and batch, while the H100 is
+**flat in k** (90-193 us throughout, as the GPU section already noted). At k ≤ 8 Trn2
+is 1.4-6.2x raw, i.e. at or ahead of parity per chip; at k=50 it is 28-57x. There is
+evidently a small-k path and a general sort above it. Typical top-k sampling uses
+k=50, so production sampling hits the slow side: 5.3 ms per decode step at TP=1, still
+1.4 ms at TP=4, against a ~36.5 ms step budget.
+
+### `rms_norm`'s 14x is mostly a provider mismatch, but not entirely
+
+At 10240 tokens `rms_norm` is 13.8x (bf16) and 14.4x (fp32) raw — far outside the band.
+Provider labels explain most of it: the H100 runs **`flashinfer`/`vllm`** fused kernels
+at 2638-2780 GB/s, Trn2 runs **`base`** torch. That is not an apples-to-apples
+comparison of silicon, and the honest statement is that Neuron has no fused RMSNorm
+provider registered in this harness.
+
+The residue is still real, though: Trn2's `base` rms_norm gets 190.9 GB/s at 10240
+tokens and 297-331 GB/s at 4096 — **declining with size, and 2.5x under `silu`'s
+475 GB/s on the same chip**. So even against its own elementwise roofline there is
+about 2.5x available here. `add_rms_norm`, `qk_rms_norm` and `head_rms_norm` run `base`
+on *both* sides and sit at 1.6-3.7x raw, i.e. Trainium2 ahead per chip — which is the
+cleaner comparison and the reason to read the 14x as software, not hardware.
+
+### Partial rotary saves the H100 3.6x and Trainium2 almost nothing
+
+`rope_dim: 64` against the `rope_dim: 256` control, prefill only (B=1, so no loop
+artifact):
+
+| shape | Trn2 rope64 | Trn2 rope256 | Trn2 saving | H100 saving |
+| --- | --- | --- | --- | --- |
+| 24 heads, 10240 tokens | 4876.0 us | 5905.6 us | **1.21x** | **3.57x** |
+| 24 heads, 4096 tokens | 2177.4 us | 2554.7 us | 1.17x | ~2.8x |
+| 6 heads, 10240 tokens | 1315.7 us | 1810.4 us | 1.38x | — |
+
+`partial_rotary_factor: 0.25` should make this nearly 4x cheaper. The H100 collects
+most of that; Neuron collects 1.2-1.4x, so it is doing close to the full-width rotation
+either way. Worth ~3.5 ms per 10240-token prefill at TP=1 — small next to attention,
+but it is the same class of problem and cheap to check.
+
+### `all_reduce` at TP=4 is 4.1x over the decode budget
+
+Trainium-only, `world_size: 4`, `hidden_size: 5120`:
+
+| tokens | bytes | latency | bus_bw |
+| --- | --- | --- | --- |
+| 1 | 10 KiB | 105.1 us | — |
+| 16 | 160 KiB | **118.1 us** | — |
+| 64 | 640 KiB | 113.7 us | — |
+| 1024 | 10 MB | 199.6 us | — |
+| 4096 | 40 MB | 654.8 us | — |
+| 10240 | 100 MB | 1476.1 us | 106.6 GB/s |
+
+The interesting row is the one the `ccl_ops.json` section names in advance: the TP=4
+decode step sends **160 KiB, 128 times per step** (2 per layer × 64), and for that to
+stay under 10% of a 36.5 ms step each has to finish in **28.5 us**. Measured: 118.1 us,
+**4.1x over**. 128 × 118.1 us = 15.1 ms, i.e. **41% of the step spent in collectives**.
+
+Latency is flat at 105-118 us from 10 KiB to 640 KiB, so this is fixed overhead, not
+bandwidth — bandwidth only becomes the limit past ~10 MB, where 106.6 GB/s is
+respectable. The implication is that TP=4 within one chip is not free for this model,
+and the alternative (TP=1 per core, 54.6 GB of weights against 24 GB per core) does not
+fit. That tension is worth its own measurement.
+
+### Summary against the parity question
+
+The claim this directory was built to test — "a sub-40B bf16 dense model should run
+about the same on one Trn2 chip as on one H100" — holds for the *arithmetic* and fails
+for this *model*:
+
+* **Dense GEMM: confirmed, emphatically.** 91.6% MFU per logical core beats the H100's
+  81.9%. The MLP, which is 17.11B of 27.31B params, is at parity or slightly ahead per
+  chip. The fp32 scan tile is ~1.9x ahead.
+* **Elementwise and norm: confirmed.** `silu` lands on the 1.45x chip ratio; several
+  norms are ahead per chip.
+* **But three specific software gaps dominate the model's real runtime**, none of them
+  a silicon property: no fused attention at `head_dim 256` (up to 154x, growing with
+  context), `gelu` 12-15x under its own chip's roofline, and `topk` above k=8.
+  Collectives at TP=4 add a fourth.
+
+So parity is a statement about the chip, not a prediction about this checkpoint. All
+four items are fixable in kernels; none requires different hardware. The head_dim-256
+limit is the one that would need real work — a 256-partition flash kernel, or a
+two-pass split over the partition axis.
 
 ## Runtime hazard: `max_data_cnt` on the GPU backend
 
