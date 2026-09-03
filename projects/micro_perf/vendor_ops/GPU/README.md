@@ -125,11 +125,21 @@ overlay avoids mutating an environment you did not create:
 ```bash
 pip install --target ~/xpudeps jsonlines prettytable
 
-cd projects/micro_perf
-PYTHONPATH=$HOME/xpudeps:$(git rev-parse --show-toplevel)/src \
+cd ~/xpu-perf/projects/micro_perf                  # wherever the tree lives
+REPO=$(cd ../.. && pwd)
+
+PYTHONPATH=$HOME/xpudeps:$REPO/src \
   /opt/pytorch/bin/python -u launch.py --backend GPU --device 0 \
     --report_dir /tmp/out --workload workloads/basic/tensor_gemm_ops/gemm.json
 ```
+
+`$REPO` is derived from the working directory on purpose. An earlier version of
+this snippet used `$(git rev-parse --show-toplevel)`, which fails on a tree copied
+in with `rsync`/`scp` rather than cloned: `git` prints `fatal: not a git
+repository` **to stderr** and substitutes an empty string, so `PYTHONPATH` silently
+becomes `~/xpudeps:/src` and the launch dies 40 lines later on
+`ModuleNotFoundError: No module named 'xpu_perf'`. The sweep script never had this
+problem — its `REPO` default is already path-based.
 
 The full sweep, both modes:
 
