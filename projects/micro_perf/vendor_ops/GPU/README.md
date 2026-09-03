@@ -10,42 +10,63 @@ case.
 
 Normalised **per chip** — one H100 against one Trainium2, not against the quarter
 of one that a logical NeuronCore is — the gap is not one number. It spans **0.27x
-to 621x**, and which end a workload lands on is decided by whether a kernel exists
-for it, not by the hardware. This first table is the **measured** set; it is not
-the whole workload tree, and what is missing is listed with the reason
+to 715x**, and which end a workload lands on is decided by whether a kernel exists
+for it, not by the hardware. Rows are grouped by op family, and each carries both
+the raw per-chip ratio and the part of it that peak silicon does not explain
+(defined under the table). This is the **measured** set; it is not the whole
+workload tree, and what is missing is listed with the reason
 [below](#what-this-table-does-not-cover-yet):
 
-| Workload | H100 / Trainium2, per chip | What that is |
-|---|---|---|
-| dense bf16 `gemm` | **1.35x** | silicon (nominal peak ratio is 1.48x) |
-| elementwise / reductions | **~1.4x** | parity: 12 of 24 ops within 0.93-1.15x of the H100's %-of-own-peak |
-| head/QK norms, `swiglu` | **0.35-1.26x** | Trainium2 *ahead* on 6 of 8 rows |
-| attention prefill | **3.1x** | ~1.5x silicon, ~2.1x software — and the software is `nkilib`'s `attention_cte`, confirmed by identity, so there is no better kernel to reach for |
-| attention decode | **1.9-3.2x** | 1.6-2.7x software on a 1.16x bandwidth bar, straddling prefill's 2.1x. The one row that is *provider-dependent*: SDPA alone gives **1.9-11.1x**, worsening with cache length, and `attention_tkg` is what flattens it ([table](#cross-chip-decode-on-the-aligned-workload)) |
-| `gelu`, `sin`/`cos`, `reduce_max` | **3.5-7.7x** | single-op lowering gaps, each with a fast sibling op |
-| the 7 quantised ops | **3.8-38x** | on top of a shared unfused helper that costs the H100 3-14x too |
-| `gemm` at fp8 | **~99x** as published, **~1.56x** measured | the published row is the eager path in an `e4m3fn` this chip cannot multiply (OCP fp8 matmul starts at Trn3); compiled, in `e5m2`, it reaches 75.6% of its fp8 peak at 4096³ and 86.8% at the best shape measured |
-| `gather` / `scatter` | **449x / 621x** | the op def is exonerated; `gather` is one index dtype away from **1.08x**, `scatter` has no kernel |
-| `topk`, `moe_softmax_topk` | **0.33x / 0.27x** | Trainium2 ~3x ahead per chip, and the x4 is now measured at these shapes |
-| `gemm` at fp32 | **0.32x** | Trainium2 3.09x ahead; the nominal bar favours it 2.70x |
-| `rotary_embedding` | **1.15x** | exactly the memory-bound bar — both backends get 5.9% of their own peak, so the missing 94% is the op def |
+| Workload | Per chip | Software residual | What that is |
+|---|---|---|---|
+| `gemm`, bf16 | **1.35x** | **0.91x** | silicon — and Trainium2 is *ahead* of the 1.48x nominal peak ratio, extracting 90% of its own peak against the H100's 82% |
+| `gemm`, fp8 | **~99x** published, **1.56x** compiled | **65x** published, **1.03x** compiled | the published row is the eager path in `e4m3fn`, which this chip cannot multiply (OCP fp8 matmul starts at Trn3). Compiled in `e5m2` it reaches 75.6% of its fp8 peak at 4096³, 86.8% at the best shape measured |
+| `gemm`, fp32 | **0.32x** | **0.86x** | Trainium2 3.09x ahead, and ahead of even the 2.70x the nominal bar already gives it |
+| `flash_attention`, prefill | **3.1x** | **2.1x** | kernel quality, not an absent kernel: the 32% MFU *is* `nkilib`'s `attention_cte`, confirmed by object identity, so there is no better kernel to reach for |
+| `flash_attention`, decode | **1.9-3.2x** | **1.6-2.7x** | the only provider-dependent row — SDPA alone is **1.9-11.1x** and worsens with cache length; `attention_tkg` is what flattens it ([table](#cross-chip-decode-on-the-aligned-workload)) |
+| elementwise + reductions (13 of 24 ops) | **1.1-1.3x** | **0.93-1.15x** | parity, all within 15% of the H100's own %-of-peak: `add`, `sub`, `mul`, `div`, `exp`, `log`, `sqrt`, `silu`, `cast`, `softmax`, `reduce_sum`, `index_select`, `embedding` |
+| `rms_norm`, `layer_norm` | **1.7x** | **1.5x** | the only two of those 24 that are neither at parity nor pathological |
+| `gelu`, `sin`, `cos`, `reduce_max`, `reduce_min`, `index_add` | **4.0-8.9x** | **3.5-7.7x** | single-op lowering gaps, each with a fast sibling on the same chip — `silu` 1.09x against `gelu` 7.7x, `reduce_sum` 1.01x against `reduce_max` 3.5x, `index_select` 0.98x against `index_add` 3.8x |
+| `gather`, `scatter` | **510x / 715x** | **449x / 621x** | the op def is exonerated — the H100 runs both at 68-85% of peak. `gather` is one index dtype away from **1.08x**; `scatter` has no kernel at all |
+| `topk`, `moe_softmax_topk` | **0.33x / 0.27x** | **0.29x / 0.23x** | Trainium2 3.0x and 3.7x ahead per chip, and the x4 behind that is measured at these shapes (4.01x, 4.00x) rather than assumed |
+| `add_rms_norm`, `qk_rms_norm`, `head_rms_norm`, `swiglu`, `moe_swiglu` | **0.40-1.46x** | **0.35-1.26x** | Trainium2 ahead on 8 of these 9 dtype/op rows, by up to 2.9x on `head_rms_norm` at fp32; the exception is `add_rms_norm` |
+| `rotary_embedding` | **1.15x** | **0.99x** | exactly the memory-bound bar — both backends get 5.9% of their own peak, so the missing 94% is the op def, not either chip |
+| `*_dynamic_quant` (5 ops), `quant_group_gemm_reduce_sum` | **4.4-44x** | **3.8-38x** | `scale_`, `swiglu_`, `add_rms_norm_`, `head_rms_norm_`, `moe_swiglu_dynamic_quant`, plus `quant_group_gemm_reduce_sum` at fp8 and int8 — seven rows over six ops, all on top of one shared unfused helper, `smooth_per_token_dynamic_quant`, which costs the H100 3-14x too |
+
+**The two numeric columns answer different questions and are not
+interchangeable.** *Per chip* is the raw ratio of one H100 to one Trainium2 — a
+logical NeuronCore x4, since a Trn2 chip is four of them at LNC=2. *Software
+residual* divides that by the nominal bar the workload is actually limited by, so
+it is the part peak silicon does not explain: **1.48x** for compute-bound bf16
+(989.4 against 4 x 166.9 TFLOPS), **1.16x** for anything bandwidth-bound (3.35
+against 2.9 TB/s), and the dtype-specific peak ratio for the other two `gemm` rows.
+A residual of 1.0 means both chips sit the same distance from their own ceiling;
+below 1.0 means Trainium2 is closer to its own than the H100 is to the H100's. The
+memory-bound residuals are the "Neuron shortfall" column of the
+[memory-bound table](#memory-bound-ops) verbatim, which is why a couple differ from
+`per chip / 1.16` in the last digit — that table's percentages carry two
+significant figures. Earlier revisions of this summary quoted the residual for five
+rows and the per-chip ratio for the rest, under a header that said per chip; the
+`gather` row is where that mattered most, at 449x against a true per-chip 510x.
 
 So the headline is that **Trainium2's silicon is fine and essentially all of the
-gap is in its software.** The twelve rows fall into two groups: eight of them land
-within ~3x of whichever nominal bar applies (0.27-3.2x — both attention modes are
-in this group), and four are one to three orders of magnitude off it (3.5x to
-621x), which is the signature of a missing or wrong kernel rather than slow
-hardware. The fp8 row belongs to the first group once it is compiled in a dtype
-the chip can actually multiply (1.56x) and to the second only as the sweep
-currently publishes it (99x).
+gap is in its software.** Read down the residual column: **eight of the thirteen
+rows are within 1.5x of their own nominal bar**, and on four of them Trainium2 is
+the one closer to its own ceiling — both non-fp8 `gemm` rows, both selection ops and
+`rotary_embedding`. Two more, the attention modes, are within 2.7x. Three rows are
+3.5x to 621x off it — the `gelu`
+group, `gather`/`scatter`, and the quantised ops — and that is the signature of a
+missing or wrong kernel, not of slow hardware. The fp8 row belongs to the first
+group once it is compiled in a dtype the chip can actually multiply (1.03x residual)
+and to the second only as the sweep currently publishes it (99x).
 
 Earlier revisions of this table put the split at a sharp empty band — "nothing
 between 1.4x and 3.1x" — and that band was an artifact of decode never having been
 measured on an aligned workload. It now sits at **1.9-3.2x**, in the middle of it,
 so the boundary is a gradient rather than a gap. The claim that survives is the
-weaker and more useful one: **nothing in the second group is explained by peak
-FLOPS or peak bandwidth**, and every row in it has a named cause — an int64 index,
-an absent kernel, an unfused helper, a dtype the Tensor Engine cannot take.
+weaker and more useful one: **nothing in the far group is explained by peak FLOPS
+or peak bandwidth**, and every row in it has a named cause — an int64 index, an
+absent kernel, an unfused helper, a dtype the Tensor Engine cannot take.
 
 On bf16 gemm it delivers 90% of its own peak against the H100's 82% and lands
 within 1.35x per chip — [and the four-core run confirms that x4 is

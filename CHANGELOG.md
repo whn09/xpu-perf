@@ -97,10 +97,32 @@ This changelog follows semantic versioning and Keep a Changelog style.
 
 ### Changed
 
-- `projects/micro_perf/vendor_ops/GPU/README.md`: **the Summary table now has an
-  `attention decode` row, and the bimodality claim above it is corrected.** Decode
-  was the one workload with a measured Trainium2 number and no line in the table
-  everybody reads first; it is **1.9-3.2x per chip** with the better of the two
+- `projects/micro_perf/vendor_ops/GPU/README.md`: **the Summary table is rebuilt —
+  grouped by op family, with the two normalisations separated into their own
+  columns.** It had accumulated rows in no order (`gemm` at bf16, fp8 and fp32 were
+  1st, 8th and 11th), three naming conventions for the same op (`dense bf16 gemm`
+  vs `gemm at fp8`), and cells that named nothing at all ("the 7 quantised ops").
+  Rows now read `gemm` bf16/fp8/fp32, then both `flash_attention` modes, then the
+  24 basic ops split by outcome, then the layer ops, then the quantised ones, each
+  naming the ops it covers.
+
+  The reordering surfaced a worse problem: **the ratio column mixed two different
+  normalisations under a header that said "per chip".** Five of the twelve rows
+  quoted the "Neuron shortfall" figure from the memory-bound and norm tables, which
+  is already divided by the 1.16x bandwidth bar (`shortfall = per-chip / 1.1552`
+  exactly, since 3.35 TB/s / (725 GB/s x 4) = 1.1552). So `gather`'s headline 449x
+  was the software residual and its true per-chip ratio is 510x; `scatter` 621x is
+  really 715x; the `gelu` group's 3.5-7.7x is 4.0-8.9x; the quantised ops' 3.8-38x
+  is 4.4-44x; the norm/`swiglu` range 0.35-1.26x is 0.40-1.46x. Both columns are now
+  present and defined under the table, with the bar named per family (1.48x
+  compute-bound bf16, 1.16x bandwidth-bound, dtype-specific for the other `gemm`
+  rows), and the residual column is the one to read as "how much is software".
+  The published shortfall numbers are kept verbatim in that column so they still
+  match their source tables.
+
+  Also: **an `attention decode` row, and the bimodality claim above it corrected.**
+  Decode was the one workload with a measured Trainium2 number and no line in the
+  table everybody reads first; it is **1.9-3.2x per chip** with the better of the two
   providers at each shape, 1.6-2.7x of that software against a 1.16x bandwidth bar.
   Two claims did not survive it. The table said "nothing here lands between 1.4x and
   3.1x", offered as evidence that the gap is bimodal — decode lands in the middle of
