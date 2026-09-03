@@ -203,10 +203,11 @@ These are wall clock, not device time: about **13%** of a case is spent executin
 the op and the rest is harness setup, measured in
 [How to compare these to the Trainium2 numbers](#how-to-compare-these-to-the-trainium2-numbers).
 So the `single_moe_gating_ops` row above being 9.7x *slower* here than on one
-NeuronCore says nothing about either chip: the two backends pay different
-per-case harness overheads, and 1,191 s / 56 cases = 21 s per case is two orders
-of magnitude above the ~1 ms latencies that file actually reports. The per-case
-comparison for that file is the `moe_softmax_topk` row in
+NeuronCore says nothing about either chip. Its smallest case builds **22 million**
+copies of a 48-byte tensor to serve 16 op executions and takes **474 s** on its
+own, 0.02% of it on the GPU — see
+[Tiny tensors cost minutes per case on this backend](#tiny-tensors-cost-minutes-per-case-on-this-backend).
+The per-case comparison for that file is the `moe_softmax_topk` row in
 [Norm, activation and MoE ops](#norm-activation-and-moe-ops), and it points the
 other way — a 0.65x median shortfall, i.e. one NeuronCore is ahead of this H100
 at the median. Do not read any elapsed time in this table as a performance
@@ -328,6 +329,49 @@ tensors it immediately casts away — `core/utils.py:47` `float_creator`, reache
 For a 128 MiB fp16 operand that is 347 ms of `randn` against 20.8 ms of H2D and
 0.4 ms of cast. The Trainium host does the same work in the same time (272 ms /
 19.9 ms / 1.1 ms), so this is a harness cost, not a platform one.
+
+### Tiny tensors cost minutes per case on this backend
+
+The 10x above runs the other way for ops whose tensors are *small*, and the cause
+is unrelated. `core/backend.py:337-348` sets
+
+```python
+max_data_cnt = min(floor(max(0.9 * avail, 1 GiB) / tensor_size), floor(1 GiB / tensor_size))
+```
+
+with **no upper bound**. The intent is cache-busting — enough distinct buffers that
+the timed loop cannot read the same operand out of L2. But `perf()` only ever
+issues `6 + prefer_iters` executions, at most 16, so the buffer count needed is 16
+and the count actually built is whatever 1 GiB divided by the operand happens to be.
+
+Probed on the first `moe_softmax_topk` case (`num_tokens: 1`, `num_experts: 8`,
+fp32 — a 48-byte operand):
+
+| | |
+|---|---|
+| copies built (`max_data_cnt`) | **22,369,621** |
+| op executions those served | 16 |
+| `create_tensors` | 193 s (41%) |
+| `random.shuffle(tensor_list)` + `del tensor_list` (the `other` column) | 281 s (59%) |
+| device execution | 0.09 s (**0.02%**) |
+| **wall clock, one case** | **474 s** |
+
+Host CPU is 100% of one core throughout — this is Python allocating, shuffling and
+freeing 22 million CUDA tensors. That is what the 1,191 s on `moe_gating_ops.json`
+is: a handful of small-`num_tokens` cases, not 56 expensive ones.
+
+The Neuron backend never hits this because it caps the count at 4
+(`backends/NEURON/backend_neuron.py:619`), and for an unrelated reason — a long
+clone chain makes `neuronx-cc` take over five minutes. So on this file the two
+backends' wall clocks differ by 9.7x purely because one of them has a cap.
+
+The published latencies are not invalidated by this: the timed loop still runs and
+still reports the per-execution number. The caveat is narrower — with 22 M shuffled
+buffers every one of the 16 executions is a guaranteed cache miss, where 4 buffers
+on Neuron are not necessarily, so for the smallest operands the two sides are not
+measuring identical cache conditions. **Capping `max_data_cnt` at the iteration
+count would remove both the minutes and the asymmetry, but it changes measurement
+semantics for every backend, so it is not done here.**
 
 ## Attention
 

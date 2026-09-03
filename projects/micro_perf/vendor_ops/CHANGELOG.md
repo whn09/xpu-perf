@@ -313,6 +313,22 @@ This changelog follows a Keep a Changelog style and semantic versioning.
   policies (1 s / 50 iters vs 50 ms / 10 iters) are worth 1-6%, not 10x. Written
   up in `NEURON/README.md` under "Sweep wall clock is not a performance
   comparison", with a troubleshooting entry for the case where a sweep looks hung.
+- `GPU/README.md`: "Tiny tensors cost minutes per case on this backend", the same
+  probe pointed at `moe_gating_ops.json`, where the wall-clock ratio runs the other
+  way (1,191 s here against 123 s on one NeuronCore). `core/backend.py:337-348`
+  sets `max_data_cnt = floor(1 GiB / tensor_size)` with **no upper bound**, to keep
+  the timed loop out of L2. `perf()` issues at most 16 executions, so 16 buffers
+  suffice; for the 48-byte operand in that file's `num_tokens: 1` case it builds
+  **22,369,621**. Measured: 474 s for that one case — 193 s in `create_tensors`,
+  281 s in `random.shuffle` plus `del tensor_list`, **0.09 s on the GPU** (0.02%),
+  host CPU pinned at 100% of one core. The Neuron backend never sees it because
+  `backend_neuron.py:619` caps the count at 4 for an unrelated reason, so that
+  9.7x is entirely one backend having a cap. Published latencies still stand (the
+  timed loop runs normally); the narrower caveat is that 22 M shuffled buffers
+  guarantee a cache miss on every execution where 4 do not, so the smallest
+  operands are not compared under identical cache conditions. Capping
+  `max_data_cnt` at the iteration count would fix both, but it changes measurement
+  semantics for every backend, so it is documented rather than changed.
 
 ### Fixed
 

@@ -759,6 +759,16 @@ gives each case a 1 s / 50-iteration timed loop where `core/backend.py:335-336`
 gives it 50 ms / 10 iterations, and `:651` sleeps 0.2 s per case against 0.1 s —
 together 1-6% of the wall clock here.
 
+**And it runs the other way for small tensors.** `backend_neuron.py:619` caps
+`max_data_cnt` at 4, added because a longer clone chain in the HLO makes
+`neuronx-cc` take over five minutes. `core/backend.py:337-348` has no such cap: it
+builds `floor(1 GiB / tensor_size)` copies, which for the 48-byte operand in
+`moe_gating_ops.json`'s smallest case is **22,369,621** of them, to serve 16 op
+executions. That one case takes **474 s** on the H100 with 0.02% of it on the GPU,
+and it is why the same file is 123 s here against 1,191 s there. So neither
+direction of a sweep-duration ratio is a chip comparison; see
+[Tiny tensors cost minutes per case on this backend](../GPU/README.md#tiny-tensors-cost-minutes-per-case-on-this-backend).
+
 The consequence for reading this document: latency and MFU rows are unaffected,
 because the timed loop is warm by the time it runs. Sweep durations, and the
 per-label elapsed times in [Reproduce one row at a
