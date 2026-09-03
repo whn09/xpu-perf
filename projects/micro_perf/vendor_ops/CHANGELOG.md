@@ -330,8 +330,44 @@ This changelog follows a Keep a Changelog style and semantic versioning.
   `max_data_cnt` at the iteration count would fix both, but it changes measurement
   semantics for every backend, so it is documented rather than changed.
 
+- `NEURON`: a `torch_compile` provider for `gemm`, which is the first thing in this
+  repo that reaches Trainium2's fp8 tensor engines. The `torch` provider measures
+  `torch.matmul` on fp8 operands in eager mode and lands at ~0.4-1.4% of the fp8
+  peak, because eager has no fp8 matmul lowering and casts both operands up to
+  bfloat16 first. This one wraps the same matmul in
+  `torch.compile(backend="neuron", dynamic=False)` and accepts `float8_e5m2` only —
+  `float8_e4m3` resolves to `torch.float8_e4m3fn`, which `nc_matmul` supports only
+  from NeuronCore-v4. Measured over all 12 cases of the new workload file: **53.7x
+  to 191.1x** faster than the eager rows, best point **281.97 TFLOPS = 86.8% of the
+  324.75 TF per-core peak** at 16384x4096x4096. Four things it has to do that are
+  each a silent-wrong-number trap, and are documented as such: `dynamic=False`
+  (neuronx-cc rejects `bf16[?,?]`); `torch._dynamo.reset()` per case, because
+  dynamo's default `cache_size_limit` is 8 and this file has 12 shapes, so the 9th
+  onward would otherwise fall back to eager *while still reporting under a provider
+  called `torch_compile`*; an explicit non-fp8 `dst_dtype`, since `nc_matmul` writes
+  an fp32 `dst` on v3 and defaulting to `dtype` would make `write_bytes` claim 1
+  byte per element against a graph emitting 2; and registration gated on
+  `XPU_PERF_NEURON_GEMM_COMPILE=1`, so a default sweep stays byte-identical to the
+  published one instead of printing 848 rejection tracebacks for `gemm.json`'s
+  non-fp8 cases.
+- `NEURON/workloads/gemm_fp8_compiled.json`: the fp8 shapes from
+  `gemm.json` paired with `"dst_dtype": "bfloat16"`. It lives under `vendor_ops/`
+  rather than `workloads/` on purpose — `--task_dir` rglobs `workloads/basic`, so a
+  file there would join every default sweep. It uses the `{"gemm": [...]}` form
+  rather than `{"cases": [...]}` because the latter takes the op name from the
+  filename. Running it reports both providers per case, so the eager/compiled ratio
+  comes out of one log.
+
 ### Fixed
 
+- `core/common_utils.py`: `discover_plugins` used `dirpath.startswith(p)` to decide
+  whether a directory had already been covered by a loaded provider package. That is
+  a string prefix, not a path prefix, so a provider whose directory name merely
+  *begins* with an already-visited sibling's — `ops/torch_compile` next to
+  `ops/torch` — was skipped and its ops never registered. Nothing warned; the new
+  provider simply did not appear in the op mapping. And because `os.walk` yields
+  siblings in filesystem order, which of the two loaded depended on directory order
+  rather than on anything in the code. Now compares against `p + os.sep`.
 - `NEURON/README.md`, `GPU/README.md`: **sourced the fp8 encoding claim properly.**
   Both files said the ~99x was partly because Trainium2 implements `f8e4m3` and not
   `f8e4m3fn`, which was inferred from one compiler error alone. It is now sourced to

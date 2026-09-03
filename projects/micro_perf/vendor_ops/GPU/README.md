@@ -21,7 +21,7 @@ workload tree, and what is missing is listed with the reason
 | attention prefill | **3.1x** | ~1.5x silicon, ~2.1x software — and the software is `nkilib`'s `attention_cte`, confirmed by identity, so there is no better kernel to reach for |
 | `gelu`, `sin`/`cos`, `reduce_max` | **3.5-7.7x** | single-op lowering gaps, each with a fast sibling op |
 | the 7 quantised ops | **3.8-38x** | on top of a shared unfused helper that costs the H100 3-14x too |
-| `gemm` at fp8 | **~99x** as published, **~1.56x** measured | the published row is the eager path in an `e4m3fn` this chip cannot multiply (OCP fp8 matmul starts at Trn3); compiled, in `e5m2`, it reaches 75.6% of its fp8 peak |
+| `gemm` at fp8 | **~99x** as published, **~1.56x** measured | the published row is the eager path in an `e4m3fn` this chip cannot multiply (OCP fp8 matmul starts at Trn3); compiled, in `e5m2`, it reaches 75.6% of its fp8 peak at 4096³ and 86.8% at the best shape measured |
 | `gather` / `scatter` | **449x / 621x** | the op def is exonerated; `gather` is one index dtype away from **1.08x**, `scatter` has no kernel |
 | `topk`, `moe_softmax_topk` | **0.33x / 0.27x** | Trainium2 ~3x ahead per chip, and the x4 is now measured at these shapes |
 | `gemm` at fp32 | **0.32x** | Trainium2 3.09x ahead; the nominal bar favours it 2.70x |
@@ -41,8 +41,12 @@ number on either count: it is the eager path, in an `e4m3fn` that Trainium2's
 Tensor Engine cannot multiply — `nc_matmul` takes legacy `e4m3` and `e5m2` on
 NeuronCore-v3, and OCP `e4m3fn` "starting NeuronCore-v4", i.e. Trn3. Compiled, in `e5m2`,
 one logical core does **245.50 TFLOPS at 75.6%
-of its fp8 peak**, which puts the per-chip gap at **1.56x** against a 1.52x nominal
-bar — [details](../NEURON/README.md#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply).
+of its fp8 peak** at 4096³, which puts the per-chip gap at **1.56x** against a 1.52x
+nominal bar — [details](../NEURON/README.md#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply).
+A 12-shape sweep through the new `torch_compile` provider peaks higher still, 281.97
+TFLOPS = **86.8%** of that core's fp8 peak at 16384x4096x4096; the 1.56x stays
+sourced to 4096³ because that is the shape whose x4 to a per-chip figure was
+actually measured.
 The 99x is real as a measurement of what the sweep currently runs, and it is not a
 statement about the chip.
 

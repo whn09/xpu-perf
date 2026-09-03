@@ -323,10 +323,22 @@ def load_plugin_package(package_path: str):
     parse_vendor_ops(provider_name, init_file)
 
 
+def _is_within(child: str, parent: str) -> bool:
+    """True if `child` is `parent` or a directory inside it.
+
+    A plain `child.startswith(parent)` is wrong here and silently drops providers:
+    a sibling whose name merely *begins* with an already-visited one --
+    `ops/torch_compile` next to `ops/torch` -- looks like a subdirectory of it and
+    is skipped. Worse, os.walk yields siblings in filesystem order, so which of the
+    two survives depends on directory order rather than on anything in the code.
+    """
+    return child == parent or child.startswith(parent + os.sep)
+
+
 def discover_plugins(root_path: str) -> Dict[str, any]:
     visited = set()
     for dirpath, _, filenames in os.walk(root_path):
-        if any(dirpath.startswith(p) for p in visited):
+        if any(_is_within(dirpath, p) for p in visited):
             continue
         if "__init__.py" in filenames:
             load_plugin_package(dirpath)

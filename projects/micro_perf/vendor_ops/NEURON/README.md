@@ -1097,10 +1097,11 @@ compiler rejects `bf16[?,?]` outright; and the failing e4m3fn compile has to run
 **last**, because it latches an error that the next device op inherits — a
 `torch.randn` three lines later fails with the e4m3fn message still attached.
 
-**What is *not* claimed here.** The workload files are unchanged and the published
-rows are still eager, so the table above stands as what `gemm.json` measures.
-Getting the better number into the sweep needs `float8_e5m2` cases run through a
-compiled provider, which is a different provider rather than a flag. And the two
+**What is *not* claimed here.** `gemm.json` is unchanged and its published rows
+are still eager, so the table above stands as what a default sweep measures. The
+compiled number is reachable from the harness now, but through a separate provider
+and a separate workload file — see [Measuring the compiled fp8 path from the
+sweep](#measuring-the-compiled-fp8-path-from-the-sweep) below. And the two
 sides' fp8 numbers are necessarily in different encodings: the H100's is e4m3fn,
 Trainium2's Tensor Engine does not take e4m3fn at all, and Trainium2's has to be
 quoted in e5m2 — which `torch._scaled_mm` in turn rejects on CUDA
@@ -1116,6 +1117,74 @@ per chip is the throughput of the format that is available on 2.27, not of a
 configuration you would necessarily ship. The `--auto-cast-type` route and the cFP8
 `e3m4` split (documented for NeuronCore v2/v3, and never exercised in this repo)
 are the obvious things to look at if accuracy is the binding constraint.
+
+##### Measuring the compiled fp8 path from the sweep
+
+`tools/probe_fp8_datapath.py` answers "can this chip do fp8" but it is a standalone
+script: it does not go through an op def, so it produces no `mfu`, no report file
+and nothing an `analyze_sweep.py` run can pick up. The `torch_compile` provider does
+the same thing inside the harness.
+
+```bash
+sudo docker run --rm --device /dev/neuron0 \
+  -e XPU_PERF_NEURON_GEMM_COMPILE=1 -e PYTHONPATH=/w/src \
+  -v "$HOME/xpu-perf":/w -w /w/projects/micro_perf xpu-perf-eager:latest \
+  python3 -u launch.py --backend NEURON --device 0 --report_dir /tmp/fp8 \
+    --workload vendor_ops/NEURON/workloads/gemm_fp8_compiled.json
+```
+
+That gives **both** providers on every case, because `gemm` now has two registered
+vendor implementations — so each shape reports an eager row under `torch` and a
+compiled row under `torch_compile`, and the ratio between them is in one log.
+Measured 2026-09-03 on one logical NeuronCore of a trn2.3xlarge, all 12 cases of
+that file (fp8 peak 324.75 TF/core):
+
+| M | K | N | eager us | compiled us | compiled TFLOPS | compiled MFU | speed-up |
+|---|---|---|---|---|---|---|---|
+| 1024 | 4096 | 4096 | 21,828.7 | 169.8 | 202.41 | 0.623 | 128.6x |
+| 4096 | 4096 | 4096 | 68,351.6 | 532.4 | 258.15 | 0.795 | 128.4x |
+| 8192 | 4096 | 4096 | 114,418.1 | 1,004.9 | 273.53 | 0.842 | 113.9x |
+| 16384 | 4096 | 4096 | 210,020.0 | 1,949.7 | **281.97** | **0.868** | 107.7x |
+| 1024 | 8192 | 1024 | 20,084.3 | 116.2 | 147.83 | 0.455 | 172.8x |
+| 4096 | 8192 | 1024 | 55,351.1 | 328.8 | 209.00 | 0.644 | 168.4x |
+| 8192 | 8192 | 1024 | 103,966.8 | 603.8 | 227.64 | 0.701 | 172.2x |
+| 16384 | 8192 | 1024 | 199,293.2 | 1,167.0 | 235.54 | 0.725 | 170.8x |
+| 1024 | 8192 | 8192 | 103,663.1 | 542.4 | 253.41 | 0.780 | 191.1x |
+| 4096 | 8192 | 8192 | 186,857.2 | 2,349.6 | 233.98 | 0.721 | 79.5x |
+| 8192 | 8192 | 8192 | 306,586.5 | 4,605.6 | 238.73 | 0.735 | 66.6x |
+| 16384 | 8192 | 8192 | 488,241.8 | 9,093.1 | 241.84 | 0.745 | 53.7x |
+
+The best point is **281.97 TFLOPS = 86.8% of the per-core fp8 peak** at
+16384x4096x4096 — ten points above the 75.6% the probe reports, because the probe
+only runs square shapes and 4096³ is not the best one. Read this table as the
+single-core answer: the x4 to a per-chip figure is
+[measured](#the-two-things-that-produce-12) for the 4096³ square case only, so the
+982 TFLOPS/chip figure quoted above still rests on that case rather than on this
+86.8% one, whose x4 is unmeasured.
+
+Four details, each of which is a trap if you write your own version:
+
+* **`XPU_PERF_NEURON_GEMM_COMPILE=1` is required**, and without it the provider does
+  not register at all. That is deliberate: a registered provider is instantiated
+  once per case, and `gemm.json`'s 848 non-fp8 cases would each print a rejection
+  traceback. Opt-in keeps a default sweep byte-identical to the published one.
+* **The workload has to set an explicit non-fp8 `dst_dtype`.** `nc_matmul` writes an
+  fp32 `dst` on NeuronCore-v3, so something has to convert; the shipped file uses
+  `bfloat16`, which is what an fp8 inference path emits. Leaving `dst_dtype` to
+  default to `dtype` would make `write_bytes` claim 1 byte per element while the
+  graph emits 2, so the provider rejects that case rather than reporting it.
+* **Only `float8_e5m2` is accepted.** `float8_e4m3` maps to `torch.float8_e4m3fn`,
+  which is the OCP encoding this chip has no matmul datapath for, so the provider
+  rejects it with the reason rather than letting neuronx-cc fail mid-sweep.
+* **`torch._dynamo.reset()` per case.** dynamo's default `cache_size_limit` is 8 and
+  this file has 12 shapes, so without the reset the 9th shape onward would silently
+  fall back to eager — reporting ~1.5 TFLOPS under a provider named
+  `torch_compile`, which is the worst possible failure mode here.
+
+Cost: the first of `perf()`'s two warm-up iterations pays a full neuronx-cc compile
+for that shape, which is minutes per case rather than the ~3 s of the [eager
+per-shape warm-up](#a-sweep-is-taking-all-day-but-nothing-is-hung). Size any
+watchdog accordingly.
 
 ##### `torch._scaled_mm` is not usable on this backend
 
