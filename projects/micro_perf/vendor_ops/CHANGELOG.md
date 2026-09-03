@@ -332,6 +332,33 @@ This changelog follows a Keep a Changelog style and semantic versioning.
 
 ### Fixed
 
+- `NEURON/README.md`, `GPU/README.md`: **corrected the explanation of the fp8 row.**
+  Both files said the ~99x was partly because "Trainium1 and Trainium2 implement
+  `f8e4m3`" and not `f8e4m3fn`, i.e. a hardware encoding gap. That was inferred from
+  one compiler error and AWS's documentation contradicts it. [Data
+  Types](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-features/data-types.html)
+  gives NeuronCore v2 "8-bit Floating point with configurable range and precision
+  (cFP8)" over *three* splits — `FP8_e5m2`, `FP8_e4m3`, `FP8_e3m4` — and NeuronCore
+  v3 (Trn2) "supports all of the data types available on NeuronCore v2"; the e4m3 /
+  e4m3fn difference is inf/NaN and range semantics in the type system, which is why
+  the workaround the error itself names is `--experimental-unsafe-fp8e4m3fn-as-fp8e4m3`,
+  a reinterpretation onto the same engines. And in the current SDK
+  `nl.float8_e4m3fn` is tagged "relevant for: Trn2, Trn3" and is the default dtype
+  of the [FP8 Quantize kernel](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/library/api/fp8-quantize.html).
+  What survives is a version fact, now stated as one: on the SDK these numbers were
+  taken with, `neuronxcc.nki.language` exposes only `float8_e4m3` and `float8_e5m2`
+  and the compiler refuses `F8E4M3FN` by name — verified on all three images on
+  these hosts (neuronx-cc 2.27.2878.0 twice, 2.25.1280.0 once), none newer than
+  2.27, so the 2.32 behaviour is documented but **unmeasured**. The measurements are
+  unchanged and so is the conclusion (99x is the eager path; compiled e5m2 gives
+  245.50 TFLOPS per core, 982 per chip, a 1.56x per-chip gap), because that rests on
+  the *eager lowering* cause rather than on the encoding one. Two downstream claims
+  were also scoped: "the two chips share no fp8 format both stacks will multiply" is
+  true as measured on 2.27, not a property of the chips; and the section heading
+  "the wrong e4m3 encoding" became "in a dtype this SDK will not compile". Added the
+  accuracy caveat the TFLOPS figures hide — e5m2 has 2 mantissa bits to e4m3fn's 3,
+  so 982 TFLOPS/chip is the throughput of the format 2.27 offers, not necessarily of
+  a shippable configuration.
 - `GPU/README.md`: the `Reproduce one row at a time` table called its 2,496 s total
   "device time". It is wall clock, and the probe above measures device execution at
   about 13% of a case on this backend (52.6% goes to `create_tensors`, 33.6% to the

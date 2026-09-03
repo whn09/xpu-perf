@@ -21,7 +21,7 @@ workload tree, and what is missing is listed with the reason
 | attention prefill | **3.1x** | ~1.5x silicon, ~2.1x software — and the software is `nkilib`'s `attention_cte`, confirmed by identity, so there is no better kernel to reach for |
 | `gelu`, `sin`/`cos`, `reduce_max` | **3.5-7.7x** | single-op lowering gaps, each with a fast sibling op |
 | the 7 quantised ops | **3.8-38x** | on top of a shared unfused helper that costs the H100 3-14x too |
-| `gemm` at fp8 | **~99x** as published, **~1.56x** measured | the published row is the eager path in an e4m3 encoding Trainium2 does not implement; compiled, in `e5m2`, it reaches 75.6% of its fp8 peak |
+| `gemm` at fp8 | **~99x** as published, **~1.56x** measured | the published row is the eager path in an `e4m3fn` this SDK refuses to compile; compiled, in `e5m2`, it reaches 75.6% of its fp8 peak |
 | `gather` / `scatter` | **449x / 621x** | the op def is exonerated; `gather` is one index dtype away from **1.08x**, `scatter` has no kernel |
 | `topk`, `moe_softmax_topk` | **0.33x / 0.27x** | Trainium2 ~3x ahead per chip, and the x4 is now measured at these shapes |
 | `gemm` at fp32 | **0.32x** | Trainium2 3.09x ahead; the nominal bar favours it 2.70x |
@@ -37,10 +37,12 @@ real](#how-to-compare-these-to-the-trainium2-numbers). On attention it delivers
 32% against the H100's 69% — and that 32% is *already* a fused NKI flash kernel,
 [measured by turning it off](#attention), so the remaining 2.1x is kernel quality
 rather than an absent kernel. On fp8 the published row is not a hardware
-number on either count: it is the eager path, in an `e4m3` encoding Trainium2 does
-not implement. Compiled, in `e5m2`, one logical core does **245.50 TFLOPS at 75.6%
+number on either count: it is the eager path, in an `e4m3fn` that neuronx-cc
+2.27 refuses to compile (a version fact — AWS documents `e4m3fn` on Trn2 as of
+2.32, and Trainium's fp8 is configurable: e5m2, e4m3, e3m4). Compiled, in `e5m2`,
+one logical core does **245.50 TFLOPS at 75.6%
 of its fp8 peak**, which puts the per-chip gap at **1.56x** against a 1.52x nominal
-bar — [details](../NEURON/README.md#fp8-the-sweep-measures-the-eager-path-and-the-wrong-e4m3-encoding).
+bar — [details](../NEURON/README.md#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-sdk-will-not-compile).
 The 99x is real as a measurement of what the sweep currently runs, and it is not a
 statement about the chip.
 
@@ -541,11 +543,14 @@ the format promises. The Trainium2 cells next to it are 3.85 / 4.77 TFLOPS, 1.2-
 MFU — and two independent things produce that, neither of which is "the hardware
 has no fp8 gemm":
 
-- **The encoding is wrong.** `float8_e4m3` maps to `torch.float8_e4m3fn`, the
-  finite-only variant CUDA uses. Trainium1/2 implement the *other* e4m3, and the
-  compiler says so by name: `[NCC_EVRF051] Data type F8E4M3FN is not supported on
-  TRN1/TRN2.` The workaround flag that error recommends does not exist in
-  neuronx-cc 2.27.2878.0.
+- **The encoding is one this SDK will not compile.** `float8_e4m3` maps to
+  `torch.float8_e4m3fn`, the finite-only variant CUDA uses, and neuronx-cc
+  2.27.2878.0 refuses it by name: `[NCC_EVRF051] Data type F8E4M3FN is not
+  supported on TRN1/TRN2.` The workaround flag that error recommends does not exist
+  in that version either. This is a version fact, not a hardware one — AWS
+  documents `e4m3fn` on Trn2 as of Neuron 2.32, and Trainium's fp8 is *configurable*
+  (cFP8: e5m2, e4m3, e3m4). No image on these hosts is newer than 2.27, so the 2.32
+  behaviour is unmeasured.
 - **The path is eager.** Eager has no fp8 gemm lowering for *either* encoding, so
   both fall onto the same software widening at ~1-2 TFLOPS.
 
@@ -555,7 +560,7 @@ own bf16 on a nominal 1.95x bar, 115.7x the eager number at the same shape. Unli
 eager fp8, that path scales across cores cleanly (1.018x worst case over four
 concurrent runs), so **982 TFLOPS per chip and a real gap of 1.56x** where the
 nominal fp8 peak ratio is 1.52x
-([details](../NEURON/README.md#fp8-the-sweep-measures-the-eager-path-and-the-wrong-e4m3-encoding)).
+([details](../NEURON/README.md#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-sdk-will-not-compile)).
 
 Two things follow. The ~99x row stays in the table because it is what
 `gemm.json` measures today and it is reproducible — closing it needs an fp8
