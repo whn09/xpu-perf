@@ -87,16 +87,17 @@ can be quoted for them: the seven in `xccl_ops/`, `gemm_ops.json`,
 `moe_dispatch_ops.json`, `moe_combine_ops.json`, and two of the `vendor_test/`
 files. `tools/run_comparison_sweep.sh` runs none of them. The remaining rows are
 a different problem — a case no backend can run, or one only a single backend can —
-and are marked as such. Some of this is a hardware limit, since a p5.4xlarge has
-one GPU; the rest is simply not done yet, which is worth being explicit about
-rather than leaving the table above looking complete.
+and are marked as such. Most of this is a hardware limit, since a p5.4xlarge has
+one GPU. **Exactly three files are runnable here today and simply unrun**:
+`gemm_ops.json`, `moe_dispatch_ops.json` and `moe_combine_ops.json`. That is worth
+being explicit about rather than leaving the table above looking complete.
 
 | Workload | Ops | What Trainium2 got | Blocker | TODO |
 |---|---|---|---|---|
 | `xccl_ops/{all_reduce,all_gather,reduce_scatter,all_to_all}.json` | 4 collectives | best `bus_bw` at ws=4: `all_gather` 125.1, `all_reduce` 107.1, `reduce_scatter` 101.7, `all_to_all` 54.2 GB/s ([table](../NEURON/README.md#memory-bound-ops)) | **hardware** — `world_size` is 1 on one GPU | needs a p5.48xlarge (8x H100, NVLink). **The highest-value item in this list**: NVLink vs NeuronLink is the one remaining difference likely to matter at training scale, and nothing here constrains it |
 | `single_test_ops/ccl_ops.json` | same 4 | **0 cases** — the file asks for `world_size: 8` and a trn2.3xlarge has 4 logical cores | **hardware**, both sides | needs 8 of either; on the Neuron side a trn2.48xlarge |
 | `xccl_ops/device2device.json` | `device2device` | 648.7 GB/s (bf16) | **hardware** — needs two devices | same box. Note this op reads its operands exactly once, which is why it tops the Neuron memory-bound table |
-| `xccl_ops/{device2host,host2device}.json` | 2 | 14.3 / 14.0 GB/s at ws=2, and the ws=4 column is not comparable (1 GiB cap, four ranks sharing one host DMA path) | **none** — these are single-device host copies and run on a p5.4xlarge as-is | **cheapest thing on this list**, and the only row here that can be closed without another instance. It is also the one number in the comparison governed by neither chip's HBM but by a host link, so 14.3 GB/s currently has nothing to be read against. Worth having for exactly that reason |
+| `xccl_ops/{device2host,host2device}.json` | 2 | 14.3 / 14.0 GB/s at ws=2, and the ws=4 column is not comparable (1 GiB cap, four ranks sharing one host DMA path) | **harness**, not hardware — both ops are registered on `XCCLEngine` (`op_defs/basic_ops/xccl_ops.py:569,627`), and `perf_engine.py:173` skips that engine outright when `len(device_ids) * node_world_size <= 1`. So although both files do list a `world_size: 1` case, a one-GPU launch dispatches to an engine that was never started and writes `note: engine_not_started` for every case (`perf_engine.py:352-364`) — exit 0, nothing measured. `XPU_PERF_ENGINES=XCCLEngine` does not help: the env filter is applied *before* that guard, not instead of it | needs any box with ≥2 GPUs — unlike the collectives it does not need NVLink or all eight. An earlier version of this row claimed these ran here as-is, on the strength of the `world_size: 1` entry in the JSON alone; they do not. Still worth having, as the one number in the comparison governed by neither chip's HBM but by a host link, so 14.3 GB/s currently has nothing to be read against |
 | `single_test_ops/gemm_ops.json` | `moe_gating_gemm`, `quant_matmul`, `moe_quant_group_gemm` | `moe_gating_gemm` 21.89 TF / **48% MFU**; `quant_matmul` 15.78 "TOPS"; `moe_quant_group_gemm` **2.67-2.84 s at every shape** | **none** | run it. `moe_gating_gemm` is the interesting one — the only genuine compute-bound row outside plain `gemm`, at 48% of the fp32 peak against `gemm`'s 82% at the same dtype, with no GPU control to say which of those two numbers is the anomaly. The other two route through `fake_quant_gemm` and are [a bf16 simulation on every backend](../NEURON/README.md#the-quantized-ops-are-a-bf16-simulation-on-every-backend), so a GPU column there measures the same shared helper the `_dynamic_quant` rows already exposed |
 | `single_test_ops/moe_dispatch_ops.json` | `moe_scatter_dynamic_quant` | 0.7 GB/s | **none** | run it. At 0.7 GB/s it is in `gather`/`scatter` territory, and the GPU column is what would say whether that is the op def or the lowering — exactly the question the H100 settled for `gather` |
 | `single_test_ops/moe_combine_ops.json` | `moe_gather`, `moe_quant_group_gemm_combine` | `moe_gather` 9.2 GB/s | **none** | run it, same reason — `moe_gather` at 9.2 GB/s is 68x off `index_select` on the same chip |
@@ -147,6 +148,62 @@ implementation**, so without a fused-attention package installed every case in a
 paged-attention workload is skipped and the launch **exits 0 having measured
 nothing**. The Dockerfile therefore asserts `import flash_attn` at build time
 rather than treating it as optional.
+
+## Reproduce one row at a time
+
+Checking one figure in the tables below does not need the sweep. Every row came
+from exactly one `launch.py` call, and each of those calls has a label:
+
+```bash
+cd projects/micro_perf
+
+LIST=1 vendor_ops/GPU/tools/run_comparison_sweep.sh    # print all 13; runs nothing
+ONLY=gemm vendor_ops/GPU/tools/run_comparison_sweep.sh 2>&1 | tee /tmp/one.log
+ONLY=single_norm_ops,single_quant_ops vendor_ops/GPU/tools/run_comparison_sweep.sh
+```
+
+`ONLY` takes commas or spaces, matches whole labels only (`ONLY=gemm` does not
+also select `single_gemm_ops`), and changes nothing else: the log format and the
+`$RESULTS/<label>/` layout are identical to a full run, so
+`vendor_ops/NEURON/tools/analyze_sweep.py` reads a one-label log the same way.
+
+**Every label here is single-GPU.** The elapsed times are what the published run
+actually took on an idle p5.4xlarge, not the watchdog budgets in the script:
+
+| Label | Workload | Elapsed | Covers |
+|---|---|---|---|
+| `gemm` | `basic/tensor_gemm_ops/gemm.json` | 403 s | [gemm](#gemm), including the 24 fp8 cases |
+| `basic_vector_linear_ops` | `basic/vector_linear_ops` (all) | 175 s | [memory-bound](#memory-bound-ops) |
+| `basic_vector_activation_ops` | `basic/vector_activation_ops` (all) | 64 s | " |
+| `basic_vector_norm_ops` | `basic/vector_norm_ops` (all) | 51 s | " |
+| `basic_vector_reduction_ops` | `basic/vector_reduction_ops` (all) | 84 s | " |
+| `basic_vector_sfu_ops` | `basic/vector_sfu_ops` (all) | 289 s | " |
+| `basic_vector_index_ops` | `basic/vector_index_ops` (all) | 62 s | `gather`/`scatter`, the [two ops Neuron is 100x off on](../NEURON/README.md#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity) |
+| `single_norm_ops` | `llm/single_test_ops/norm_ops.json` | 84 s | [norm/activation/MoE](#norm-activation-and-moe-ops) |
+| `single_activation_ops` | `llm/single_test_ops/activation_ops.json` | 52 s | " |
+| `single_moe_gating_ops` | `llm/single_test_ops/moe_gating_ops.json` | **1,191 s** | " — the longest run here, and 9.7x the same file on one NeuronCore (123 s) |
+| `single_quant_ops` | `llm/single_test_ops/quant_ops.json` | 17 s | " |
+| `single_fa_linear_ops` | `llm/single_test_ops/fa_linear_ops.json` | 15 s | [attention](#attention) — all 10 prefill/decode/GQA cases |
+| `single_fa_ops` | `llm/single_test_ops/fa_ops.json` | 9 s | paged attention. **Measures nothing under `MODE=host`** without `flash_attn`, and exits 0 |
+
+That is 2,496 s of device time in total — **the whole comparison sweep is 42
+minutes**, so reproducing all of it is usually cheaper than deciding which label
+you need. The Trainium2 side is most of a day; see
+[NEURON/README.md, Reproduce one row at a time](../NEURON/README.md#reproduce-one-row-at-a-time)
+for its label list, and note that two labels are named differently there — `gemm`
+is `basic_tensor_gemm_ops`, and `basic_vector_index_ops` is split into
+`basic_index_ok` and `basic_index_slow` because `gather`/`scatter` have to be run
+under their own watchdog on that side.
+
+Three further labels exist but are **skipped in a default run** and reachable only
+by naming them: `single_gemm_ops`, `single_moe_dispatch_ops` and
+`single_moe_combine_ops`. They are the files with a Trainium2 number and no GPU
+column that this box could close today — see
+[What this table does not cover yet](#what-this-table-does-not-cover-yet). Running
+them adds three rows to the comparison; they are gated so that a default run keeps
+describing what the published numbers were actually taken with. `single_pre_fa_ops`
+is in the same block for a different reason: the `rotary_embedding` row was measured
+by hand rather than through the script.
 
 ## How to compare these to the Trainium2 numbers
 

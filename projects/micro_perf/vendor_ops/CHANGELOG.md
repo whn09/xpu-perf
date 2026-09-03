@@ -272,9 +272,39 @@ This changelog follows a Keep a Changelog style and semantic versioning.
   scaling — and unlike the elementwise ops already measured, these are the ones
   most likely to serialise on something shared. Cheap to run: the 56-case
   `moe_gating_ops.json` takes 123 s on Neuron, against 1,191 s on the H100.
+- `LIST=1` and `ONLY=<labels>` in `NEURON/tools/run_full_sweep.sh` and
+  `GPU/tools/run_comparison_sweep.sh`, so a single published figure can be
+  re-measured without the sweep it came from — a day on Trainium2, 42 minutes on
+  the H100. `LIST` prints every label with its device list, budget and launch
+  arguments and touches no device, which also makes it safe to run on a machine
+  someone else is using. `ONLY` accepts commas or spaces (`run_new_workloads.sh`
+  took space-separated labels first, and three scripts disagreeing on a delimiter
+  is a trap) and matches whole labels, so `ONLY=gemm` cannot also select
+  `single_gemm_ops`. Neither changes the log format or the `$RESULTS/<label>/`
+  layout, so `analyze_sweep.py` reads a one-label log exactly as a full one.
+  `run_new_workloads.sh` gained `LIST` for symmetry. Both READMEs now carry a
+  `Reproduce one row at a time` section listing every label against its workload
+  file, device count and *measured* elapsed time from the logs the published
+  numbers came from — not the watchdog budgets, which are 3-30x larger.
+- `GPU/tools/run_comparison_sweep.sh`: labels for the three files that have a
+  Trainium2 number, are runnable on a p5.4xlarge, and are simply unrun
+  (`single_test_ops/{gemm_ops,moe_dispatch_ops,moe_combine_ops}.json`), plus
+  `single_pre_fa_ops`. They are gated behind `ONLY`/`LIST` so a default run keeps
+  describing what the published numbers were actually taken with.
 
 ### Fixed
 
+- `GPU/README.md`: corrected the claim that `xccl_ops/{device2host,host2device}.json`
+  run on a one-GPU box as-is. Both files do list a `world_size: 1` case, which is
+  what the claim rested on, but both ops are registered on `XCCLEngine`
+  (`op_defs/basic_ops/xccl_ops.py:569,627`) and `perf_engine.py:173` skips that
+  engine outright when `len(device_ids) * node_world_size <= 1`. The launch then
+  dispatches to an engine that was never started, writes `note: engine_not_started`
+  for every case, and **exits 0 having measured nothing** — the same silent-success
+  failure mode the collectives section warns about, reached from the other
+  direction. `XPU_PERF_ENGINES=XCCLEngine` does not override it: the env filter is
+  applied before that guard, not instead of it. So these two need ≥2 GPUs, which
+  moves them out of the "runnable, just unrun" set and leaves it at three files.
 - `GPU`: pin the fused SDPA backend set in `flash_attention`'s `vendor_impl`.
   Which backend `scaled_dot_product_attention` picks is process-global state, and
   any *other* provider's import can change it: `import vllm` calls

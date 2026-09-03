@@ -1279,6 +1279,95 @@ read them off the Neuron column as if they were:
   they are fixed there is no `store_kv_cache` number to compare, on this backend or
   the GPU.
 
+## Reproduce one row at a time
+
+The full sweep is most of a day, and checking one figure in the tables above does
+not need it. Every row came from exactly one `launch.py` call, and each of those
+calls has a label in one of the two scripts:
+
+```bash
+cd projects/micro_perf
+
+# What is there. Prints label, device list, budget and launch arguments; touches
+# no device, so it is safe on a machine someone else is using.
+LIST=1 vendor_ops/NEURON/tools/run_full_sweep.sh
+LIST=1 vendor_ops/NEURON/tools/run_new_workloads.sh
+
+# One row.
+ONLY=single_gemm_ops IMAGE=xpu-perf-eager:latest \
+    vendor_ops/NEURON/tools/run_full_sweep.sh
+tail -f /tmp/neuron_sweep.log        # both scripts log to a file, not the terminal
+
+# Several. Commas or spaces, either works in either script.
+ONLY=basic_index_ok,basic_index_slow IMAGE=xpu-perf-eager:latest \
+    vendor_ops/NEURON/tools/run_full_sweep.sh
+```
+
+`ONLY` matches whole labels only, so `ONLY=gemm` selects nothing rather than
+quietly running `single_gemm_ops`. Everything else is unchanged: the log format and
+the `$RESULTS/<label>/` layout are identical to a full run, so
+`analyze_sweep.py` reads a one-label log the same way. The
+[waiting-for-an-idle-chip behaviour](#reproducing-the-full-sweep) still applies to
+each run — that is the point of going through the script rather than calling
+`launch.py` by hand.
+
+**24 of the 28 labels in `run_full_sweep.sh` are single-core** (`--device 0`, one
+logical NeuronCore, a quarter of a chip at LNC=2). Elapsed times are from the logs
+the published numbers came from, on an otherwise idle trn2.3xlarge:
+
+| Label | Workload | Dev | Elapsed | Covers |
+|---|---|---|---|---|
+| `basic_tensor_gemm_ops` | `basic/tensor_gemm_ops` (all) | 0 | 4,939 s | [gemm](#eager-runtime-full-sweep) — 856 cases, the longest single-core run |
+| `basic_vector_linear_ops` | `basic/vector_linear_ops` (all) | 0 | not recorded | [memory-bound](#memory-bound-ops) |
+| `basic_vector_activation_ops` | `basic/vector_activation_ops` (all) | 0 | not recorded | " |
+| `basic_vector_sfu_ops` | `basic/vector_sfu_ops` (all) | 0 | not recorded | " |
+| `basic_vector_norm_ops` | `basic/vector_norm_ops` (all) | 0 | 413 s | " |
+| `basic_vector_reduction_ops` | `basic/vector_reduction_ops` (all) | 0 | 591 s | " |
+| `basic_index_ok` | `basic/vector_index_ops`, `embedding,index_select,index_add` | 0 | not recorded | the three index ops that are fine |
+| `basic_index_slow` | same dir, `gather,scatter` | 0 | **killed at 1,240 s** | [the two that are not](#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity). Expect a kill; results come back with `recover_from_log.py` |
+| `single_gemm_ops` | `llm/single_test_ops/gemm_ops.json` | 0 | 182 s | `moe_gating_gemm` (48% MFU), `quant_matmul`, `moe_quant_group_gemm` |
+| `single_fa_linear_ops` | `llm/single_test_ops/fa_linear_ops.json` | 0 | **killed at 784 s** | [attention](#eager-runtime) — prefill, decode, GQA. `run_new_workloads.sh` gives it 21,600 s instead of 5,400 for this reason |
+| `single_fa_ops` | `llm/single_test_ops/fa_ops.json` | 0 | 15 s | **0 cases** — paged, and no Neuron provider takes a block table |
+| `single_pre_fa_ops` | `llm/single_test_ops/pre_fa_ops.json` | 0 | 177 s | `rotary_embedding`; `store_kv_cache` runs 0 cases |
+| `single_moe_dispatch_ops` | `llm/single_test_ops/moe_dispatch_ops.json` | 0 | 32 s | `moe_scatter_dynamic_quant` |
+| `single_moe_combine_ops` | `llm/single_test_ops/moe_combine_ops.json` | 0 | 61 s | `moe_gather` |
+| `single_norm_ops` | `llm/single_test_ops/norm_ops.json` | 0 | 873 s | [norm/activation/MoE](#the-_dynamic_quant-family-is-90-180x-off-and-it-is-one-shared-helper) |
+| `single_activation_ops` | `llm/single_test_ops/activation_ops.json` | 0 | 312 s | " |
+| `single_moe_gating_ops` | `llm/single_test_ops/moe_gating_ops.json` | 0 | 123 s | " — and 9.7x faster than the same file on an H100 (1,191 s) |
+| `single_quant_ops` | `llm/single_test_ops/quant_ops.json` | 0 | 172 s | " |
+| `quant_matmul` | `llm/vendor_test/quant_matmul.json` | 0 | **killed at 1,988 s** | 85 of 184 cases; recover from the log |
+| `moe_quant_group_gemm` | `llm/vendor_test/moe_quant_group_gemm.json` | 0 | **killed at 565 s** | 15 of 276 — [~16 min of wall clock per 2.7 s measurement](#most-workloadsllm-cases-do-not-run) |
+| `fa_vendor_test` | `llm/vendor_test/flash_attention.json` | 0 | 16 s | **0 cases** |
+| `demo_quant_matmul` | `llm/vendor_test_demo/quant_matmul.json` | 0 | 41 s | the small versions of the three above |
+| `demo_moe_quant_group_gemm` | `llm/vendor_test_demo/moe_quant_group_gemm.json` | 0 | 38 s | " |
+| `demo_flash_attention` | `llm/vendor_test_demo/flash_attention.json` | 0 | 17 s | " (0 cases) |
+| `xccl4` | capped copies of `xccl_ops/` | 0,1,2,3 | 762 s | the 4 collectives plus `device2host`/`host2device`. Needs `XPU_PERF_ENGINES=XCCLEngine`, which the script sets |
+| `d2d` | capped `xccl_ops/device2device.json` | 0,1 | 142 s | `device2device`, 648.7 GB/s |
+| `chip4_gemm` | `basic/tensor_gemm_ops` (all) | 0,1,2,3 | 1,480 s | whether "x4" is real |
+| `chip4_mem` | `basic/vector_linear_ops` (all) | 0,1,2,3 | 187 s | " |
+
+"not recorded" means that label ran under an earlier version of the script that did
+not print an elapsed line, not that it failed. **A kill is not a failure either**:
+micro_perf writes its CSVs only when a launch finishes, but every case is printed as
+it completes, so `recover_from_log.py <log> <outdir>` rebuilds the reports — several
+of the published numbers came through that path. Whether a 137 was the watchdog or a
+hand kill to free the chip is not recoverable from the log, so treat these elapsed
+figures as "how long it ran", not "how long it needs".
+
+`run_new_workloads.sh` has 12 labels of its own, 9 of them single-core, and takes
+the same `LIST`/`ONLY`. The two overlap deliberately: `single_norm_ops`,
+`single_activation_ops`, `single_moe_gating_ops`, `single_quant_ops` and
+`single_fa_linear_ops` appear in both, with a larger budget in the newer script.
+`core1_gemm` there is `basic_tensor_gemm_ops` under a different name, paired with
+`chip4_gemm` so `analyze_scaling.py` can join them.
+
+The GPU side is label-for-label the same idea and much cheaper — 13 labels, all
+single-GPU, 42 minutes end to end. See
+[GPU/README.md, Reproduce one row at a time](../GPU/README.md#reproduce-one-row-at-a-time);
+two labels are spelled differently there (`gemm` for `basic_tensor_gemm_ops`, and
+one `basic_vector_index_ops` instead of the `basic_index_ok`/`basic_index_slow`
+split, which exists here only because `gather`/`scatter` need their own watchdog).
+
 ## Reproducing the full sweep
 
 `tools/` holds what produced the eager full-sweep numbers. `launch.py --task all`

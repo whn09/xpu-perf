@@ -16,13 +16,17 @@
 #     workloads/basic/tensor_gemm_ops/gemm.json;
 #   * tensor_gemm_ops and vector_linear_ops on all four logical cores at once.
 #
-# ONLY=<space-separated labels> restricts the run to a subset, which is what you
-# want most of the time after the first pass -- re-running one file because its op
-# changed should not mean sitting through gemm's 856 cases again. Labels are the
-# first argument to run_one, e.g.
+# ONLY=<labels> restricts the run to a subset, which is what you want most of the
+# time after the first pass -- re-running one file because its op changed should not
+# mean sitting through gemm's 856 cases again. Labels are the first argument to
+# run_one; either separator works, matching run_full_sweep.sh:
 #
 #   ONLY="chip4_gemm chip4_mem" ./run_new_workloads.sh
-#   ONLY="single_norm_ops single_quant_ops" ./run_new_workloads.sh
+#   ONLY=single_norm_ops,single_quant_ops ./run_new_workloads.sh
+#   LIST=1 ./run_new_workloads.sh     # print every label and its launch arguments
+#                                     # to the terminal; touches no device
+#
+# See ../README.md, "Reproduce one row at a time".
 set -u
 
 IMAGE=${IMAGE:-xpu-perf-eager:latest}
@@ -32,11 +36,15 @@ RESULTS=${RESULTS:-/tmp/new_results}
 DOCKER=${DOCKER:-sudo docker}
 WAIT_BUDGET_S=${WAIT_BUDGET_S:-1800}
 ONLY=${ONLY:-}
+LIST=${LIST:-}
 TOOLS=$(cd "$(dirname "$0")" && pwd)
 
-mkdir -p "$RESULTS"
-exec >>"$LOG" 2>&1
-echo "=============== new-workload sweep started $(date -Is) ==============="
+# LIST writes to the terminal, not the log: its whole purpose is to be read now.
+if [ -z "$LIST" ]; then
+    mkdir -p "$RESULTS"
+    exec >>"$LOG" 2>&1
+    echo "=============== new-workload sweep started $(date -Is) ==============="
+fi
 
 NOISE="NRT:nrta_tensor|_warn_trace_cache_once|NKI_ENABLE_TRACE_CACHE|^\\\\_NEFF"
 
@@ -96,13 +104,21 @@ run_one() {
     local tmo="$1"; shift
     local dev="$1"; shift
     local env_prefix="$1"; shift
+    if [ -n "$LIST" ]; then
+        printf '%-26s dev=%-8s budget=%-7s %s\n' \
+            "$label" "$dev" "${tmo}s" "$*"
+        return 0
+    fi
     [ "$env_prefix" = "-" ] && env_prefix=""
     local cname="xpu_new_$label"
     local start rc runpid wdpid
-    # Word-boundary match, so ONLY="single_norm_ops" does not also select
-    # single_norm_ops_something later.
-    if [ -n "$ONLY" ] && ! printf ' %s ' "$ONLY" | grep -q " $label "; then
-        return 0
+    # Whole-word match on either separator, so ONLY=single_norm_ops does not also
+    # select single_norm_ops_something later.
+    if [ -n "$ONLY" ]; then
+        case " ${ONLY//,/ } " in
+            *" $label "*) ;;
+            *) return 0;;
+        esac
     fi
     start=$(date +%s)
     echo ""
@@ -181,6 +197,8 @@ run_one chip4_reduction 5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
 run_one chip4_moe       5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
     --workload "$W/llm/single_test_ops/moe_gating_ops.json"
 
-echo ""
-echo "=============== new-workload sweep finished $(date -Is) ==============="
-echo "Now: python3 $TOOLS/analyze_sweep.py $LOG"
+if [ -z "$LIST" ]; then
+    echo ""
+    echo "=============== new-workload sweep finished $(date -Is) ==============="
+    echo "Now: python3 $TOOLS/analyze_sweep.py $LOG"
+fi

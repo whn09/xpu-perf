@@ -14,12 +14,17 @@
 #   * --task all over a whole directory. Independent per-file launches mean one
 #     op wedging the machine costs one file's report, not the sweep's.
 #
-# TODO -- these have Neuron numbers, are NOT hardware-blocked on a p5.4xlarge, and
-# are missing only because nobody has run them. See GPU/README.md, "What this table
-# does not cover yet", for what each one would settle:
+# Also not here: workloads/xccl_ops/{device2host,host2device}.json. These look
+# runnable on one GPU -- both files list a world_size 1 case -- and are not. Both
+# ops live on XCCLEngine, and perf_engine.py:173 skips that engine when
+# `len(device_ids) * node_world_size <= 1`, so a one-GPU launch writes
+# `note: engine_not_started` for every case and exits 0. XPU_PERF_ENGINES=XCCLEngine
+# does not override it; the env filter runs before that guard, not instead of it.
 #
-#   * workloads/xccl_ops/{device2host,host2device}.json -- single-device host
-#     copies, so they run here as-is. Cheapest item on the list.
+# TODO -- these three have Neuron numbers, are NOT blocked on a p5.4xlarge, and are
+# missing only because nobody has run them. See GPU/README.md, "What this table does
+# not cover yet", for what each one would settle:
+#
 #   * workloads/llm/single_test_ops/gemm_ops.json -- moe_gating_gemm (48% MFU on
 #     Neuron and no GPU control), quant_matmul, moe_quant_group_gemm.
 #   * workloads/llm/single_test_ops/moe_dispatch_ops.json -- moe_scatter_dynamic_quant,
@@ -29,9 +34,9 @@
 #     on Neuron, 68x off index_select on the same chip) and
 #     moe_quant_group_gemm_combine.
 #
-# Adding them is four more run_one lines; they are left out rather than added
-# untested so that this script stays a description of what the published numbers
-# were actually taken with.
+# They have labels in section 5 below, reachable only by naming them with ONLY, so
+# that a default run stays a description of what the published numbers were actually
+# taken with.
 #
 # Read the results with the same analyzer as the Neuron side:
 #   python3 vendor_ops/NEURON/tools/analyze_sweep.py <log>
@@ -57,6 +62,17 @@
 # Usage:
 #   RESULTS=/tmp/gpu_results ./run_comparison_sweep.sh 2>&1 | tee /tmp/gpu_sweep.log
 #   MODE=docker RESULTS=/tmp/gpu_results ./run_comparison_sweep.sh 2>&1 | tee ...
+#
+# One row at a time, which is what checking a single README figure needs:
+#
+#   LIST=1 ./run_comparison_sweep.sh          # print every label; runs nothing
+#   ONLY=gemm ./run_comparison_sweep.sh       # run just that label
+#   ONLY=gemm,single_fa_linear_ops ...        # or several; a space-separated
+#                                             # "gemm single_fa_linear_ops" also works
+#
+# The log and $RESULTS layout are unchanged under ONLY, so the Neuron side's
+# analyze_sweep.py works on a one-label log exactly as on a full one. Every label
+# here is single-GPU; see ../README.md, "Reproduce one row at a time".
 
 set -u
 
@@ -68,15 +84,35 @@ IMAGE=${IMAGE:-xpu-perf-cuda:latest}
 REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)}
 RESULTS=${RESULTS:-/tmp/gpu_results}
 DEVICE=${DEVICE:-0}
+ONLY=${ONLY:-}
+LIST=${LIST:-}
+# Passed to `env` verbatim, so `EXTRA_ENV="A=1 B=2"` -- an escape hatch for one-off
+# reruns (e.g. XPU_PERF_ENGINES=, TORCH_LOGS=) without editing this file.
+EXTRA_ENV=${EXTRA_ENV:-}
 
-mkdir -p "$RESULTS"
+[ -z "$LIST" ] && mkdir -p "$RESULTS"
 
 W=workloads
+
+# ONLY=<label>[,<label>...] or ONLY="<label> <label>". Both separators work: this
+# script and run_new_workloads.sh would otherwise disagree on the delimiter, which
+# is a trap worth spending one substitution on. The match is on a whole delimited
+# word, so ONLY=gemm cannot also select single_gemm_ops.
+want() {
+    [ -z "$ONLY" ] && return 0
+    case " ${ONLY//,/ } " in *" $1 "*) return 0;; esac
+    return 1
+}
 
 # run_one <label> <timeout_s> <launch-args...>
 run_one() {
     local label="$1" tmo="$2"; shift 2
     local start rc
+    if [ -n "$LIST" ]; then
+        printf '%-24s budget=%-7s %s\n' "$label" "${tmo}s" "$*"
+        return 0
+    fi
+    want "$label" || return 0
     start=$(date +%s)
 
     echo "########## RUN $label   tmo=${tmo}s   dev=$DEVICE   mode=$MODE   $(date -Is)"
@@ -84,7 +120,8 @@ run_one() {
     if [ "$MODE" = host ]; then
         ( cd "$REPO/projects/micro_perf" \
           && PYTHONPATH="$EXTRA_PYTHONPATH:$REPO/src" CUDA_VISIBLE_DEVICES="$DEVICE" \
-             timeout "$tmo" "$PYTHON" -u launch.py --backend GPU --device 0 \
+             env $EXTRA_ENV timeout "$tmo" "$PYTHON" -u launch.py \
+                 --backend GPU --device 0 \
                  --report_dir "$RESULTS/$label" "$@" 2>&1 )
         rc=$?
         # 124 is the shell convention for "timeout fired", worth distinguishing
@@ -103,7 +140,7 @@ run_one() {
             -w /xpu-perf/projects/micro_perf \
             -e PYTHONPATH=/xpu-perf/src \
             "$IMAGE" \
-            env python -u launch.py --backend GPU --device "$DEVICE" \
+            env $EXTRA_ENV python -u launch.py --backend GPU --device "$DEVICE" \
                 --report_dir "/results/$label" "$@" >/dev/null
 
         # A `timeout docker run` would signal the client, not the container,
@@ -163,5 +200,27 @@ done
 run_one single_fa_linear_ops 10800 --workload $W/llm/single_test_ops/fa_linear_ops.json
 run_one single_fa_ops        10800 --workload $W/llm/single_test_ops/fa_ops.json
 
-echo ""
-echo "=============== GPU comparison sweep finished $(date -Is) ==============="
+# 5. Not part of the published sweep, and skipped unless named with ONLY.
+#
+#    These are the files with a Trainium2 number and no GPU column that are NOT
+#    hardware-blocked on a one-GPU box -- see GPU/README.md, "What this table does
+#    not cover yet", for what each would settle. They exist as labels so that
+#    `ONLY=single_gemm_ops ...` just works, and are gated so a default run remains
+#    a description of what the published numbers were actually taken with.
+#
+#
+#    single_pre_fa_ops is in this block for a different reason: the published
+#    rotary_embedding row was measured by hand rather than through this script, so
+#    the file has a number but no reproducible label. Running it would also pick up
+#    store_kv_cache, which has no runnable case on any backend.
+if [ -n "$ONLY" ] || [ -n "$LIST" ]; then
+    run_one single_gemm_ops         5400 --workload $W/llm/single_test_ops/gemm_ops.json
+    run_one single_moe_dispatch_ops 5400 --workload $W/llm/single_test_ops/moe_dispatch_ops.json
+    run_one single_moe_combine_ops  5400 --workload $W/llm/single_test_ops/moe_combine_ops.json
+    run_one single_pre_fa_ops       5400 --workload $W/llm/single_test_ops/pre_fa_ops.json
+fi
+
+if [ -z "$LIST" ]; then
+    echo ""
+    echo "=============== GPU comparison sweep finished $(date -Is) ==============="
+fi

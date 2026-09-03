@@ -31,6 +31,19 @@
 # Results: $RESULTS/<label>/. Log: $LOG. Feed the log to analyze_sweep.py for the
 # per-run accounting, and to recover_from_log.py if a run was killed before it
 # could write its CSVs.
+#
+# You usually do not want the whole thing. Two knobs make it reproducible one row
+# at a time, which is what checking a single README figure needs:
+#
+#   LIST=1 ./run_full_sweep.sh              # print every label and its launch
+#                                           # arguments; touches no device
+#   ONLY=single_gemm_ops ./run_full_sweep.sh # run just that label
+#   ONLY=basic_index_ok,basic_index_slow ... # or several, comma-separated
+#
+# Under ONLY the log and $RESULTS layout are unchanged, so analyze_sweep.py works
+# on a one-label log exactly as on a full one. Every label except xccl4, d2d,
+# chip4_gemm and chip4_mem runs on a single logical NeuronCore (`--device 0`); see
+# ../README.md, "Reproduce one row at a time".
 set -u
 
 IMAGE=${IMAGE:-xpu-perf-eager:latest}
@@ -41,10 +54,25 @@ WS4=${WS4:-/tmp/xccl_ws4}                 # capped copies of workloads/xccl_ops
 DOCKER=${DOCKER:-sudo docker}
 WAIT_BUDGET_S=${WAIT_BUDGET_S:-1800}
 TOOLS=$(cd "$(dirname "$0")" && pwd)
+ONLY=${ONLY:-}
+LIST=${LIST:-}
 
-mkdir -p "$RESULTS"
-exec >>"$LOG" 2>&1
-echo "=============== sweep started $(date -Is) ==============="
+# LIST writes to the terminal, not the log: its whole purpose is to be read now.
+if [ -z "$LIST" ]; then
+    mkdir -p "$RESULTS"
+    exec >>"$LOG" 2>&1
+    echo "=============== sweep started $(date -Is) ==============="
+fi
+
+# ONLY=<label>[,<label>...] or ONLY="<label> <label>". Both separators work: this
+# script and run_new_workloads.sh would otherwise disagree on the delimiter, which
+# is a trap worth spending one substitution on. The match is on a whole delimited
+# word, so ONLY=gemm cannot also select single_gemm_ops.
+want() {
+    [ -z "$ONLY" ] && return 0
+    case " ${ONLY//,/ } " in *" $1 "*) return 0;; esac
+    return 1
+}
 
 # Noise filter: three lines per case, thousands of cases.
 NOISE="NRT:nrta_tensor|_warn_trace_cache_once|NKI_ENABLE_TRACE_CACHE|^\\\\_NEFF"
@@ -111,6 +139,12 @@ run_one() {
     local tmo="$1"; shift
     local dev="$1"; shift
     local env_prefix="$1"; shift
+    if [ -n "$LIST" ]; then
+        printf '%-26s dev=%-8s budget=%-7s %s\n' \
+            "$label" "$dev" "${tmo}s" "$*"
+        return 0
+    fi
+    want "$label" || return 0
     [ "$env_prefix" = "-" ] && env_prefix=""
     local cname="xpu_sweep_$label"
     local start rc runpid wdpid
@@ -144,7 +178,11 @@ run_one() {
 
 W=workloads
 
-python3 "$TOOLS/cap_xccl_workloads.py" $W/xccl_ops "$WS4" --world-size 4
+# The capped copies are cheap to make and xccl4/d2d cannot run without them, so
+# this runs for any ONLY selection -- but not for LIST, which must not write.
+if [ -z "$LIST" ]; then
+    python3 "$TOOLS/cap_xccl_workloads.py" $W/xccl_ops "$WS4" --world-size 4
+fi
 
 # 1. The quantized ops first: they are the slowest per case and the most often
 #    asked about, and burying them behind ~2000 basic cases means a wedge
@@ -215,6 +253,8 @@ run_one chip4_gemm 5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
 run_one chip4_mem  5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
     --task_dir $W/basic/vector_linear_ops --task all
 
-echo ""
-echo "=============== sweep finished $(date -Is) ==============="
-echo "Now: python3 $TOOLS/analyze_sweep.py $LOG"
+if [ -z "$LIST" ]; then
+    echo ""
+    echo "=============== sweep finished $(date -Is) ==============="
+    echo "Now: python3 $TOOLS/analyze_sweep.py $LOG"
+fi
