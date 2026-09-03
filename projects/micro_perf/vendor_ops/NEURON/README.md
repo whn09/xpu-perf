@@ -698,6 +698,73 @@ smallest shape in the tables above where arithmetic clearly dominates. The
 measurement behind this, and why `torch.compile` does not fix it, is in
 [IMPLEMENTATION.md](IMPLEMENTATION.md#eager-dispatch-costs-55-65-us-per-op-and-that-is-the-floor).
 
+### Sweep wall clock is not a performance comparison
+
+`basic/tensor_gemm_ops/gemm.json` takes ~4,200 s here and ~403 s on one H100.
+That 10x is **not** the chips, and it is not visible in any published number: it
+is a per-shape warm-up on the eager runtime that lands entirely outside the timed
+loop.
+
+`tools/probe_case_overhead.py` replays the real `Backend.perf()` with its phases
+instrumented. Per case, in ms, same three cases on both machines:
+
+| | tensors | copies | iters | latency | wall | create | sync | calib | sleep | timed |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Trn2 idx 0 | 64 M | 4 | 50 | 249 us | **3,223** | 145 | 1,386 | 1,479 | 200 | 14 |
+| Trn2 idx 122 | 86 M | 4 | 50 | 832 us | **3,445** | 159 | 1,368 | 1,674 | 200 | 44 |
+| Trn2 idx 489 | 188 M | 4 | 50 | 2,036 us | **6,535** | 1,533 | 1,444 | 3,252 | 200 | 107 |
+| H100 idx 0 | 64 M | 15 | 10 | 28 us | **253** | 99 | 0 | 52 | 100 | 1 |
+| H100 idx 122 | 86 M | 11 | 10 | 553 us | **263** | 123 | 0 | 29 | 100 | 7 |
+| H100 idx 489 | 188 M | 5 | 10 | 351 us | **671** | 485 | 0 | 79 | 100 | 4 |
+
+Mean per case: **5.25 s** here against **0.30 s** on the H100.
+
+**The whole gap is a first-touch cost, keyed per shape and cached in-process.**
+Repeat one case in the same process and it collapses:
+
+```
+idx 0   1st  wall 3,202   sync 1,367   calib 1,475
+idx 0   2nd  wall   294   sync     1.2 calib     1.5
+idx 0   3rd  wall   291   sync     1.1 calib     1.5
+idx 122 1st  wall 3,431   ...
+idx 0   4th  wall   293   <- another shape ran in between; still warm
+idx 122 2nd  wall   342   <- so the cache is per shape, not last-shape-wins
+```
+
+11x, split about evenly between the first `device_synchronize()` after
+`create_tensors` (~1.37 s, flat in tensor size) and the first executions of the op
+(1.47 s at 64 MiB, 3.25 s at 188 MiB). The same effect exists on CUDA — cuBLAS
+picking a kernel — and costs **52 ms**, three orders of magnitude less. With 856
+distinct shapes in `gemm.json` and no reuse, 2.9 s x 648 measured cases is ~1,900 s
+on its own, and weighting the larger shapes accounts for the rest of the 4,200 s.
+
+**It is not `neuronx-cc`**, despite looking exactly like the compile described
+under [A run that looks hung is usually
+compiling](#a-run-that-looks-hung-is-usually-compiling):
+
+* host CPU over the case loop is **8-17% of one core** (the H100 side is 87%).
+  A real `neuronx-cc` runs at ~199%. The host is blocked waiting, not compiling.
+* it does not survive the process. A fresh container pays 3,204 ms for the same
+  case, and mounting a volume at `/var/tmp` catches nothing written to disk.
+
+So it is the runtime preparing and loading a kernel per shape onto the core, held
+in process memory only.
+
+Two things it is *not*, both checked because they were the obvious suspects. The
+host-side tensor pipeline is the same on both machines — for a 128 MiB fp16 tensor,
+CPU fp32 `randn` 272 ms on trn2.3xlarge vs 347 ms on p5.4xlarge, H2D 19.9 ms vs
+20.8 ms (~12.5 GB/s both), on-device cast ~1 ms, `clone` <1 ms. And the policy
+difference between the two backends is real but small: `backend_neuron.py:595-597`
+gives each case a 1 s / 50-iteration timed loop where `core/backend.py:335-336`
+gives it 50 ms / 10 iterations, and `:651` sleeps 0.2 s per case against 0.1 s —
+together 1-6% of the wall clock here.
+
+The consequence for reading this document: latency and MFU rows are unaffected,
+because the timed loop is warm by the time it runs. Sweep durations, and the
+per-label elapsed times in [Reproduce one row at a
+time](#reproduce-one-row-at-a-time), are wall clock and mostly measure this
+warm-up. Do not divide one by the other.
+
 ### Most `workloads/llm/` cases do not run
 
 | Workload | Cases | Measured | Note |
@@ -1410,6 +1477,17 @@ sudo docker run --rm --privileged -v "$PWD":/w -w /w xpu-perf-eager:latest \
 #    decomposed at the shape the table publishes (~4 min, needs a few GB HBM).
 sudo docker run --rm --privileged -v "$PWD":/w -w /w xpu-perf-eager:latest \
     python3 vendor_ops/NEURON/tools/probe_inplace_write.py
+
+# 8. Where a case's wall clock goes, phase by phase (~1 min). Cross-backend:
+#    --backend GPU runs the same probe on an H100. Repeating a case index
+#    (--cases 0,0,0) is what shows the per-shape warm-up. See "Sweep wall clock
+#    is not a performance comparison". Unlike 6 and 7 this one imports xpu_perf,
+#    so it needs the repo root mounted, not just projects/micro_perf.
+sudo docker run --rm --device /dev/neuron0 -v "$(cd ../.. && pwd)":/xpu-perf \
+    -w /xpu-perf/projects/micro_perf -e PYTHONPATH=/xpu-perf/src \
+    -e NEURON_RT_VISIBLE_CORES=0 xpu-perf-eager:latest \
+    python3 -u vendor_ops/NEURON/tools/probe_case_overhead.py --backend NEURON \
+        --workload workloads/basic/tensor_gemm_ops/gemm.json --limit 8
 ```
 
 `IMAGE`, `REPO`, `LOG`, `RESULTS`, `DOCKER` and `WAIT_BUDGET_S` all come from the
@@ -1465,6 +1543,19 @@ broken vendor op — the check is a live `walrus_driver`, not elapsed time. Two
 practical consequences: give an FA sweep a per-case budget in hours rather than
 minutes, and warm each distinct shape once before timing anything you intend to
 publish.
+
+### A sweep is taking all day but nothing is hung
+
+Expected, and it is mostly not the ops. Every distinct tensor shape costs ~2.9 s
+of one-time warm-up on the eager runtime — cached in the process, not on disk — and
+a workload file with 856 distinct shapes pays it 856 times. Measured breakdown and
+the evidence that this is *not* `neuronx-cc` (8-17% host CPU, nothing written to
+disk) are under [Sweep wall clock is not a performance
+comparison](#sweep-wall-clock-is-not-a-performance-comparison).
+
+The distinguishing check against a real compile: a `neuronx-cc` or `walrus_driver`
+process at ~199% CPU means compiling; a python process at ~10% with the core
+allocated means warming up, and it will finish in seconds per case.
 
 ### `timeout docker run` does not bound anything
 

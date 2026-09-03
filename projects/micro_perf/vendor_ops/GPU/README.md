@@ -196,9 +196,23 @@ actually took on an idle p5.4xlarge, not the watchdog budgets in the script:
 | `single_fa_linear_ops` | `llm/single_test_ops/fa_linear_ops.json` | 15 s | [attention](#attention) — all 10 prefill/decode/GQA cases |
 | `single_fa_ops` | `llm/single_test_ops/fa_ops.json` | 9 s | paged attention. **Measures nothing under `MODE=host`** without `flash_attn`, and exits 0 |
 
-That is 2,496 s of device time in total — **the whole comparison sweep is 42
-minutes**, so reproducing all of it is usually cheaper than deciding which label
-you need. The Trainium2 side is most of a day; see
+That is 2,496 s in total — **the whole comparison sweep is 42 minutes**, so
+reproducing all of it is usually cheaper than deciding which label you need.
+
+These are wall clock, not device time: about **13%** of a case is spent executing
+the op and the rest is harness setup, measured in
+[How to compare these to the Trainium2 numbers](#how-to-compare-these-to-the-trainium2-numbers).
+So the `single_moe_gating_ops` row above being 9.7x *slower* here than on one
+NeuronCore says nothing about either chip: the two backends pay different
+per-case harness overheads, and 1,191 s / 56 cases = 21 s per case is two orders
+of magnitude above the ~1 ms latencies that file actually reports. The per-case
+comparison for that file is the `moe_softmax_topk` row in
+[Norm, activation and MoE ops](#norm-activation-and-moe-ops), and it points the
+other way — a 0.65x median shortfall, i.e. one NeuronCore is ahead of this H100
+at the median. Do not read any elapsed time in this table as a performance
+figure.
+
+The Trainium2 side is most of a day; see
 [NEURON/README.md, Reproduce one row at a time](../NEURON/README.md#reproduce-one-row-at-a-time)
 for its label list, and note that two labels are named differently there — `gemm`
 is `basic_tensor_gemm_ops`, and `basic_vector_index_ops` is split into
@@ -287,6 +301,33 @@ Two classes of exception, both noted where they appear:
 **Attention** is still not measured this way — the workload has no multi-core
 variant yet, so the 3.1x prefill gap keeps the "upper bound on Trainium, lower
 bound on the gap" caveat.
+
+**Sweep wall clock is not one of the comparable columns.** `gemm.json` finishes in
+403 s here and takes ~4,200 s on one logical NeuronCore, and that 10x says nothing
+about either chip. `../NEURON/tools/probe_case_overhead.py` runs on both backends
+and decomposes it: mean per case is **0.30 s here** against **5.25 s on Trainium**,
+and essentially all of the difference is a per-shape warm-up on the eager Neuron
+runtime that sits outside the timed loop (~2.9 s the first time a shape is seen,
+~2.6 ms every later time in the same process). The full breakdown and the evidence
+that it is not `neuronx-cc` are in
+[`../NEURON/README.md`](../NEURON/README.md#sweep-wall-clock-is-not-a-performance-comparison).
+
+The GPU half of that measurement is worth knowing on its own, because it explains
+what the 403 s is made of and none of it is the H100:
+
+| Phase | Mean per case | Share |
+|---|---|---|
+| `create` — CPU fp32 `randn`, then H2D, then an on-device cast | 157 ms | **53%** |
+| `sleep` — the fixed `time.sleep(0.1)` at `core/backend.py:367` | 100 ms | **34%** |
+| `calib` — the 4-execution calibration run, dominated by cuBLAS picking a kernel for a shape it has not seen (52 ms cold, 0.3 ms warm) | 35 ms | 12% |
+| `timed` — the run whose number is published | 3 ms | 1% |
+
+So the H100 sweep is host-CPU-bound (87% of one core) on generating random fp32
+tensors it immediately casts away — `core/utils.py:47` `float_creator`, reached via
+`OpTensorInfo`'s default `default_creator` rather than by an explicit `creator=`.
+For a 128 MiB fp16 operand that is 347 ms of `randn` against 20.8 ms of H2D and
+0.4 ms of cast. The Trainium host does the same work in the same time (272 ms /
+19.9 ms / 1.1 ms), so this is a harness cost, not a platform one.
 
 ## Attention
 

@@ -291,9 +291,39 @@ This changelog follows a Keep a Changelog style and semantic versioning.
   (`single_test_ops/{gemm_ops,moe_dispatch_ops,moe_combine_ops}.json`), plus
   `single_pre_fa_ops`. They are gated behind `ONLY`/`LIST` so a default run keeps
   describing what the published numbers were actually taken with.
+- `NEURON/tools/probe_case_overhead.py`: a cross-backend probe (`--backend
+  NEURON|GPU`) that replays the real `Backend.perf()` one case at a time with the
+  phases instrumented — construct / create / sync / calibration / sleep / timed —
+  and samples `resource.getrusage` over the case loop. Written to answer why a
+  workload file that takes minutes on an H100 takes tens of minutes on a
+  trn2.3xlarge, and it found the cause: **the eager Neuron runtime pays ~2.9 s the
+  first time it sees a tensor shape.** The same case repeated in one process costs
+  3,202 ms then 293 ms then 291 ms, and another shape running in between does not
+  evict it, so the cache is keyed per shape. It splits about evenly between the
+  first `device_synchronize()` after `create_tensors` and the first op executions.
+  It is *not* `neuronx-cc`: host CPU over the case loop is 8-17% of one core where
+  a real compile runs at ~199%, and it does not survive the process (a fresh
+  container pays 3,204 ms again, and a volume mounted at `/var/tmp` catches
+  nothing). `gemm.json`'s 856 shapes are all distinct, so at ~2.9 s each this is
+  most of that file's Trainium2 wall clock. **Reported latency and MFU are
+  unaffected** — the timed loop is warm by then. Two hypotheses it also falsifies:
+  the host-side tensor pipeline is not the difference (for a 128 MiB fp16 tensor,
+  CPU `randn` is 272 ms on trn2.3xlarge against 347 ms on p5.4xlarge, and H2D is
+  19.9 vs 20.8 ms, ~12.5 GB/s on both), and the backends' differing `perf()`
+  policies (1 s / 50 iters vs 50 ms / 10 iters) are worth 1-6%, not 10x. Written
+  up in `NEURON/README.md` under "Sweep wall clock is not a performance
+  comparison", with a troubleshooting entry for the case where a sweep looks hung.
 
 ### Fixed
 
+- `GPU/README.md`: the `Reproduce one row at a time` table called its 2,496 s total
+  "device time". It is wall clock, and the probe above measures device execution at
+  about 13% of a case on this backend (52.6% goes to `create_tensors`, 33.6% to the
+  `time.sleep(0.1)` between calibration and measurement). The same paragraph
+  claimed every latency in `moe_gating_ops.json` was faster on the H100, which the
+  `moe_softmax_topk` row it links to contradicts: a 0.65x median shortfall, i.e.
+  one NeuronCore is ahead at the median even though the file's wall clock is 9.7x
+  longer here. Elapsed sweep times are now marked as not comparable on both sides.
 - `GPU/README.md`: corrected the claim that `xccl_ops/{device2host,host2device}.json`
   run on a one-GPU box as-is. Both files do list a `world_size: 1` case, which is
   what the claim rested on, but both ops are registered on `XCCLEngine`
