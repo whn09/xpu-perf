@@ -97,6 +97,24 @@ This changelog follows semantic versioning and Keep a Changelog style.
 
 ### Changed
 
+- `projects/micro_perf/vendor_ops/GPU/README.md`: **the Summary table now has an
+  `attention decode` row, and the bimodality claim above it is corrected.** Decode
+  was the one workload with a measured Trainium2 number and no line in the table
+  everybody reads first; it is **1.9-3.2x per chip** with the better of the two
+  providers at each shape, 1.6-2.7x of that software against a 1.16x bandwidth bar.
+  Two claims did not survive it. The table said "nothing here lands between 1.4x and
+  3.1x", offered as evidence that the gap is bimodal — decode lands in the middle of
+  that band, and the band was an artifact of decode never having been measured on an
+  aligned workload, so the split is now stated as a gradient with the surviving
+  claim (nothing in the far group is explained by peak FLOPS or peak bandwidth)
+  separated from the retracted one. And decode's software residual was described as
+  "much smaller than the prefill row's 2.1x"; it straddles it (ahead at kv_len 4,096,
+  behind at 8,192), so the honest distinction is the *sign of the curve* rather than
+  the midpoint — prefill's residual grows with the problem size and decode's stops
+  once the right provider is used. The cross-chip decode block is also now a
+  `###` subsection so the summary row can link to it, and it carries the SDPA-only
+  per-chip series (1.86x to 11.13x) that the "provider-dependent" range refers to.
+
 - `projects/micro_perf/vendor_ops/GPU/README.md`,
   `projects/micro_perf/vendor_ops/GPU/tools/run_comparison_sweep.sh`,
   `projects/micro_perf/vendor_ops/GPU/ops/torch/flash_attention.py`,

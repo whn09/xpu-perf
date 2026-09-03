@@ -1,6 +1,7 @@
 # GPU backend — reference numbers, and a Trainium2 comparison
 
-Measured on a **p5.4xlarge** (1x H100 SXM5 80GB HBM3), 2026-09-02, against the
+Measured on a **p5.4xlarge** (1x H100 SXM5 80GB HBM3), 2026-09-02 and 09-03,
+against the
 same workload files and the same provider code as the Trainium2 numbers in
 [`../NEURON/README.md`](../NEURON/README.md), so the two are comparable case for
 case.
@@ -8,9 +9,10 @@ case.
 ## Summary
 
 Normalised **per chip** — one H100 against one Trainium2, not against the quarter
-of one that a logical NeuronCore is — the gap is not one number, it is three very
-different ones. This first table is the **measured** set; it is not the whole
-workload tree, and what is missing is listed with the reason
+of one that a logical NeuronCore is — the gap is not one number. It spans **0.27x
+to 621x**, and which end a workload lands on is decided by whether a kernel exists
+for it, not by the hardware. This first table is the **measured** set; it is not
+the whole workload tree, and what is missing is listed with the reason
 [below](#what-this-table-does-not-cover-yet):
 
 | Workload | H100 / Trainium2, per chip | What that is |
@@ -19,6 +21,7 @@ workload tree, and what is missing is listed with the reason
 | elementwise / reductions | **~1.4x** | parity: 12 of 24 ops within 0.93-1.15x of the H100's %-of-own-peak |
 | head/QK norms, `swiglu` | **0.35-1.26x** | Trainium2 *ahead* on 6 of 8 rows |
 | attention prefill | **3.1x** | ~1.5x silicon, ~2.1x software — and the software is `nkilib`'s `attention_cte`, confirmed by identity, so there is no better kernel to reach for |
+| attention decode | **1.9-3.2x** | 1.6-2.7x software on a 1.16x bandwidth bar, straddling prefill's 2.1x. The one row that is *provider-dependent*: SDPA alone gives **1.9-11.1x**, worsening with cache length, and `attention_tkg` is what flattens it ([table](#cross-chip-decode-on-the-aligned-workload)) |
 | `gelu`, `sin`/`cos`, `reduce_max` | **3.5-7.7x** | single-op lowering gaps, each with a fast sibling op |
 | the 7 quantised ops | **3.8-38x** | on top of a shared unfused helper that costs the H100 3-14x too |
 | `gemm` at fp8 | **~99x** as published, **~1.56x** measured | the published row is the eager path in an `e4m3fn` this chip cannot multiply (OCP fp8 matmul starts at Trn3); compiled, in `e5m2`, it reaches 75.6% of its fp8 peak at 4096³ and 86.8% at the best shape measured |
@@ -27,14 +30,28 @@ workload tree, and what is missing is listed with the reason
 | `gemm` at fp32 | **0.32x** | Trainium2 3.09x ahead; the nominal bar favours it 2.70x |
 | `rotary_embedding` | **1.15x** | exactly the memory-bound bar — both backends get 5.9% of their own peak, so the missing 94% is the op def |
 
-So the headline is that **Trainium2's silicon is fine and the gap is bimodal in
-its software.** Nothing here lands between 1.4x and 3.1x, and nothing between
-7.7x and 99x: ops are either at parity or off by one to three orders of
-magnitude, which is the signature of missing kernels rather than slow hardware.
+So the headline is that **Trainium2's silicon is fine and essentially all of the
+gap is in its software.** The twelve rows fall into two groups: eight of them land
+within ~3x of whichever nominal bar applies (0.27-3.2x — both attention modes are
+in this group), and four are one to three orders of magnitude off it (3.5x to
+621x), which is the signature of a missing or wrong kernel rather than slow
+hardware. The fp8 row belongs to the first group once it is compiled in a dtype
+the chip can actually multiply (1.56x) and to the second only as the sweep
+currently publishes it (99x).
+
+Earlier revisions of this table put the split at a sharp empty band — "nothing
+between 1.4x and 3.1x" — and that band was an artifact of decode never having been
+measured on an aligned workload. It now sits at **1.9-3.2x**, in the middle of it,
+so the boundary is a gradient rather than a gap. The claim that survives is the
+weaker and more useful one: **nothing in the second group is explained by peak
+FLOPS or peak bandwidth**, and every row in it has a named cause — an int64 index,
+an absent kernel, an unfused helper, a dtype the Tensor Engine cannot take.
+
 On bf16 gemm it delivers 90% of its own peak against the H100's 82% and lands
 within 1.35x per chip — [and the four-core run confirms that x4 is
-real](#how-to-compare-these-to-the-trainium2-numbers). On attention it delivers
-32% against the H100's 69% — and that 32% is *already* a fused NKI flash kernel,
+real](#how-to-compare-these-to-the-trainium2-numbers). On attention **prefill** it
+delivers
+32% MFU against the H100's 69% — and that 32% is *already* a fused NKI flash kernel,
 [measured by turning it off](#attention), so the remaining 2.1x is kernel quality
 rather than an absent kernel. On fp8 the published row is not a hardware
 number on either count: it is the eager path, in an `e4m3fn` that Trainium2's
@@ -77,17 +94,31 @@ that was wrong, since `cos` and `sin` are precomputed outside the timed region �
 see [the NEURON README](../NEURON/README.md#rotary_embedding-is-not-a-neuron-result-at-all)
 for the decomposition.
 
-Memory-bound attention still tells the original story, but the Trainium side of it
-has moved. During decode the H100 reads its KV cache at 80-86% of HBM peak. The
-Trainium column above (15-33% of its own) is the `torch`/SDPA provider, and SDPA
-cannot reach a fused kernel at `q_len == 1`. A second provider that can —
-`ops/nkilib/flash_attention.py`, calling `nkilib`'s `attention_tkg` — was added
-2026-09-03 and reaches **42%**, with the crossover between the two providers landing
-between kv_len 4,096 and 8,192: at 16,384 it is **4.09x** SDPA, at 4,096 it is
-0.55x. Trainium2 decode is therefore no longer *degrading* with cache length, which
-was the shape of the original finding.
+The decode row is the one that moved most, and it moved because of a provider
+rather than a chip, which is why it is worth stating what changed. During decode the
+H100 reads its KV cache at 80-86% of HBM peak. The Trainium figure published in the
+[attention section](#attention) below — **15-33%** of its own — is the
+`torch`/SDPA provider, and SDPA cannot reach a fused kernel at `q_len == 1`: the
+torch_neuronx rewrite gate wants `L % 512 == 0` and `B*H <= 512`, and a decode step
+offers `L == 1` with `B*H` of 1280-5120. So that path builds a score matrix per
+step and its bandwidth *falls* as the cache grows. A second provider that does have
+a kernel — `ops/nkilib/flash_attention.py`, calling `nkilib`'s `attention_tkg` — was
+added 2026-09-03 and reaches **42%**, rising with cache length instead of falling.
+The two cross between kv_len 4,096 and 8,192: at 16,384 `attention_tkg` is **4.09x**
+SDPA, at 4,096 it is **0.55x**, so both stay registered and the right answer depends
+on the context length being served. What this changes about the comparison is the
+*sign of the curve*, not just a constant: Trainium2 decode no longer degrades with
+cache length, which was the shape of the original finding.
 
-**The cross-chip decode ratio, on the aligned workload.** `attention_tkg` requires
+Every number in this file carries the unit caveats in
+[How to compare](#how-to-compare-these-to-the-trainium2-numbers). Read them before
+quoting anything.
+
+### Cross-chip decode, on the aligned workload
+
+This is the newest row in the table above and the only one where both backends ran
+the *same* file through the *same* provider code on the same day, so it is worth
+seeing case by case rather than as a range. `attention_tkg` requires
 `kv_len % 128 == 0`, so its numbers come from
 `../NEURON/workloads/fa_decode_tkg.json` rather than from the published
 `fa_linear_ops.json`. Both backends have now run that file, so the two columns below
@@ -103,10 +134,18 @@ wins at that shape, since both stay registered:
 | 64 | 4,096 | 368.4 us | 2,921.9 | 87.2% | SDPA | 3,239.1 us | 332.3 | **45.8%** | 8.79x | **2.20x** |
 | 64 | 10,240 | 924.5 us | 2,906.4 | 86.8% | `attention_tkg` | 8,748.5 us | 307.1 | 42.4% | 9.46x | **2.37x** |
 
+The same six cases with **SDPA only** — what this ratio was before 2026-09-03 — come
+out at **1.86x, 4.92x, 6.75x, 11.13x, 2.20x, 3.10x** per chip in the row order
+above. That series is why the summary row quotes a provider-dependent range rather
+than a single number: the choice of provider is worth up to 4.1x here, more than any
+hardware difference in this comparison.
+
 **Decode is 1.9-3.2x per chip on a 1.16x nominal bandwidth bar** (3.35 TB/s against
-4 x 725 GB/s), so 1.6-2.7x of it is still software — a much smaller residual than the
-prefill row's 2.1x, and unlike prefill it shrinks rather than grows with the problem
-size once the right provider is used. The H100's own curve is the flat one here: it
+4 x 725 GB/s), so 1.6-2.7x of it is still software. That straddles the prefill row's
+2.1x rather than beating it — decode is ahead at 4,096 and behind at 8,192 — but it
+differs from prefill in a way that matters more than the midpoint: once the right
+provider is used the residual **stops growing with the problem size**, which is what
+the SDPA-only column could not say. The H100's own curve is the flat one here: it
 sits at 69-91% of HBM peak everywhere and has essentially nothing left to win, which
 is why the whole cross-chip movement in this row comes from the Trainium side.
 
@@ -118,10 +157,6 @@ single logical core; that multiplication is
 [measured for memory-bound work](#how-to-compare-these-to-the-trainium2-numbers) at
 1.00-1.02x, but not for this op specifically. The Trainium-side provider analysis is
 in [the NEURON README](../NEURON/README.md#decode-the-nkilib-provider-attention_tkg).
-
-Every number below carries the unit caveats in
-[How to compare](#how-to-compare-these-to-the-trainium2-numbers). Read them before
-quoting anything.
 
 ### What this table does not cover yet
 
