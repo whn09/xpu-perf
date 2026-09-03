@@ -465,7 +465,10 @@ and `moe_softmax_topk` float32 only. Four things worth reading out of that table
 2026-09-02, same instance and image, `single_test_ops/fa_linear_ops.json` through
 the eager `torch` (SDPA) provider. Nine of the file's ten cases; the tenth is
 `q_len: 4` speculative decode, which this provider rejects on purpose (see
-[Known unsupported](#known-unsupported)). All bf16, `head_dim` 128.
+[Known unsupported](#known-unsupported)) and which the `nkilib` provider added a
+day later does cover — see
+[Decode: the `nkilib` provider](#decode-the-nkilib-provider-attention_tkg), which
+supersedes the decode rows below. All bf16, `head_dim` 128.
 
 | Mode | q/kv heads | Batch | cache_len | q_len | Latency | TFLOPS | MFU | mem_bw |
 |---|---|---|---|---|---|---|---|---|
@@ -566,12 +569,73 @@ attention), not faster paths for this one. Reproduce with
 
 Every decode row fails that gate twice over and always will: `q_len == 1` can never
 satisfy `L % 512 == 0`, and their `B*H` is 1280 and 5120 against a limit of 512.
-That is what the 15-33% of bandwidth reflects. The named fix is
-`nkilib`'s `attention_tkg` (token-generation attention), which is installed in the
-beta images and would be wired as a second provider rather than a change to this
-one — see [What would close these gaps](#what-would-close-these-gaps).
+That is what the 15-33% of bandwidth reflects.
 
-For the same nine cases measured on an H100 with the same provider code, see
+##### Decode: the `nkilib` provider (`attention_tkg`)
+
+The fix is `nkilib`'s `attention_tkg` (token-generation attention), and as of
+2026-09-03 it is wired up as a second provider — `ops/nkilib/flash_attention.py`,
+provider name `nkilib`. It needs `kv_len % 128 == 0`, which none of
+`fa_linear_ops.json`'s decode rows satisfy (`cache_len 4096` + `q_len 1` = 4097), so
+it ships with `workloads/fa_decode_tkg.json`: the same rows one token shorter, plus
+8,192 and 16,384 to locate the crossover. **Both providers run that file**, so this
+is one launch and an exact comparison:
+
+```bash
+sudo docker run --rm --privileged -v $HOME/xpu-perf:/xpu-perf \
+  -w /xpu-perf/projects/micro_perf -e PYTHONPATH=/xpu-perf/src \
+  xpu-perf-beta4:latest python launch.py --backend NEURON --device 0 \
+  --report_dir /results --workload vendor_ops/NEURON/workloads/fa_decode_tkg.json
+```
+
+2026-09-03, Trn2, one logical core pair, 80/8/128 GQA, all bf16:
+
+| Batch | kv_len | q_len | `torch` (SDPA) | `nkilib` (`attention_tkg`) | Speedup |
+|---|---|---|---|---|---|
+| 16 | 4,096 | 1 | 866.6 us / 310.5 GB/s | 1,580.1 us / 170.3 GB/s | 0.55x |
+| 16 | 8,192 | 1 | 3,764.2 us / 142.8 GB/s | 2,411.4 us / 222.9 GB/s | **1.56x** |
+| 16 | 10,240 | 1 | 6,801.3 us / 98.8 GB/s | 2,769.0 us / 242.6 GB/s | **2.46x** |
+| 16 | 16,384 | 1 | 15,726.4 us / 68.3 GB/s | 3,841.2 us / 279.7 GB/s | **4.09x** |
+| 64 | 4,096 | 1 | 3,239.1 us / 332.3 GB/s | 3,792.3 us / 283.8 GB/s | 0.85x |
+| 64 | 10,240 | 1 | 11,467.9 us / 234.3 GB/s | 8,748.5 us / 307.1 GB/s | **1.31x** |
+| 16 | 10,240 | 4 | rejected | 3,881.1 us / 173.6 GB/s | new coverage |
+
+- **Neither provider wins everywhere, so keep both.** SDPA's bandwidth *falls* with
+  context length (310.5 -> 68.3 GB/s) because the unfused path builds a score matrix
+  per step; `attention_tkg`'s *rises* (170.3 -> 279.7 GB/s) as its fixed per-batch
+  cost amortises. They cross between 4,096 and 8,192. At 4,096 SDPA is genuinely the
+  better choice, at 16,384 it is 4x worse. `--task`/provider selection is how you
+  pick, and the answer depends on the context length you actually serve.
+- **This is what the "15-33% of bandwidth" gap was.** The best decode row is now
+  307.1 GB/s = 42% of ~725 GB/s, up from 238.7. It is still not `index_select`'s
+  631 GB/s, so there is more left, but the shape of the curve has changed sign:
+  bandwidth no longer degrades with cache length.
+- **`q_len 4` speculative decode is newly measurable.** The SDPA provider turns it
+  away because `is_causal=True` aligns the mask to the top-left of a non-square
+  score matrix and would silently attend to the wrong keys; the `nkilib` provider
+  builds the active mask explicitly (`active_mask[k, b, h, s] == 1` iff `k <= s`),
+  so the tenth case of the published file finally has a number.
+- **`attention_tkg` needs a *paged* prior to be worth anything.** With a flat
+  `[bs, 1, s_prior, d]` prior it is 4-8x slower than with pages and loses to SDPA at
+  every length measured (0.11-0.48x). The provider therefore always reinterprets the
+  linear cache as pages. `block_len` itself barely matters — the kernel's own
+  `resize_cache_block_len_for_attention_tkg_kernel` overrides the caller and reduces
+  128 to 16 at kv_len 10,240, and all of 128/64/32/16 land within 2%.
+- **The kernel's fast MM1 path (QK-swap) is unreachable at this head count.**
+  `is_qk_swapped` needs `s_active * q_per_group` to satisfy both `% 32 == 0 or
+  32 % it == 0` and `128 % it == 0`; 80/8 GQA gives `q_per_group = 10`, so decode
+  offers 10 and fails both. Re-running at 64 query heads makes it eligible and
+  changes nothing measurable, so the missing swap is *not* what costs the 4,096 row.
+
+`attention_tkg` is not directly launchable — it takes a `BufferManager` and a
+caller-allocated `out`, so the `@nki.jit` entry point is ours. The provider
+docstring lists the non-obvious constraints (`qk_in_sb=True` is mandatory when
+`fuse_rope=False`; every `alloc_stack` must be inside an open scope; `curr_sprior`
+counts the active tokens; q must be pre-scaled by `1/sqrt(d)`; kv heads fold into
+the batch). Reproduce the configuration sweep behind these conclusions with
+`tools/probe_attention_tkg.py`.
+
+For the same cases measured on an H100 with the same provider code, see
 [`../GPU/README.md`](../GPU/README.md).
 
 Collectives, best `bus_bw`:
@@ -1377,7 +1441,8 @@ Two different things are easy to conflate, so they are kept apart: a case the
 | **`store_kv_cache` with `store_mode: "k"`**, independently of the above | `vendor_impl` creates `v_cache` only for `store_mode in ("both", "v")`, but `vendor_impl_run` reads `tensor_mapping["v_cache"]` unconditionally at `store_kv_cache.py:248` → `KeyError: 'v_cache'`. So removing `block_size` is not enough to make the file run | base op def |
 | `quant_matmul` / `moe_quant_group_gemm` with `float8` / `mxfloat8` / `mxfloat4` / `int4` weights | both base impls accept only `int8/int8/int8 -> bfloat16` | base op def |
 | `flash_attention` with a paged cache (`block_size`) | neither the NKI `flash_fwd` kernel nor native SDPA takes a block table | this backend |
-| `flash_attention` chunked prefill (`cache_len > 0`, `q_len > 1`) or multi-token decode | `is_causal` is top-left aligned; these need bottom-right | this backend (correctness) |
+| `flash_attention` chunked prefill (`cache_len > 0`, `q_len > 1`) **on the `torch` provider** | `is_causal` is top-left aligned; these need bottom-right | this backend (correctness) |
+| ~~`flash_attention` multi-token decode~~ | now covered by the **`nkilib`** provider, which builds the active mask explicitly instead of relying on `is_causal` ([table](#decode-the-nkilib-provider-attention_tkg)). Still unsupported on `torch` | — |
 | `flash_attention` GQA / decode / `batch_size > 1` on the **XLA** runtime | the NKI `flash_fwd` kernel takes one contiguous K/V block for one head group; eager SDPA runs all three | this backend |
 | `flash_attention` prefill at `q_len: 32768` | SDPA does not complete at that length — see below | this backend (capacity) |
 | `p2p` | needs send/recv across multiple NeuronDevices | this backend |
@@ -1430,12 +1495,15 @@ value per unit of work:
    and a single fused norm+quant kernel replaces the whole chain. This is the
    largest number of affected ops for the least new code, and it does not need a new
    op def.
-2. **`attention_tkg`, for decode — and nothing for prefill.** Decode cannot reach
-   the built-in NKI flash rewrite (see [Attention](#attention)) and is leaving
-   2.6-5.7x of this core's bandwidth unused. `nkilib` ships a token-generation
-   attention kernel for exactly this shape. It goes in as a third
-   `flash_attention` provider, so it neither perturbs the existing eager numbers
-   nor needs the XLA runtime. **Prefill is a different case and is already done:**
+2. ~~**`attention_tkg`, for decode**~~ — **done, 2026-09-03.** Decode cannot reach
+   the built-in NKI flash rewrite (see [Attention](#attention)) and was leaving
+   2.6-5.7x of this core's bandwidth unused. `nkilib`'s token-generation kernel is
+   now wired as the `nkilib` provider and takes the best decode row to 42% of
+   bandwidth, 4.09x SDPA at kv_len 16,384 — but 0.55x at 4,096, so both providers
+   stay registered and the crossover is the result
+   ([table](#decode-the-nkilib-provider-attention_tkg)). What is *not* done: the
+   remaining 58% of bandwidth, and an H100 run of the aligned workload to restate
+   the per-chip decode ratio. **Prefill is a different case and was already done:**
    the SDPA rewrite lowers to `nkilib`'s `attention_cte`, calling that kernel by
    hand reproduces the same latency to 0.97x, and the 3.1x per-chip gap to the
    H100 is therefore that kernel against cuDNN/FlashAttention. Writing a NKI
@@ -1485,7 +1553,7 @@ read them off the Neuron column as if they were:
 
 The full sweep is most of a day, and checking one figure in the tables above does
 not need it. Every row came from exactly one `launch.py` call, and each of those
-calls has a label in one of the two scripts:
+calls has a label in `run_full_sweep.sh`:
 
 ```bash
 cd projects/micro_perf
@@ -1493,14 +1561,13 @@ cd projects/micro_perf
 # What is there. Prints label, device list, budget and launch arguments; touches
 # no device, so it is safe on a machine someone else is using.
 LIST=1 vendor_ops/NEURON/tools/run_full_sweep.sh
-LIST=1 vendor_ops/NEURON/tools/run_new_workloads.sh
 
 # One row.
 ONLY=single_gemm_ops IMAGE=xpu-perf-eager:latest \
     vendor_ops/NEURON/tools/run_full_sweep.sh
-tail -f /tmp/neuron_sweep.log        # both scripts log to a file, not the terminal
+tail -f /tmp/neuron_sweep.log        # the script logs to a file, not the terminal
 
-# Several. Commas or spaces, either works in either script.
+# Several. Commas or spaces, either works.
 ONLY=basic_index_ok,basic_index_slow IMAGE=xpu-perf-eager:latest \
     vendor_ops/NEURON/tools/run_full_sweep.sh
 ```
@@ -1513,13 +1580,13 @@ the `$RESULTS/<label>/` layout are identical to a full run, so
 each run — that is the point of going through the script rather than calling
 `launch.py` by hand.
 
-**24 of the 28 labels in `run_full_sweep.sh` are single-core** (`--device 0`, one
+**25 of the 31 labels in `run_full_sweep.sh` are single-core** (`--device 0`, one
 logical NeuronCore, a quarter of a chip at LNC=2). Elapsed times are from the logs
 the published numbers came from, on an otherwise idle trn2.3xlarge:
 
 | Label | Workload | Dev | Elapsed | Covers |
 |---|---|---|---|---|
-| `basic_tensor_gemm_ops` | `basic/tensor_gemm_ops` (all) | 0 | 4,939 s | [gemm](#eager-runtime-full-sweep) — 856 cases, the longest single-core run |
+| `basic_tensor_gemm_ops` | `basic/tensor_gemm_ops` (all) | 0 | 4,939 s | [gemm](#eager-runtime-full-sweep) — 856 cases, the longest single-core run. 4,939 s is the float cases only; the 24 fp8 ones are last at 20–570 s each, which is why this label's budget is 28,800 s and not the 5,400 the other directories get |
 | `basic_vector_linear_ops` | `basic/vector_linear_ops` (all) | 0 | not recorded | [memory-bound](#memory-bound-ops) |
 | `basic_vector_activation_ops` | `basic/vector_activation_ops` (all) | 0 | not recorded | " |
 | `basic_vector_sfu_ops` | `basic/vector_sfu_ops` (all) | 0 | not recorded | " |
@@ -1528,8 +1595,9 @@ the published numbers came from, on an otherwise idle trn2.3xlarge:
 | `basic_index_ok` | `basic/vector_index_ops`, `embedding,index_select,index_add` | 0 | not recorded | the three index ops that are fine |
 | `basic_index_slow` | same dir, `gather,scatter` | 0 | **killed at 1,240 s** | [the two that are not](#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity). Expect a kill; results come back with `recover_from_log.py` |
 | `single_gemm_ops` | `llm/single_test_ops/gemm_ops.json` | 0 | 182 s | `moe_gating_gemm` (48% MFU), `quant_matmul`, `moe_quant_group_gemm` |
-| `single_fa_linear_ops` | `llm/single_test_ops/fa_linear_ops.json` | 0 | **killed at 784 s** | [attention](#eager-runtime) — prefill, decode, GQA. `run_new_workloads.sh` gives it 21,600 s instead of 5,400 for this reason |
-| `single_fa_ops` | `llm/single_test_ops/fa_ops.json` | 0 | 15 s | **0 cases** — paged, and no Neuron provider takes a block table |
+| `single_fa_linear_ops` | `llm/single_test_ops/fa_linear_ops.json` | 0 | **killed at 784 s** | [attention](#eager-runtime) — prefill, decode, GQA. It is compile-bound, not execution-bound: one cold GQA prefill sat in `walrus_driver` over 13 minutes and then measured 9.5 ms. Budget is now 21,600 s for that reason |
+| `single_fa_decode_tkg` | `NEURON/workloads/fa_decode_tkg.json` | 0 | ~9 min | [decode through `attention_tkg`](#decode-the-nkilib-provider-attention_tkg) — the same decode rows on a 128-aligned `kv_len`, extended to 16,384. Both the `torch` and `nkilib` providers run it, which is the comparison |
+| `single_fa_ops` | `llm/single_test_ops/fa_ops.json` | 0 | 15 s | **0 cases** — paged, and no Neuron provider takes a block table. Not a Neuron-only gap: the GPU side is empty too, and `flash_attn` does not fix it ([why](../GPU/README.md#what-this-table-does-not-cover-yet)) |
 | `single_pre_fa_ops` | `llm/single_test_ops/pre_fa_ops.json` | 0 | 177 s | `rotary_embedding`; `store_kv_cache` runs 0 cases |
 | `single_moe_dispatch_ops` | `llm/single_test_ops/moe_dispatch_ops.json` | 0 | 32 s | `moe_scatter_dynamic_quant` |
 | `single_moe_combine_ops` | `llm/single_test_ops/moe_combine_ops.json` | 0 | 61 s | `moe_gather` |
@@ -1545,8 +1613,10 @@ the published numbers came from, on an otherwise idle trn2.3xlarge:
 | `demo_flash_attention` | `llm/vendor_test_demo/flash_attention.json` | 0 | 17 s | " (0 cases) |
 | `xccl4` | capped copies of `xccl_ops/` | 0,1,2,3 | 762 s | the 4 collectives plus `device2host`/`host2device`. Needs `XPU_PERF_ENGINES=XCCLEngine`, which the script sets |
 | `d2d` | capped `xccl_ops/device2device.json` | 0,1 | 142 s | `device2device`, 648.7 GB/s |
-| `chip4_gemm` | `basic/tensor_gemm_ops` (all) | 0,1,2,3 | 1,480 s | whether "x4" is real |
-| `chip4_mem` | `basic/vector_linear_ops` (all) | 0,1,2,3 | 187 s | " |
+| `chip4_gemm` | `basic/tensor_gemm_ops` (all) | 0,1,2,3 | 1,480 s | whether "x4" is real. Joins per shape against `basic_tensor_gemm_ops` |
+| `chip4_mem` | `basic/vector_linear_ops` (all) | 0,1,2,3 | 187 s | " — against `basic_vector_linear_ops` |
+| `chip4_reduction` | `basic/vector_reduction_ops` (all) | 0,1,2,3 | not recorded | " — against `basic_vector_reduction_ops`. `topk` is where a Neuron core is closest to a whole H100, so the x4 there has to be measured rather than carried over |
+| `chip4_moe` | `llm/single_test_ops/moe_gating_ops.json` | 0,1,2,3 | not recorded | " — against `single_moe_gating_ops`, for the same reason |
 
 "not recorded" means that label ran under an earlier version of the script that did
 not print an elapsed line, not that it failed. **A kill is not a failure either**:
@@ -1556,12 +1626,15 @@ of the published numbers came through that path. Whether a 137 was the watchdog 
 hand kill to free the chip is not recoverable from the log, so treat these elapsed
 figures as "how long it ran", not "how long it needs".
 
-`run_new_workloads.sh` has 12 labels of its own, 9 of them single-core, and takes
-the same `LIST`/`ONLY`. The two overlap deliberately: `single_norm_ops`,
-`single_activation_ops`, `single_moe_gating_ops`, `single_quant_ops` and
-`single_fa_linear_ops` appear in both, with a larger budget in the newer script.
-`core1_gemm` there is `basic_tensor_gemm_ops` under a different name, paired with
-`chip4_gemm` so `analyze_scaling.py` can join them.
+There used to be a second script here, `run_new_workloads.sh`, holding "just the
+workload files added after the 2026-09-01 sweep" so that a re-run took an hour
+instead of a day. `ONLY=` already does that, and maintaining two label lists meant
+they drifted in ways that cost results: `fa_linear_ops` had a 21,600 s budget in one
+and a fatal 5,400 s in the other, `gemm`'s fp8 tail was reachable only from the
+newer script, and `attention_tkg` was added only to the older one. It has been
+folded in — `chip4_reduction` and `chip4_moe` are now section 7, and its
+`core1_gemm`/`core1_reduction` were `basic_tensor_gemm_ops` and
+`basic_vector_reduction_ops` under different names.
 
 The GPU side is label-for-label the same idea and much cheaper — 13 labels, all
 single-GPU, 42 minutes end to end. See
@@ -1586,9 +1659,10 @@ docker build -f vendor_ops/NEURON/tools/Dockerfile.eager \
 # 2. Sweep, on an idle trn2.3xlarge. Budget a day.
 IMAGE=xpu-perf-eager:latest setsid nohup vendor_ops/NEURON/tools/run_full_sweep.sh &
 
-# 2b. Or just the workloads added after the first sweep, plus the 4-core runs.
-#     Same machinery, about an hour. Log: /tmp/neuron_new.log.
-IMAGE=xpu-perf-eager:latest setsid nohup vendor_ops/NEURON/tools/run_new_workloads.sh &
+# 2b. Or a subset -- ONLY takes any set of labels, so "everything I changed since
+#     the last sweep" is a list, not a second script. About an hour for this one.
+ONLY="single_norm_ops,single_activation_ops,single_quant_ops,single_fa_decode_tkg" \
+    IMAGE=xpu-perf-eager:latest vendor_ops/NEURON/tools/run_full_sweep.sh
 
 # 3. Per-run accounting: cases tried, measured, and grouped rejection reasons.
 python3 vendor_ops/NEURON/tools/analyze_sweep.py /tmp/neuron_sweep.log
@@ -1597,12 +1671,14 @@ python3 vendor_ops/NEURON/tools/analyze_sweep.py /tmp/neuron_sweep.log
 python3 vendor_ops/NEURON/tools/analyze_sweep.py /tmp/neuron_sweep.log all_to_all
 
 # 5. Is "x4" real? Join a 1-core report against a 4-core one, shape by shape.
-#    Only the matched pairs from step 2b are comparable; the labels are
-#    core1_gemm/chip4_gemm and core1_reduction/chip4_reduction.
-ONLY="core1_gemm chip4_gemm core1_reduction chip4_reduction chip4_moe" \
-    IMAGE=xpu-perf-eager:latest vendor_ops/NEURON/tools/run_new_workloads.sh
+#    Only matched pairs over the same task_dir are comparable -- comparing a chip4
+#    peak against a published peak shows the best case is unchanged but cannot show
+#    that some particular shape degrades, and the tail is where they do.
+ONLY="basic_tensor_gemm_ops chip4_gemm basic_vector_reduction_ops chip4_reduction \
+      single_moe_gating_ops chip4_moe" \
+    IMAGE=xpu-perf-eager:latest vendor_ops/NEURON/tools/run_full_sweep.sh
 python3 vendor_ops/NEURON/tools/analyze_scaling.py \
-    /tmp/new_results/core1_gemm /tmp/new_results/chip4_gemm
+    /tmp/sweep_results/basic_tensor_gemm_ops /tmp/sweep_results/chip4_gemm
 
 # 6. The gather int64-vs-int32 finding, on device, in one file (~2 min).
 sudo docker run --rm --privileged -v "$PWD":/w -w /w xpu-perf-eager:latest \

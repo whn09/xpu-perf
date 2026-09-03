@@ -24,8 +24,12 @@ try:
     # never satisfies `L % 512 == 0`, and B*H is 1280/5120, over the 512 limit --
     # which is what the decode rows' 15-33% of HBM peak reflects. nkilib (installed
     # in the beta images, so wrap_nki does have kernels to wrap now, contrary to what
-    # this comment used to say) ships attention_tkg for exactly that case; wiring it
-    # would be a second provider, not a change to this one.
+    # this comment used to say) ships attention_tkg for exactly that case, and it is
+    # now wired up next door in ops/nkilib/flash_attention.py -- a second provider,
+    # not a change to this one, because neither wins everywhere: attention_tkg is
+    # 4.09x this provider at kv_len 16,384 and 0.55x at 4,096. So this file stays the
+    # decode implementation for short contexts, and the two are compared in one
+    # launch against workloads/fa_decode_tkg.json.
     #
     # And the kernel this rewrite picks for prefill is already the best one nkilib
     # has to offer: decompositions.py line 24 imports nkilib's attention_cte and

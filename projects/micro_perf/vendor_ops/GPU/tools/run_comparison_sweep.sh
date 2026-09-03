@@ -95,7 +95,7 @@ EXTRA_ENV=${EXTRA_ENV:-}
 W=workloads
 
 # ONLY=<label>[,<label>...] or ONLY="<label> <label>". Both separators work: this
-# script and run_new_workloads.sh would otherwise disagree on the delimiter, which
+# script and the NEURON sweep script would otherwise disagree on the delimiter, which
 # is a trap worth spending one substitution on. The match is on a whole delimited
 # word, so ONLY=gemm cannot also select single_gemm_ops.
 want() {
@@ -191,12 +191,25 @@ done
 # 4. Attention. fa_linear_ops is the linear-cache file this port added, and is
 #    what the Neuron GQA/decode numbers come from; the `torch` SDPA provider is
 #    what makes it comparable, since `fa2` accepts only 4 of its 10 cases (no
-#    linear decode, no batch_size > 1 prefill). fa_ops is the paged-cache file
-#    that has no runnable case on Neuron at all -- flash_attn does take a block
-#    table, so the GPU side can fill in that row, but only in MODE=docker or with
-#    flash_attn otherwise installed. Under MODE=host with no flash_attn, fa_ops
-#    measures nothing and exits 0 -- which is the trap the Dockerfile's
-#    `import flash_attn` assertion exists to catch.
+#    linear decode, no batch_size > 1 prefill).
+#
+#    fa_ops is the paged-cache file, and it has no runnable case on *either*
+#    backend -- installing flash_attn does not change that, so do not read the
+#    empty single_fa_ops report as a missing dependency. All 11 cases set
+#    block_size: 512, which is what makes cache_type "paged"
+#    (core/utils.py:427). fa2/fa3 reject them from both ends:
+#      * its 9 prefill cases, because FA2Op.vendor_parser demands
+#        cache_type == "linear" for prefill (flash_attn_func takes no block
+#        table; only flash_attn_with_kvcache does, and that is the decode path);
+#      * its 2 decode cases, which are paged as the decode path wants, because
+#        the same parser demands an all-bfloat16 dtype set and both carry
+#        cache_dtype: int8.
+#    So the file needs an int8-KV paged kernel, which no provider here has --
+#    ops/flashinfer and ops/vllm hold only rms_norm.py. Filling this row means
+#    writing that provider (or relaxing fa_ops to a bf16 cache), not pip install.
+#    Under MODE=host with no flash_attn it still measures nothing and exits 0,
+#    which is the trap the Dockerfile's `import flash_attn` assertion catches --
+#    that assertion is about the *other* labels, not this one.
 run_one single_fa_linear_ops 10800 --workload $W/llm/single_test_ops/fa_linear_ops.json
 run_one single_fa_ops        10800 --workload $W/llm/single_test_ops/fa_ops.json
 

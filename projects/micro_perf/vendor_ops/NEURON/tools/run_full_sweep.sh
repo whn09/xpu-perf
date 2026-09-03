@@ -32,6 +32,16 @@
 # per-run accounting, and to recover_from_log.py if a run was killed before it
 # could write its CSVs.
 #
+# This is the only sweep script for this backend. There used to be a second one,
+# run_new_workloads.sh, holding "just the workloads added after the 2026-09-01
+# sweep" so a re-run took an hour instead of a day. `ONLY=` below does that job
+# already, and keeping two lists of labels meant they drifted: fa_linear_ops had a
+# 21,600 s budget in one and a fatal 5,400 s in the other, gemm's fp8 tail was
+# reachable only from the newer script, and attention_tkg was added only to the
+# older one. Its labels are folded in here -- chip4_reduction and chip4_moe in
+# section 7, and its core1_gemm/core1_reduction are basic_tensor_gemm_ops and
+# basic_vector_reduction_ops under their real names.
+#
 # You usually do not want the whole thing. Two knobs make it reproducible one row
 # at a time, which is what checking a single README figure needs:
 #
@@ -41,8 +51,8 @@
 #   ONLY=basic_index_ok,basic_index_slow ... # or several, comma-separated
 #
 # Under ONLY the log and $RESULTS layout are unchanged, so analyze_sweep.py works
-# on a one-label log exactly as on a full one. Every label except xccl4, d2d,
-# chip4_gemm and chip4_mem runs on a single logical NeuronCore (`--device 0`); see
+# on a one-label log exactly as on a full one. Every label except xccl4, d2d and
+# the four chip4_* runs is on a single logical NeuronCore (`--device 0`); see
 # ../README.md, "Reproduce one row at a time".
 set -u
 
@@ -65,8 +75,8 @@ if [ -z "$LIST" ]; then
 fi
 
 # ONLY=<label>[,<label>...] or ONLY="<label> <label>". Both separators work: this
-# script and run_new_workloads.sh would otherwise disagree on the delimiter, which
-# is a trap worth spending one substitution on. The match is on a whole delimited
+# script and the GPU comparison script would otherwise disagree on the delimiter,
+# which is a trap worth spending one substitution on. The match is on a whole
 # word, so ONLY=gemm cannot also select single_gemm_ops.
 want() {
     [ -z "$ONLY" ] && return 0
@@ -198,13 +208,53 @@ run_one demo_flash_attention      3600 0 - --workload $W/llm/vendor_test_demo/fl
 # 2. Single-op LLM workloads. ccl_ops.json is excluded on purpose: every case
 #    asks for world_size 8 and a trn2.3xlarge has 4 logical cores, so there is
 #    nothing in it this instance can run.
-for wl in gemm_ops fa_ops fa_linear_ops pre_fa_ops moe_dispatch_ops moe_combine_ops \
+#
+#    fa_linear_ops is not in this loop: it needs four times the budget. See 2b.
+for wl in gemm_ops fa_ops pre_fa_ops moe_dispatch_ops moe_combine_ops \
           norm_ops activation_ops moe_gating_ops quant_ops; do
     run_one "single_$wl" 5400 0 - --workload "$W/llm/single_test_ops/$wl.json"
 done
 
+# 2b. fa_linear_ops gets its own budget because it is dominated by compilation, not
+#     by execution: a cold 80/8/128 GQA prefill at q_len 4096 sat in walrus_driver
+#     for over 13 minutes and then measured 9.5 ms. Twelve cases at 5-15 minutes of
+#     neuronx-cc each does not fit the 5400 s the other files use -- at 5400 s this
+#     label is killed at ~784 s of *measured* progress and its whole report is lost,
+#     which is how the published attention rows came to need recover_from_log.py.
+run_one single_fa_linear_ops 21600 0 - \
+    --workload "$W/llm/single_test_ops/fa_linear_ops.json"
+
+# 2c. Decode attention through nkilib's attention_tkg. Separate from
+#     single_fa_linear_ops because the kernel asserts kv_len % 128 == 0 and none of
+#     that file's decode rows satisfy it; this workload restates them aligned. Both
+#     the `torch` and `nkilib` providers run it, which is the point -- they cross
+#     over between kv_len 4096 and 8192. Each of the 7 cases pays a one-off
+#     neuronx-cc compile of 20-90 s on top of the measurement.
+run_one single_fa_decode_tkg 5400 0 - \
+    --workload vendor_ops/NEURON/workloads/fa_decode_tkg.json
+
 # 3. Basic ops, one directory per launch.
-for d in tensor_gemm_ops vector_linear_ops vector_activation_ops vector_sfu_ops \
+#
+#    tensor_gemm_ops is not in this loop either, for the same reason as
+#    fa_linear_ops: gemm.json enumerates 856 cases and the 24 **fp8** ones are
+#    *last*, at 20-570 s each against ~1 ms for a bf16 case. At the 5400 s the
+#    other directories use, the watchdog fires inside the fp8 tail, and because
+#    micro_perf writes its CSVs only when a launch finishes (reason 2 above) that
+#    loses the 832 float cases too. 28800 s is what it takes to get both halves in
+#    one report -- which is also the report analyze_scaling.py needs to join
+#    against chip4_gemm, so this one launch serves three purposes.
+#
+#    Note what the fp8 rows in it do and do not measure. They are the *eager* fp8
+#    path, which lands on a software widening at ~4 TF (1.2% MFU) and is what the
+#    published 99x gap against an H100 is. The 245.50 TF / 75.6% figure is
+#    `float8_e5m2` under torch.compile(backend="neuron", dynamic=False), which no
+#    workload file can reach because there is no compiled fp8 gemm provider -- it
+#    comes from probe_fp8_datapath.py, run by hand. Do not read the low number
+#    here as the chip's fp8 ceiling.
+run_one basic_tensor_gemm_ops 28800 0 - \
+    --task_dir "$W/basic/tensor_gemm_ops" --task all
+
+for d in vector_linear_ops vector_activation_ops vector_sfu_ops \
          vector_norm_ops vector_reduction_ops; do
     run_one "basic_$d" 5400 0 - --task_dir "$W/basic/$d" --task all
 done
@@ -248,10 +298,29 @@ run_one d2d 5400 0,1 "XPU_PERF_ENGINES=ComputeEngine" \
 #    XPU_PERF_ENGINES is required, not optional: with 4 devices and no filter the
 #    launch also starts an XCCLEngine worker on every core, and the second set
 #    cannot get cores.
-run_one chip4_gemm 5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
+#    Each of these has a one-core partner earlier in the script over the *same*
+#    task_dir, which is the only thing analyze_scaling.py can join per shape:
+#    chip4_gemm <-> basic_tensor_gemm_ops, chip4_mem <-> basic_vector_linear_ops,
+#    chip4_reduction <-> basic_vector_reduction_ops, chip4_moe <->
+#    single_moe_gating_ops. Comparing a chip4 peak against a *published* peak only
+#    shows the best case is unchanged; it cannot show that some particular shape
+#    degrades, and the small-shape contention tail is exactly where they do.
+run_one chip4_gemm 7200 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
     --task_dir $W/basic/tensor_gemm_ops --task all
 run_one chip4_mem  5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
     --task_dir $W/basic/vector_linear_ops --task all
+
+#    Selection and sorting, because these are the two ops where a Neuron core is
+#    within 8-32% of a whole H100 (see ../../GPU/README.md) and the per-chip claim
+#    therefore rests entirely on whether they scale. chip4_mem shows elementwise
+#    work scales at 1.00-1.02x, but topk and moe_softmax_topk are not elementwise --
+#    they are the ops most likely to serialise on something shared, so the x4 has to
+#    be measured rather than carried over. Both are cheap: the whole 56-case
+#    moe_gating file takes 123 s here (the same file takes an H100 1,191 s).
+run_one chip4_reduction 5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
+    --task_dir $W/basic/vector_reduction_ops --task all
+run_one chip4_moe       5400 0,1,2,3 "XPU_PERF_ENGINES=ComputeEngine" \
+    --workload "$W/llm/single_test_ops/moe_gating_ops.json"
 
 if [ -z "$LIST" ]; then
     echo ""

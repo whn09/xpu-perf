@@ -77,10 +77,47 @@ that was wrong, since `cos` and `sin` are precomputed outside the timed region �
 see [the NEURON README](../NEURON/README.md#rotary_embedding-is-not-a-neuron-result-at-all)
 for the decomposition.
 
-Memory-bound attention still tells the original story. During decode the H100
-reads its KV cache at 80-86% of HBM peak, Trainium at 15-33% of its own — and
-since the same Neuron core reaches 631 GB/s on a plain `index_select`, that is a
-lowering result rather than a bandwidth wall.
+Memory-bound attention still tells the original story, but the Trainium side of it
+has moved. During decode the H100 reads its KV cache at 80-86% of HBM peak. The
+Trainium column above (15-33% of its own) is the `torch`/SDPA provider, and SDPA
+cannot reach a fused kernel at `q_len == 1`. A second provider that can —
+`ops/nkilib/flash_attention.py`, calling `nkilib`'s `attention_tkg` — was added
+2026-09-03 and reaches **42%**, with the crossover between the two providers landing
+between kv_len 4,096 and 8,192: at 16,384 it is **4.09x** SDPA, at 4,096 it is
+0.55x. Trainium2 decode is therefore no longer *degrading* with cache length, which
+was the shape of the original finding.
+
+**The cross-chip decode ratio, on the aligned workload.** `attention_tkg` requires
+`kv_len % 128 == 0`, so its numbers come from
+`../NEURON/workloads/fa_decode_tkg.json` rather than from the published
+`fa_linear_ops.json`. Both backends have now run that file, so the two columns below
+are the same six cases on both sides. "Best Trn2" is whichever of the two providers
+wins at that shape, since both stay registered:
+
+| B | kv_len | H100 lat | H100 GB/s | % of 3.35 TB/s | Best Trn2 core | Trn2 lat | Trn2 GB/s | % of 725 GB/s | Per core | **Per chip** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 16 | 4,096 | 116.4 us | 2,312.4 | 69.0% | SDPA | 866.6 us | 310.5 | 42.8% | 7.45x | **1.86x** |
+| 16 | 8,192 | 191.1 us | 2,812.7 | 84.0% | `attention_tkg` | 2,411.4 us | 222.9 | 30.7% | 12.62x | **3.15x** |
+| 16 | 10,240 | 251.8 us | 2,667.8 | 79.6% | `attention_tkg` | 2,769.0 us | 242.6 | 33.5% | 11.00x | **2.75x** |
+| 16 | 16,384 | 353.4 us | 3,040.4 | **90.8%** | `attention_tkg` | 3,841.2 us | 279.7 | 38.6% | 10.87x | **2.72x** |
+| 64 | 4,096 | 368.4 us | 2,921.9 | 87.2% | SDPA | 3,239.1 us | 332.3 | **45.8%** | 8.79x | **2.20x** |
+| 64 | 10,240 | 924.5 us | 2,906.4 | 86.8% | `attention_tkg` | 8,748.5 us | 307.1 | 42.4% | 9.46x | **2.37x** |
+
+**Decode is 1.9-3.2x per chip on a 1.16x nominal bandwidth bar** (3.35 TB/s against
+4 x 725 GB/s), so 1.6-2.7x of it is still software — a much smaller residual than the
+prefill row's 2.1x, and unlike prefill it shrinks rather than grows with the problem
+size once the right provider is used. The H100's own curve is the flat one here: it
+sits at 69-91% of HBM peak everywhere and has essentially nothing left to win, which
+is why the whole cross-chip movement in this row comes from the Trainium side.
+
+Two things this run does *not* settle. The `q_len 4` case in that file is **rejected
+on both backends** by the `torch` provider — PyTorch's `is_causal` aligns to the
+top-left of a non-square score matrix — so the `nkilib` provider's speculative-decode
+coverage has no GPU counterpart and no ratio. And the per-chip column is `x4` on a
+single logical core; that multiplication is
+[measured for memory-bound work](#how-to-compare-these-to-the-trainium2-numbers) at
+1.00-1.02x, but not for this op specifically. The Trainium-side provider analysis is
+in [the NEURON README](../NEURON/README.md#decode-the-nkilib-provider-attention_tkg).
 
 Every number below carries the unit caveats in
 [How to compare](#how-to-compare-these-to-the-trainium2-numbers). Read them before
@@ -107,10 +144,34 @@ being explicit about rather than leaving the table above looking complete.
 | `single_test_ops/gemm_ops.json` | `moe_gating_gemm`, `quant_matmul`, `moe_quant_group_gemm` | `moe_gating_gemm` 21.89 TF / **48% MFU**; `quant_matmul` 15.78 "TOPS"; `moe_quant_group_gemm` **2.67-2.84 s at every shape** | **none** | run it. `moe_gating_gemm` is the interesting one — the only genuine compute-bound row outside plain `gemm`, at 48% of the fp32 peak against `gemm`'s 82% at the same dtype, with no GPU control to say which of those two numbers is the anomaly. The other two route through `fake_quant_gemm` and are [a bf16 simulation on every backend](../NEURON/README.md#the-quantized-ops-are-a-bf16-simulation-on-every-backend), so a GPU column there measures the same shared helper the `_dynamic_quant` rows already exposed |
 | `single_test_ops/moe_dispatch_ops.json` | `moe_scatter_dynamic_quant` | 0.7 GB/s | **none** | run it. At 0.7 GB/s it is in `gather`/`scatter` territory, and the GPU column is what would say whether that is the op def or the lowering — exactly the question the H100 settled for `gather` |
 | `single_test_ops/moe_combine_ops.json` | `moe_gather`, `moe_quant_group_gemm_combine` | `moe_gather` 9.2 GB/s | **none** | run it, same reason — `moe_gather` at 9.2 GB/s is 68x off `index_select` on the same chip |
-| `single_test_ops/fa_ops.json` | paged `flash_attention` | **0 cases** — every case sets `block_size: 512` and no Neuron provider takes a block table | **the Neuron side**, not this one | the GPU can fill it in under `MODE=docker` (`flash_attn` does take a block table) and the sweep script already calls it, but there would be nothing to compare it against |
+| `single_test_ops/fa_ops.json` | paged `flash_attention` | **0 cases** — every case sets `block_size: 512`, and the `torch` SDPA provider rejects a paged cache | **both backends, and it is a missing provider rather than a missing install** | see below. Installing `flash_attn` does *not* fill this row: `fa2`/`fa3` reject all 11 cases too |
 | `single_test_ops/pre_fa_ops.json` → `store_kv_cache` | 1 | **0 cases on either backend** | **base op def** — `store_kv_cache.py:257` raises on a paged cache and `:248` hits `KeyError: 'v_cache'` for `store_mode: "k"` | fix the op def first; this is shared code, so it is not a Trainium item |
 | `vendor_test/quant_matmul.json`, `vendor_test/moe_quant_group_gemm.json` | 2 | 85 of 184 runnable, and **15 of 276** — ~16 min of wall clock per 2.7 s measurement | **none**, but the cost is prohibitive | not worth a GPU run until `moe_quant_group_gemm`'s per-expert host sync is fixed; `single_test_ops/gemm_ops.json` covers the same ops cheaply |
 | `vendor_test{,_demo}/flash_attention.json` | 1 | **0 cases** (paged, plus `attn_mode=decode`) | same as `fa_ops.json` | subsumed by it |
+
+**`fa_ops.json` is not a missing dependency, so do not try to fix it with `pip
+install`.** The empty `single_fa_ops` report looks like the `MODE=host` trap
+(`flash_attn` absent ⇒ no provider ⇒ exit 0 with nothing measured), and it is
+that as well, but installing `flash_attn` — or `flashinfer`, which is *already*
+installed here and whose `ops/flashinfer/` directory holds only `rms_norm.py` —
+unlocks **zero of the 11 cases**. All 11 set `block_size: 512`, and that field
+alone is what makes `cache_type` `"paged"` (`core/utils.py:427`). `FA2Op`
+(inherited unchanged by `fa3`) then turns the file away from both ends:
+
+* its **9 prefill** cases, because the parser demands `cache_type == "linear"`
+  for prefill. That is not an oversight in this repo — `flash_attn_func` takes no
+  block table; only `flash_attn_with_kvcache` does, and that is the decode path.
+  (Three of the nine would fail the dtype gate regardless, being int8-cache or
+  fully int8, and `[1, 5120, 5120]` also violates `cache_lens[0] == 0`.)
+* its **2 decode** cases, which *are* paged as that path wants, because the same
+  parser demands an all-bfloat16 dtype set and both carry `cache_dtype: int8`.
+
+So what this file actually wants is an **int8-KV paged** attention kernel, and no
+provider in the tree has one. Filling the row means writing that provider, or
+relaxing `fa_ops.json` to a bf16 cache — at which point `fa2`'s decode path
+covers its two decode cases and the prefill nine remain out of reach on both
+backends. Either way there is still nothing to compare against on Trainium,
+which is why this is listed as a gap and not as a bug.
 
 One further gap belongs to neither backend: **`dequant_kv_cache` appears in no
 workload JSON anywhere in the repo**, so it is untested rather than unsupported on
@@ -200,7 +261,7 @@ actually took on an idle p5.4xlarge, not the watchdog budgets in the script:
 | `single_moe_gating_ops` | `llm/single_test_ops/moe_gating_ops.json` | **1,191 s** | " — the longest run here, and 9.7x the same file on one NeuronCore (123 s) |
 | `single_quant_ops` | `llm/single_test_ops/quant_ops.json` | 17 s | " |
 | `single_fa_linear_ops` | `llm/single_test_ops/fa_linear_ops.json` | 15 s | [attention](#attention) — all 10 prefill/decode/GQA cases |
-| `single_fa_ops` | `llm/single_test_ops/fa_ops.json` | 9 s | paged attention. **Measures nothing under `MODE=host`** without `flash_attn`, and exits 0 |
+| `single_fa_ops` | `llm/single_test_ops/fa_ops.json` | 9 s | paged attention. **Measures nothing and exits 0**, and installing `flash_attn` does not change that — `fa2`/`fa3` reject all 11 cases (paged prefill, int8-KV decode). [Why](#what-this-table-does-not-cover-yet) |
 
 That is 2,496 s in total — **the whole comparison sweep is 42 minutes**, so
 reproducing all of it is usually cheaper than deciding which label you need.
@@ -473,14 +534,29 @@ Four conclusions, in order of how much they matter:
   ([details](../NEURON/README.md#attention)). So the 3.1x is `attention_cte`
   against cuDNN/FlashAttention at the same shape, with no better kernel sitting
   unused on the Neuron side.
-- **Decode on Trainium is not bandwidth-limited, which means it is fixable.**
-  The H100 reads its KV cache at 80-86% of HBM peak — that is a
-  bandwidth-saturating kernel and there is nothing left to win. Trainium reads it
-  at 15-33%, and for scale the best plain memory-bound op on the same core hits
-  631 GB/s (`index_select`). So decode there is leaving 2.6-5.7x of *its own*
-  available bandwidth on the floor. Both backends improve with batch and degrade
-  with cache length, which is a per-call fixed cost being amortised rather than a
-  ceiling.
+- **Decode on Trainium was not bandwidth-limited, which is why it was fixable — and
+  it has since been partly fixed.** The H100 reads its KV cache at 80-86% of HBM
+  peak; there is a bandwidth-saturating kernel there and nothing left to win.
+  Trainium reads it at 15-33% in the table above, and for scale the best plain
+  memory-bound op on the same core hits 631 GB/s (`index_select`), so decode was
+  leaving 2.6-5.7x of *its own* bandwidth on the floor. The table above is the
+  `torch`/SDPA provider, and the reason it cannot do better is structural: SDPA's
+  fused-NKI gate needs `L % 512 == 0` and `B*H <= 512`, and a decode step offers
+  `L == 1` and `B*H` of 1280-5120. A second provider calling `nkilib`'s
+  `attention_tkg` directly (added 2026-09-03) reaches **42%** and is **4.09x** SDPA
+  at kv_len 16,384, though it is 0.55x at 4,096 — the two cross between 4,096 and
+  8,192, so both stay registered. Note what that does to the *shape* of this bullet:
+  both backends in the table degrade with cache length, which read as a per-call
+  fixed cost being amortised; `attention_tkg` improves with cache length instead, so
+  on Trainium that degradation was the SDPA path rather than the chip.
+  [Details and the full table](../NEURON/README.md#decode-the-nkilib-provider-attention_tkg).
+  The H100 has since run the same aligned workload, so the ratio is no longer an
+  extrapolation: **1.9-3.2x per chip** on a 1.16x nominal bandwidth bar, tabulated
+  case by case in [the Summary](#summary). That is the narrowest software residual
+  anywhere in this comparison outside the parity rows, and the H100's own column is
+  flat at 69-91% of peak across all six cases — so the movement is entirely on the
+  Trainium side, and it is the one row where picking the right provider changed the
+  conclusion rather than the decimal place.
 - **GQA and MHA cost the same on both backends**, to within 1% at every shape, and
   on both the MHA row is marginally *faster* at `q_len 10240`. Prefill is
   compute-bound and GQA saves KV traffic rather than FLOPs, so this is the

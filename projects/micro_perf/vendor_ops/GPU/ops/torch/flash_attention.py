@@ -62,7 +62,12 @@ class GPUSDPAFlashAttentionOp:
 
     * a paged cache -- gathering `block_table` rows into a contiguous k/v would be
       a copy inside the timed region, which is the cost the paged layout exists to
-      avoid. `fa_ops.json` is the paged file and `fa2` is its provider;
+      avoid. `fa_ops.json` is the paged file, and note that handing it to `fa2`
+      does not rescue it: `fa2` accepts a block table only on its *decode* path
+      (`flash_attn_with_kvcache`), its prefill path demands a linear cache just as
+      this one does, and the two decode cases in that file carry
+      `cache_dtype: int8` against an all-bfloat16 gate. That file has no provider
+      on either backend, and installing flash_attn does not give it one;
     * anything but an all-bfloat16 dtype set;
     * chunked prefill (`cache_len > 0` with `q_len > 1`) and speculative decode
       (`q_len > 1`) -- both need the causal mask aligned to the bottom-right of a

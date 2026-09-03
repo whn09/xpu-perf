@@ -21,7 +21,8 @@ Two things this reports that a single summary number would hide:
 Usage:
 
     python3 analyze_scaling.py <one-core-report-root> <four-core-report-root>
-    python3 analyze_scaling.py /tmp/core1_results/core1_gemm /tmp/chip4_results/chip4_gemm
+    python3 analyze_scaling.py /tmp/sweep_results/basic_tensor_gemm_ops \
+                               /tmp/sweep_results/chip4_gemm
 
 Report roots are whatever `--report_dir` produced -- the script walks for *.jsonl
 and takes the op name from the filename stem, so it does not care about the

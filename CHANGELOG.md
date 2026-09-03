@@ -8,6 +8,32 @@ This changelog follows semantic versioning and Keep a Changelog style.
 
 ### Added
 
+- `projects/micro_perf/vendor_ops/NEURON/ops/nkilib/`: a second NEURON
+  `flash_attention` provider, `nkilib`, calling `nkilib.core.attention.attention_tkg`
+  (token-generation attention) for the **decode** rows. The existing `torch`/SDPA
+  provider cannot reach a fused kernel there — torch_neuronx's rewrite gate needs
+  `L % 512 == 0` and `B*H <= 512`, and a decode step offers `L == 1` and `B*H` of
+  1280-5120 — so decode was measuring an unfused score-matrix path whose bandwidth
+  *falls* with cache length. `attention_tkg`'s rises: measured on Trn2 at 80/8/128
+  GQA bf16, the two cross between kv_len 4,096 (0.55x) and 8,192 (1.56x), reaching
+  **4.09x at 16,384** and 42% of the core's memory bandwidth. Both providers stay
+  registered because neither wins everywhere. It also covers `q_len 4` speculative
+  decode, which the SDPA provider rejects because PyTorch's `is_causal` aligns to
+  the top-left of a non-square score matrix.
+  `attention_tkg` is not directly launchable — it takes a `BufferManager` and a
+  caller-allocated `out` — so the `@nki.jit` entry point is part of the provider.
+- `projects/micro_perf/vendor_ops/NEURON/workloads/fa_decode_tkg.json`: the decode
+  rows of `fa_linear_ops.json` restated with `kv_len` on a multiple of 128, which the
+  kernel asserts (`cache_len 4095` + `q_len 1` rather than 4096 + 1 — a 0.02%
+  shorter context), plus kv_len 8,192 and 16,384 so the crossover between the two
+  providers is visible. Both providers run this file, so one launch produces the
+  comparison.
+- `projects/micro_perf/vendor_ops/NEURON/tools/probe_attention_tkg.py`: the
+  configuration sweep behind that provider — flat vs paged prior (paged is 4-8x
+  faster and the only one that ever beats SDPA), the `block_len` sweep showing the
+  kernel overrides the caller's choice, the QK-swap eligibility check showing 80/8
+  GQA can never reach the kernel's fast MM1 path, and the correctness check against
+  SDPA (rel_err 0.0033-0.0065 everywhere).
 - `projects/micro_perf/workloads/llm/single_test_ops/`: workload files for the op
   families that had an `op_defs` implementation but no workload JSON anywhere in
   the repo, so they were untested rather than unsupported on every backend —
@@ -71,6 +97,58 @@ This changelog follows semantic versioning and Keep a Changelog style.
 
 ### Changed
 
+- `projects/micro_perf/vendor_ops/GPU/README.md`,
+  `projects/micro_perf/vendor_ops/GPU/tools/run_comparison_sweep.sh`,
+  `projects/micro_perf/vendor_ops/GPU/ops/torch/flash_attention.py`,
+  `projects/micro_perf/vendor_ops/NEURON/README.md`: **corrected the documented
+  reason `single_fa_ops` is empty.** Three places said, or implied, that
+  `fa_ops.json`'s paged cases were the `fa2` provider's and that the GPU side
+  could fill that row once `flash_attn` was installed. It cannot: installing
+  `flash_attn` unlocks **0 of the 11 cases**. All 11 set `block_size: 512`, which
+  is the only thing that makes `cache_type` `"paged"` (`core/utils.py:427`), and
+  `FA2Op.vendor_parser` (inherited unchanged by `fa3`) rejects the file from both
+  ends — its 9 **prefill** cases because that path demands
+  `cache_type == "linear"` (`flash_attn_func` takes no block table; only
+  `flash_attn_with_kvcache` does), and its 2 **decode** cases, which are paged as
+  that path wants, because the same parser demands an all-bfloat16 dtype set and
+  both carry `cache_dtype: int8`. The file needs an **int8-KV paged** kernel and
+  no provider in the tree has one — `ops/flashinfer/` and `ops/vllm/` hold only
+  `rms_norm.py`, and flashinfer is already installed on the H100 box. So this is
+  a missing provider, not a missing dependency, and it is a gap on both backends
+  rather than a Neuron-only one.
+
+- `projects/micro_perf/vendor_ops/NEURON/tools/run_full_sweep.sh`,
+  `projects/micro_perf/vendor_ops/NEURON/tools/run_new_workloads.sh` (**removed**),
+  `projects/micro_perf/vendor_ops/NEURON/README.md`: **two sweep scripts had
+  drifted into disagreeing about how to measure the same thing.**
+  `run_new_workloads.sh` existed so a re-run of "just what changed" took an hour
+  instead of a day, but `ONLY=<labels>` already does that, and maintaining two
+  label lists cost results three separate ways: `single_fa_linear_ops` had a
+  21,600 s budget in one script and a fatal 5,400 s in the other; `gemm`'s 24 fp8
+  cases were reachable only from the newer script, because they are *last* in
+  `gemm.json` at 20-570 s each and the watchdog fires inside them at the 5,400 s
+  the float cases need — which, since micro_perf writes its CSVs only when a launch
+  finishes, also loses the 832 float cases; and `single_fa_decode_tkg` had been
+  added only to the older one. The second script is deleted and its labels folded
+  in: `chip4_reduction` and `chip4_moe` are now section 7, and its
+  `core1_gemm`/`core1_reduction` were `basic_tensor_gemm_ops` and
+  `basic_vector_reduction_ops` under different names. `basic_tensor_gemm_ops` now
+  has 28,800 s, which makes one launch serve three purposes (float cases, fp8 tail,
+  and the one-core report `analyze_scaling.py` joins against `chip4_gemm`);
+  `single_fa_linear_ops` and `chip4_gemm` get the larger budgets. 31 labels, one
+  script.
+- `projects/micro_perf/vendor_ops/GPU/README.md`: **the cross-chip decode ratio is
+  measured rather than deferred.** The H100 has now run
+  `../NEURON/workloads/fa_decode_tkg.json` — the same six comparable cases as the
+  Trainium side — so the row that said "no new cross-chip decode ratio is quoted"
+  now carries a table: **1.9-3.2x per chip on a 1.16x nominal bandwidth bar**, i.e.
+  1.6-2.7x software, the narrowest residual in the comparison outside the parity
+  rows. The H100's own column is flat at 69-91% of HBM peak across all six cases, so
+  the entire cross-chip movement in this row comes from the Trainium side and from
+  which provider wins: SDPA at kv_len 4,096, `attention_tkg` from 8,192 up. The
+  `q_len 4` case is rejected on **both** backends (PyTorch's `is_causal` aligns to
+  the top-left of a non-square score matrix), so `nkilib`'s speculative-decode
+  coverage still has no GPU counterpart.
 - `projects/micro_perf/vendor_ops/GPU/README.md`,
   `projects/micro_perf/vendor_ops/GPU/tools/run_comparison_sweep.sh`,
   `projects/micro_perf/vendor_ops/NEURON/README.md`: **the GPU Summary table read
