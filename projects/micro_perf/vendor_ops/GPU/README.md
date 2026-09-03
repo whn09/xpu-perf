@@ -9,7 +9,9 @@ case.
 
 Normalised **per chip** — one H100 against one Trainium2, not against the quarter
 of one that a logical NeuronCore is — the gap is not one number, it is three very
-different ones:
+different ones. This first table is the **measured** set; it is not the whole
+workload tree, and what is missing is listed with the reason
+[below](#what-this-table-does-not-cover-yet):
 
 | Workload | H100 / Trainium2, per chip | What that is |
 |---|---|---|
@@ -77,6 +79,37 @@ lowering result rather than a bandwidth wall.
 Every number below carries the unit caveats in
 [How to compare](#how-to-compare-these-to-the-trainium2-numbers). Read them before
 quoting anything.
+
+### What this table does not cover yet
+
+Twelve workload files have a Trainium2 number and **no GPU column**, so no ratio
+can be quoted for them: the seven in `xccl_ops/`, `gemm_ops.json`,
+`moe_dispatch_ops.json`, `moe_combine_ops.json`, and two of the `vendor_test/`
+files. `tools/run_comparison_sweep.sh` runs none of them. The remaining rows are
+a different problem — a case no backend can run, or one only a single backend can —
+and are marked as such. Some of this is a hardware limit, since a p5.4xlarge has
+one GPU; the rest is simply not done yet, which is worth being explicit about
+rather than leaving the table above looking complete.
+
+| Workload | Ops | What Trainium2 got | Blocker | TODO |
+|---|---|---|---|---|
+| `xccl_ops/{all_reduce,all_gather,reduce_scatter,all_to_all}.json` | 4 collectives | best `bus_bw` at ws=4: `all_gather` 125.1, `all_reduce` 107.1, `reduce_scatter` 101.7, `all_to_all` 54.2 GB/s ([table](../NEURON/README.md#memory-bound-ops)) | **hardware** — `world_size` is 1 on one GPU | needs a p5.48xlarge (8x H100, NVLink). **The highest-value item in this list**: NVLink vs NeuronLink is the one remaining difference likely to matter at training scale, and nothing here constrains it |
+| `single_test_ops/ccl_ops.json` | same 4 | **0 cases** — the file asks for `world_size: 8` and a trn2.3xlarge has 4 logical cores | **hardware**, both sides | needs 8 of either; on the Neuron side a trn2.48xlarge |
+| `xccl_ops/device2device.json` | `device2device` | 648.7 GB/s (bf16) | **hardware** — needs two devices | same box. Note this op reads its operands exactly once, which is why it tops the Neuron memory-bound table |
+| `xccl_ops/{device2host,host2device}.json` | 2 | 14.3 / 14.0 GB/s at ws=2, and the ws=4 column is not comparable (1 GiB cap, four ranks sharing one host DMA path) | **none** — these are single-device host copies and run on a p5.4xlarge as-is | **cheapest thing on this list**, and the only row here that can be closed without another instance. It is also the one number in the comparison governed by neither chip's HBM but by a host link, so 14.3 GB/s currently has nothing to be read against. Worth having for exactly that reason |
+| `single_test_ops/gemm_ops.json` | `moe_gating_gemm`, `quant_matmul`, `moe_quant_group_gemm` | `moe_gating_gemm` 21.89 TF / **48% MFU**; `quant_matmul` 15.78 "TOPS"; `moe_quant_group_gemm` **2.67-2.84 s at every shape** | **none** | run it. `moe_gating_gemm` is the interesting one — the only genuine compute-bound row outside plain `gemm`, at 48% of the fp32 peak against `gemm`'s 82% at the same dtype, with no GPU control to say which of those two numbers is the anomaly. The other two route through `fake_quant_gemm` and are [a bf16 simulation on every backend](../NEURON/README.md#the-quantized-ops-are-a-bf16-simulation-on-every-backend), so a GPU column there measures the same shared helper the `_dynamic_quant` rows already exposed |
+| `single_test_ops/moe_dispatch_ops.json` | `moe_scatter_dynamic_quant` | 0.7 GB/s | **none** | run it. At 0.7 GB/s it is in `gather`/`scatter` territory, and the GPU column is what would say whether that is the op def or the lowering — exactly the question the H100 settled for `gather` |
+| `single_test_ops/moe_combine_ops.json` | `moe_gather`, `moe_quant_group_gemm_combine` | `moe_gather` 9.2 GB/s | **none** | run it, same reason — `moe_gather` at 9.2 GB/s is 68x off `index_select` on the same chip |
+| `single_test_ops/fa_ops.json` | paged `flash_attention` | **0 cases** — every case sets `block_size: 512` and no Neuron provider takes a block table | **the Neuron side**, not this one | the GPU can fill it in under `MODE=docker` (`flash_attn` does take a block table) and the sweep script already calls it, but there would be nothing to compare it against |
+| `single_test_ops/pre_fa_ops.json` → `store_kv_cache` | 1 | **0 cases on either backend** | **base op def** — `store_kv_cache.py:257` raises on a paged cache and `:248` hits `KeyError: 'v_cache'` for `store_mode: "k"` | fix the op def first; this is shared code, so it is not a Trainium item |
+| `vendor_test/quant_matmul.json`, `vendor_test/moe_quant_group_gemm.json` | 2 | 85 of 184 runnable, and **15 of 276** — ~16 min of wall clock per 2.7 s measurement | **none**, but the cost is prohibitive | not worth a GPU run until `moe_quant_group_gemm`'s per-expert host sync is fixed; `single_test_ops/gemm_ops.json` covers the same ops cheaply |
+| `vendor_test{,_demo}/flash_attention.json` | 1 | **0 cases** (paged, plus `attn_mode=decode`) | same as `fa_ops.json` | subsumed by it |
+
+One further gap belongs to neither backend: **`dequant_kv_cache` appears in no
+workload JSON anywhere in the repo**, so it is untested rather than unsupported on
+both. Twelve ops were in that position until this port added
+`single_test_ops/{norm_ops,activation_ops,moe_gating_ops,quant_ops}.json`; this is
+the thirteenth.
 
 ## Quick start
 
@@ -624,14 +657,25 @@ stands, but the op does not do what its comment says.)
 
 ## What is not measured here
 
-- **Collectives.** `workloads/xccl_ops/` and `single_test_ops/ccl_ops.json` need
-  `world_size > 1`; a p5.4xlarge has one GPU. The Trainium side has `world_size`
-  2 and 4 numbers on a trn2.3xlarge's four cores, and there is no single-GPU
-  equivalent to compare them to. A p5.48xlarge (8x H100 + NVLink) would be the
-  comparison, and NVLink-vs-NeuronLink is likely the most consequential remaining
-  difference for training-scale work.
-- **Paged attention.** `fa_ops.json` needs a block table, which SDPA does not
-  take. The `fa2` provider does, so this is measurable on the GPU under
-  `MODE=docker` — but there is nothing to compare it to, since no Neuron provider
-  accepts a paged cache on either runtime.
-- **Multi-chip anything**, and **`torch.compile`** on either side.
+Workload coverage — which files have a Trainium2 number and no GPU column, and
+what blocks each — is a table in the Summary:
+[What this table does not cover yet](#what-this-table-does-not-cover-yet).
+Everything there is a TODO with a named file.
+
+What is missing for reasons that are *not* about workload coverage:
+
+- **Multi-chip anything.** One H100 against one Trainium2 chip is the widest
+  comparison here. Nothing in this document constrains how either scales past one
+  package, and the collectives rows that would are the hardware-blocked entries in
+  the table above.
+- **`torch.compile` on either side.** Both backends are measured eager, which is
+  what `launch.py` runs. That is not a neutral choice: it is precisely what made
+  the fp8 row read as 99x instead of 1.56x, and there is no reason to assume fp8
+  is the only op where it matters. Any op whose Neuron number looks like an
+  un-fused chain of elementwise passes — the `_dynamic_quant` family,
+  `rotary_embedding` — is a candidate for the same correction, on both backends.
+- **Numerics.** Every number here is latency or bandwidth. No case checks output
+  against a reference, so a lowering that is fast because it is wrong would not be
+  caught. Two bugs found in this port by reading rather than measuring
+  (`smooth_per_token_dynamic_quant`'s scale multiply, `head_rms_norm`'s in-place
+  claim) are the argument for adding that check.

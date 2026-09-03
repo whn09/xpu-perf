@@ -71,6 +71,30 @@ This changelog follows semantic versioning and Keep a Changelog style.
 
 ### Changed
 
+- `projects/micro_perf/vendor_ops/GPU/README.md`,
+  `projects/micro_perf/vendor_ops/GPU/tools/run_comparison_sweep.sh`,
+  `projects/micro_perf/vendor_ops/NEURON/README.md`: **the GPU Summary table read
+  as an inventory of the workload tree and was only the measured subset of it.**
+  Twelve workload files have a Trainium2 number and no GPU column, so no ratio can
+  be quoted for them, and the table gave no sign they existed. A new
+  `What this table does not cover yet` subsection tabulates all of them with the
+  op names, what the Trainium2 side got, the blocker, and what closing the row
+  would settle. The split that matters is that only three of the entries are
+  hardware-blocked — the four collectives and `device2device` need more than the
+  one GPU a p5.4xlarge has — while five files
+  (`xccl_ops/device2host.json`, `xccl_ops/host2device.json`,
+  `single_test_ops/gemm_ops.json`, `moe_dispatch_ops.json`,
+  `moe_combine_ops.json`) are runnable on the existing instance and are missing
+  only because nobody has run them. The same list is now a TODO block in the sweep
+  script, next to the existing "deliberately NOT here" note, so the two cannot
+  drift. `What is not measured here` at the foot of the README stops duplicating
+  the coverage list and instead records the gaps that are not about coverage:
+  multi-chip scaling, `torch.compile` on either side (the fp8 correction is the
+  demonstration that this is not a neutral omission), and the absence of any
+  numerical check, which is what let two op-def bugs in this port be found by
+  reading rather than by measuring. The NEURON README's own
+  `Most workloads/llm/ cases do not run` table now cross-links to it, since the
+  two cover mirror-image gaps.
 - `projects/micro_perf/vendor_ops/NEURON/README.md`,
   `projects/micro_perf/vendor_ops/GPU/README.md`: **every per-chip Trainium2
   figure is now measured instead of extrapolated.** Running the compute-bound,

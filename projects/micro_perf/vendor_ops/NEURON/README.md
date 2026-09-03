@@ -709,6 +709,15 @@ measurement behind this, and why `torch.compile` does not fix it, is in
 | `vendor_test/moe_quant_group_gemm.json` | 1380 | **15**, of 276 runnable | same dtype gate, but far worse per case: 15 in 4 h, ~16 min of wall clock each |
 | `single_test_ops/ccl_ops.json` | — | **0** | asks for `world_size: 8`; a trn2.3xlarge has 4 logical cores |
 
+That table is about cases this backend cannot run. The mirror-image gap — files
+that *do* have a number here but none on the GPU, so no cross-backend ratio can be
+quoted — is tabulated in
+[`../GPU/README.md`](../GPU/README.md#what-this-table-does-not-cover-yet). The
+collectives and `device2device` are hardware-blocked on a single-GPU box; five
+files (`xccl_ops/device2host.json`, `xccl_ops/host2device.json`,
+`single_test_ops/gemm_ops.json`, `moe_dispatch_ops.json`, `moe_combine_ops.json`)
+are not, and are simply not run yet.
+
 The XLA figures above come from `workloads/neuron_smoke/flash_attention.json`, the
 only flash_attention workload in the repo that the NKI path can run: no
 `block_size`, MHA `[8, 8, 128]`, all-bfloat16. `flash_fwd` takes one contiguous

@@ -6,11 +6,32 @@
 #
 # What is deliberately NOT here:
 #
-#   * workloads/xccl_ops/ and llm/single_test_ops/ccl_ops.json -- a single-GPU box
-#     has world_size 1, so there is no collective to measure. Same reason
-#     ccl_ops.json has no runnable case on a trn2.3xlarge (it asks for 8).
+#   * workloads/xccl_ops/{all_reduce,all_gather,reduce_scatter,all_to_all,
+#     device2device}.json and llm/single_test_ops/ccl_ops.json -- a single-GPU box
+#     has world_size 1, so there is no collective to measure, and device2device
+#     needs two devices. Same reason ccl_ops.json has no runnable case on a
+#     trn2.3xlarge either (it asks for 8).
 #   * --task all over a whole directory. Independent per-file launches mean one
 #     op wedging the machine costs one file's report, not the sweep's.
+#
+# TODO -- these have Neuron numbers, are NOT hardware-blocked on a p5.4xlarge, and
+# are missing only because nobody has run them. See GPU/README.md, "What this table
+# does not cover yet", for what each one would settle:
+#
+#   * workloads/xccl_ops/{device2host,host2device}.json -- single-device host
+#     copies, so they run here as-is. Cheapest item on the list.
+#   * workloads/llm/single_test_ops/gemm_ops.json -- moe_gating_gemm (48% MFU on
+#     Neuron and no GPU control), quant_matmul, moe_quant_group_gemm.
+#   * workloads/llm/single_test_ops/moe_dispatch_ops.json -- moe_scatter_dynamic_quant,
+#     0.7 GB/s on Neuron, i.e. gather/scatter territory; the GPU column is what
+#     would say whether that is the op def or the lowering.
+#   * workloads/llm/single_test_ops/moe_combine_ops.json -- moe_gather (9.2 GB/s
+#     on Neuron, 68x off index_select on the same chip) and
+#     moe_quant_group_gemm_combine.
+#
+# Adding them is four more run_one lines; they are left out rather than added
+# untested so that this script stays a description of what the published numbers
+# were actually taken with.
 #
 # Read the results with the same analyzer as the Neuron side:
 #   python3 vendor_ops/NEURON/tools/analyze_sweep.py <log>
