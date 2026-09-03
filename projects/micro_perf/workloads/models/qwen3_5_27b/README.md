@@ -9,15 +9,29 @@ a new op: every key is an op already registered in `op_defs/`, so these files ru
 today on both backends. What the model needs and the harness *cannot* express yet is
 listed at the end, and that list is the more interesting half of this directory.
 
-Run them with the sweep scripts, which have a gated label per file:
+Run them with the sweep scripts. `ONLY=qwen3_5_27b` is a prefix group and selects every
+label in this directory, so the whole set is one command per backend and lands in one
+tree — which is how every table below was produced:
 
 ```bash
-# GPU
-LIST=1 vendor_ops/GPU/tools/run_comparison_sweep.sh | grep qwen
-ONLY=qwen3_5_27b_gemm vendor_ops/GPU/tools/run_comparison_sweep.sh
+# Neuron, all eight files
+RESULTS=/tmp/qwen3_5_27b_neuron LOG=/tmp/qwen3_5_27b_neuron.log \
+    ONLY=qwen3_5_27b vendor_ops/NEURON/tools/run_full_sweep.sh
 
-# Neuron
-ONLY=qwen3_5_27b_gemm,qwen3_5_27b_attention vendor_ops/NEURON/tools/run_full_sweep.sh
+# H100, all eight files (ccl_ops needs 4 GPUs and writes nothing on a one-GPU box)
+RESULTS=/tmp/qwen3_5_27b_gpu ONLY=qwen3_5_27b \
+    vendor_ops/GPU/tools/run_comparison_sweep.sh 2>&1 | tee /tmp/qwen3_5_27b_gpu.log
+```
+
+Results land under `$RESULTS/<label>/<backend>/<sku>/<op>/<provider>/`, so the two trees
+line up op by op and provider by provider. Both scripts write incrementally, one launch
+per file, so a wedged op costs its own file and nothing behind it.
+
+One label at a time still works, and is what checking a single row below needs:
+
+```bash
+LIST=1 vendor_ops/GPU/tools/run_comparison_sweep.sh | grep qwen   # names + budgets
+ONLY=qwen3_5_27b_norm vendor_ops/NEURON/tools/run_full_sweep.sh
 ```
 
 or one file at a time through `launch.py --workload workloads/models/qwen3_5_27b/<f>.json`.
@@ -324,7 +338,8 @@ that are not are the whole result.
 | --- | --- | --- | --- |
 | `gemm`, dense bf16 | 4.42x | ~1.1x | **parity**, Trn2 slightly ahead |
 | `head_rms_norm` | 1.63x | 0.41x | Trn2 ahead |
-| `rms_norm` (small) / `qk_rms_norm` | 2.2x | 0.56x | Trn2 ahead — but see the caveat |
+| `qk_rms_norm` | 2.2x | 0.56x | Trn2 ahead |
+| `rms_norm`, fused NKI provider | 2.2-6.0x | 0.5-1.5x | **was 13.8x** — now at the memory roofline |
 | `reduce_sum`, `embedding`, `cast` | 2.4-3.2x | 0.6-0.8x | Trn2 ahead |
 | `swiglu`, `add_rms_norm` | 3.3-3.7x | ~0.9x | parity |
 | `silu`, `mul`, `exp` | 4.7-6.1x | 1.2-1.5x | parity, at the bandwidth ratio |
@@ -534,20 +549,86 @@ And it takes an `nl` dtype, never a numpy one — passing `np.float32` fails at 
 time, inside the kernel call, with `error: numpy dtypes are not supported as arguments`,
 which reads like a shape limitation rather than the one-word type bug it is.
 
-### `rms_norm`'s 14x is mostly a provider mismatch, but not entirely
+### `rms_norm` was 13.8-14.4x; it is now 5.0-6.0x — FIXED by a fused NKI kernel
 
-At 10240 tokens `rms_norm` is 13.8x (bf16) and 14.4x (fp32) raw — far outside the band.
-Provider labels explain most of it: the H100 runs **`flashinfer`/`vllm`** fused kernels
-at 2638-2780 GB/s, Trn2 runs **`base`** torch. That is not an apples-to-apples
-comparison of silicon, and the honest statement is that Neuron has no fused RMSNorm
-provider registered in this harness.
+At 10240 tokens `rms_norm` was 13.8x (bf16) and 14.4x (fp32) raw. Part of that was a
+provider mismatch — the H100 runs **`flashinfer`/`vllm`** fused kernels at 2638-2780
+GB/s and Trn2 ran plain torch — but unlike `gelu` there was nothing to blame on the op
+def: it already calls the single fused aten op, `torch.nn.functional.rms_norm`
+(`op_defs/basic_ops/vector_norm_ops.py:130`), not a hand-rolled decomposition.
 
-The residue is still real, though: Trn2's `base` rms_norm gets 190.9 GB/s at 10240
-tokens and 297-331 GB/s at 4096 — **declining with size, and 2.5x under `silu`'s
-475 GB/s on the same chip**. So even against its own elementwise roofline there is
-about 2.5x available here. `add_rms_norm`, `qk_rms_norm` and `head_rms_norm` run `base`
-on *both* sides and sit at 1.6-3.7x raw, i.e. Trainium2 ahead per chip — which is the
-cleaner comparison and the reason to read the 14x as software, not hardware.
+**The cost was the row reduction, and it was a separate pass over HBM.** Measured on
+one logical core at 10240 × 5120 bf16, alongside controls on the same bytes. These seven
+rows come from `vendor_ops/NEURON/tools/probe_rms_norm_lowering.py`, not from the
+harness — forms like `x*x` alone are not ops and have no workload — so they carry that
+script's own timing loop and read 2-3% higher than the harness's number for the same
+form (1127.3 us here against 1095.3 in the table below). The comparison inside the
+table is what it is for; nothing published elsewhere in this repo depends on it:
+
+| form | latency | GB/s |
+| --- | --- | --- |
+| `F.rms_norm` — what the op def calls | 1127.3 us | 186.0 |
+| hand-written, native dtype | 2099.6 us | 99.9 |
+| hand-written, fp32 reduction | 3824.7 us | 54.8 |
+| **reduce only: `(x*x).mean(-1)`** | **934.7 us** | **112.2** |
+| square only: `x*x` | 533.3 us | 393.2 |
+| control: `silu` | 464.2 us | 451.8 |
+| control: `x.clone()` | 362.1 us | 579.2 |
+
+The reduce-only row is the finding: **83% of the whole op is the row reduction**, which
+moves the input once, writes `[T, 1]`, and still gets 112 GB/s — a quarter of what the
+same core does on `silu`. And no torch-level spelling helps: writing the arithmetic out
+is 1.9x *worse* natively and 3.5x worse with an fp32 reduction, because on an eager
+backend every intermediate is a whole tensor through HBM.
+
+**Fixed by a kernel:** `vendor_ops/NEURON/ops/nkilib/rms_norm.py`, a second provider,
+loads a 128-row tile into SBUF once and does the square, the row sum, the rsqrt and both
+multiplies on-chip. Two `nisa` instructions carry it — `nisa.activation` squares *and*
+free-axis-reduces in the same pass, `nisa.scalar_tensor_tensor` applies
+`(x * inv_rms) * gamma` in one — and the grid is 2, because a logical core is two
+physical halves and `grid=1` leaves half of it idle (1.62x on this op alone). Both
+providers run every case, and these twelve rows are the harness's own, one
+`ONLY=qwen3_5_27b_norm vendor_ops/NEURON/tools/run_full_sweep.sh` run over
+`norm_ops.json` with no failures:
+
+| dtype | tokens | torch | nkilib | nkilib GB/s | best H100 | was | now |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bf16 | 1 | 64.6 us | 88.9 us | 0.3 | 46.5 us | 1.39x | 1.91x |
+| bf16 | 16 | 58.2 us | 85.5 us | 4.0 | 36.0 us | 1.62x | 2.38x |
+| bf16 | 64 | 59.7 us | 90.4 us | 14.6 | 35.9 us | 1.66x | 2.52x |
+| bf16 | 1024 | 92.2 us | 92.2 us | 227.5 | 41.7 us | 2.21x | 2.21x |
+| bf16 | 4096 | 282.5 us | **203.2 us** | 412.8 | 41.2 us | 6.86x | **4.93x** |
+| bf16 | 10240 | 1095.3 us | **475.8 us** | 440.7 | 79.5 us | 13.78x | **5.98x** |
+| fp32 | 1 | 62.0 us | 88.0 us | 0.7 | 41.2 us | 1.50x | 2.14x |
+| fp32 | 16 | 66.1 us | 83.3 us | 8.1 | 32.4 us | 2.04x | 2.57x |
+| fp32 | 64 | 66.2 us | 90.2 us | 29.3 | 31.8 us | 2.08x | 2.84x |
+| fp32 | 1024 | 119.4 us | **103.7 us** | 404.5 | 36.5 us | 3.27x | **2.84x** |
+| fp32 | 4096 | 501.2 us | **308.9 us** | 543.2 | 71.3 us | 7.03x | **4.33x** |
+| fp32 | 10240 | 2178.5 us | **763.0 us** | 549.8 | 150.9 us | 14.44x | **5.06x** |
+
+440.7 GB/s is 98% of `silu`'s 451.8 on the same core and dtype, and the fp32 rows go
+higher still at 549.8, so the kernel is at the streaming roofline and what is left is the
+memory system. Per chip the worst row moves from **3.45x to 1.50x** (bf16) and **3.61x to
+1.26x** (fp32), against the 1.16x an HBM-bound op should show from the 2.9 vs 3.35 TB/s
+ratio. Values match aten to rounding (0.01563 bf16 against its 0.01562; 0.00001 fp32
+against its 0.00000).
+
+Below 1024 tokens the kernel loses by a flat 20-30 us — at 1-64 tokens the op moves
+0.03-1.3 MB and both providers are measuring fixed cost, of which the nki path has more.
+That crossover is left visible in the results rather than hidden behind a `vendor_parser`
+rejection, exactly as `topk`'s is.
+
+Two notes. The provider needed `vendor_ops/NEURON/ops/torch/rms_norm.py` alongside it,
+because a vendor provider *replaces* the base implementation instead of joining it
+(`core/op.py:153-155`) — without it the aten baseline above would have stopped being
+measured, silently. And these rows now land under `rms_norm/torch/` where they used to be
+`rms_norm/base/`.
+
+`add_rms_norm`, `qk_rms_norm` and `head_rms_norm` still run torch on *both* sides — the
+H100 has no fused provider for them either — and sit at 1.6-3.7x raw, i.e. Trainium2
+ahead per chip. So a kernel for them would widen a win rather than close a gap, which is
+why this one came first; the same 112 GB/s reduction is inside all three, so the headroom
+against the roofline is there whenever it is wanted.
 
 ### Partial rotary saves the H100 3.6x and Trainium2 almost nothing
 
@@ -608,22 +689,24 @@ for this *model*:
 So parity is a statement about the chip, not a prediction about this checkpoint. All
 four items are fixable in kernels; none requires different hardware.
 
-**Three of the four have since been worked, and the results are in the sections above.**
-Each was a different kind of fix, which is the useful part:
+**Four gaps have since been worked, and the results are in the sections above.** Each was
+a different kind of fix, which is the useful part:
 
 | gap | before | after | what the fix was |
 | --- | --- | --- | --- |
 | `gelu` | 15.41x per chip | **4.35x** | the benchmark was measuring the erf form; the model asks for the tanh form. `erf` has no fast lowering, `tanh`/`sigmoid`/`exp` all reach the roofline. Op def now exposes torch's `approximate`. |
 | `topk` | 14.2x per chip worst | **2.91x** | nkilib already ships `rotational_topk`, which is flat in `k`. 40-line provider, up to 8.8x. |
 | attention `head_dim 256` | 153.6x raw worst | **38.4x** | tile the query axis so the 5.03 GB score matrix never lands whole. No kernel, and it no longer grows with context. |
+| `rms_norm` | 3.45x per chip (bf16), 3.61x (fp32) | **1.50x / 1.26x** | 83% of the op was the row reduction, as its own HBM pass at 112 GB/s. A written-from-scratch fused NKI kernel reaches 440/554 GB/s, 94-97% of `silu`'s. |
 | `all_reduce` at TP=4 | 4.1x over budget | — | not attempted; it is fixed overhead, not bandwidth. |
 
-None of the three needed new hardware and only one needed a NKI kernel that someone had
-already written. The residues are all still real and all still software: a fused NKI gelu
-is worth ~2.9x more, a 256-partition flash kernel ~3x more, and `rms_norm` has an
-unwired `rmsnorm_tkg` kernel worth ~2.5x. The honest revised claim is that the parity
-expectation holds for the chip and holds for this model *to within the coverage of the
-kernel library*, which is a moving target rather than a limit.
+None of the four needed new hardware; one needed a NKI kernel someone had already
+written, one needed a new one, and two needed no kernel at all. The residues that remain
+are still software: a fused NKI gelu is worth ~2.9x more and a 256-partition flash kernel
+~3x more, while `rms_norm` is now at its memory system's limit and has nothing left to
+give. The honest revised claim is that the parity expectation holds for the chip and holds
+for this model *to within the coverage of the kernel library*, which is a moving target
+rather than a limit.
 
 ## Runtime hazard: `max_data_cnt` on the GPU backend
 
@@ -700,11 +783,18 @@ above, so what is missing is the op def that would call it, not the kernel:
 | 3. `cumsum` | `core/cumsum/cumsum.py` |
 | 7. `where`, and 8. `pad` | `experimental/pad/pad.py`, `experimental/misc/{gather,scatter_add}.py` |
 | `topk` (fixed above) | `core/topk/rotational_topk.py`, `experimental/topk/{gpsimd_topk}.py` |
-| `rms_norm` (see its section) | `core/subkernels/rmsnorm_tkg.py`, `core/rmsnorm/{rmsnorm_quant,rmsnorm_mx_prefill}.py` |
+| `rms_norm` (fixed above, own kernel) | `core/subkernels/rmsnorm_tkg.py`, `core/rmsnorm/{rmsnorm_quant,rmsnorm_mx_prefill}.py` |
 | `rotary_embedding` | `core/embeddings/rope.py` |
 
 Item 4 (triangular inverse) and item 5 (`softplus`) have no obvious counterpart. The
 `topk` row is the worked example of what wiring one costs: an op def already existed, so
-it took a 40-line provider and produced up to 8.8x. `rms_norm` is the next such case —
-that section's 14x is a `flashinfer`-vs-`base` provider mismatch, and
-`rmsnorm_tkg.py` is what would make it like for like.
+it took a 40-line provider and produced up to 8.8x.
+
+`rms_norm` is the other kind of example, and the reason this table says "ships a kernel"
+rather than "ships the kernel you want". `rmsnorm_tkg.py` exists, and it is written for a
+different caller: it puts the hidden dimension on the 128 partitions and returns
+`[128, BxS, H//128]`, because its consumer is a sharded matmul that wants that layout
+anyway. This harness declares `dst` as `[T, H]`, so using it would move the cost into a
+transpose inside the timed region. The 2.3-2.9x in that section came from writing a
+~30-line kernel with rows on the partitions instead — cheaper than making someone else's
+layout fit.

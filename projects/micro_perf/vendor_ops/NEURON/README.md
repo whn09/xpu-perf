@@ -1570,10 +1570,17 @@ tail -f /tmp/neuron_sweep.log        # the script logs to a file, not the termin
 # Several. Commas or spaces, either works.
 ONLY=basic_index_ok,basic_index_slow IMAGE=xpu-perf-eager:latest \
     vendor_ops/NEURON/tools/run_full_sweep.sh
+
+# A whole family. A token also matches labels that start with it plus "_", so this
+# runs all eight model-shaped files into one tree.
+RESULTS=/tmp/qwen3_5_27b_neuron LOG=/tmp/qwen3_5_27b_neuron.log \
+    ONLY=qwen3_5_27b vendor_ops/NEURON/tools/run_full_sweep.sh
 ```
 
-`ONLY` matches whole labels only, so `ONLY=gemm` selects nothing rather than
-quietly running `single_gemm_ops`. Everything else is unchanged: the log format and
+`ONLY` matches whole labels, or a label prefix ending at an underscore — so
+`ONLY=gemm` still selects nothing rather than quietly running `single_gemm_ops`, while
+`ONLY=qwen3_5_27b` and `ONLY=chip4` select their families. Everything else is unchanged:
+the log format and
 the `$RESULTS/<label>/` layout are identical to a full run, so
 `analyze_sweep.py` reads a one-label log the same way. The
 [waiting-for-an-idle-chip behaviour](#reproducing-the-full-sweep) still applies to

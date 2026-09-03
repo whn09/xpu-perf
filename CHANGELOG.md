@@ -82,15 +82,16 @@ This changelog follows semantic versioning and Keep a Changelog style.
   above: they measure the op defs' per-sequence Python loop on both backends, and their
   224 ms / 2.3 ms ratio is launch overhead, not a chip result.
 
-- **Three of the four gaps above are now closed as far as they go without new
-  kernels**, each by a different mechanism, and each verified end-to-end through the
-  harness on both backends rather than in a standalone script:
+- **Four of the gaps above are now closed**, each by a different mechanism, and each
+  verified end-to-end through the harness on both backends rather than in a standalone
+  script:
 
   | gap | before | after | mechanism |
   | --- | --- | --- | --- |
   | `gelu` | 15.41x per chip | **4.35x** | the benchmark was measuring the wrong function |
   | `topk` | 14.2x per chip worst | **2.91x** | wire up a kernel nkilib already ships |
   | attention `head_dim 256` | 153.6x raw worst | **38.4x** | tile the query axis; no kernel at all |
+  | `rms_norm` | 3.45x per chip bf16, 3.61x fp32 | **1.50x / 1.26x** | write the kernel nkilib does *not* ship in this layout |
 
 - `projects/micro_perf/op_defs/basic_ops/vector_activation_ops.py`: `GeluOp` now takes
   an `approximate` argument, torch's own, defaulting to `"none"` so every pre-existing
@@ -129,6 +130,61 @@ This changelog follows semantic versioning and Keep a Changelog style.
   numpy dtypes are not supported as arguments`, which reads like a shape limitation
   rather than the one-word type bug it is.
 
+- `projects/micro_perf/vendor_ops/NEURON/ops/nkilib/rms_norm.py`: a second `rms_norm`
+  provider, and a kernel written here rather than wired up — nkilib's `rmsnorm_tkg`
+  produces `[128, BxS, H//128]`, the layout its own sharded-matmul caller wants, and the
+  harness declares `dst` as `[T, H]`, so using it would move the cost into a transpose
+  inside the timed region.
+
+  Unlike `gelu` there was nothing to fix in the op def: it already calls the single fused
+  aten op. The finding is *where* the time goes. At 10240 × 5120 bf16 on one logical
+  core, `(x*x).mean(-1)` **alone** costs 934.7 us of the whole op's 1127.3 at 112.2 GB/s,
+  while `x*x` alone is 533.3 (393.2 GB/s), `silu` 464.2 (451.8) and a bare `clone()`
+  362.1 (579.2) — so 83% of the op is the row reduction, as its own pass over HBM, and
+  the multiply is another one after it. No torch-level spelling helps: written out by
+  hand it is 1.9x *worse* natively and 3.5x worse with an fp32 reduction, because on an
+  eager backend every intermediate is a whole tensor through HBM.
+
+  The kernel loads a 128-row tile into SBUF once and does the square, the row sum, the
+  rsqrt and both multiplies on-chip. Two `nisa` instructions carry it:
+  `nisa.activation` squares **and** free-axis-reduces in the same pass
+  (`reduce_op`/`reduce_res`), and `nisa.scalar_tensor_tensor` applies
+  `(x * inv_rms) * gamma` in one pass with the `[p, 1]` broadcast free. Rows go on the
+  128 partitions, which keeps the reduction on the cheap axis and both DMAs contiguous.
+  Both providers run every case (harness-measured, `ONLY=qwen3_5_27b_norm`):
+
+  | dtype | tokens | `torch` | `nkilib` | GB/s | best H100 | was | now |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | bf16 | 1024 | 92.2 us | 92.2 us | 227.5 | 41.7 us | 2.21x | 2.21x |
+  | bf16 | 4096 | 282.5 us | **203.2 us** | 412.8 | 41.2 us | 6.86x | **4.93x** |
+  | bf16 | 10240 | 1095.3 us | **475.8 us** | 440.7 | 79.5 us | 13.78x | **5.98x** |
+  | fp32 | 1024 | 119.4 us | **103.7 us** | 404.5 | 36.5 us | 3.27x | **2.84x** |
+  | fp32 | 4096 | 501.2 us | **308.9 us** | 543.2 | 71.3 us | 7.03x | **4.33x** |
+  | fp32 | 10240 | 2178.5 us | **763.0 us** | 549.8 | 150.9 us | 14.44x | **5.06x** |
+
+  440.7 GB/s is 98% of `silu`'s 451.8 on the same core and dtype, i.e. the streaming
+  roofline, and 1.50x/1.26x per chip against the 1.16x an HBM-bound op should show. Below
+  1024 tokens the kernel loses by a flat 20-30 us of fixed cost; that crossover is left
+  visible in the results rather than hidden behind a `vendor_parser` rejection, as
+  `topk`'s is.
+  Values match aten to rounding (bf16 0.01563 against its 0.01562, fp32 0.00001 against
+  0.00000).
+
+  Four things about nki 0.6.0 that each cost a run to find, all recorded in the file:
+  **`nl.rms_norm` is unusable** — it hands its own `[p, 1]` rsqrt to
+  `nisa.tensor_tensor`, which rejects it (`'dst' free total elements 5120 != 'rhs' free
+  total elements 1`), at *lowering* time. **`nl.tile_size` properties cannot be read
+  outside a kernel trace**: they resolve the NeuronCore generation through an nki backend
+  that only exists while tracing, so reading one in `vendor_parser` fails every case of
+  the op with "No backend set. Call `_activate_backend()`…", naming none of this; the
+  SBUF bound is now a documented constant. **nki traces the source of every function a
+  kernel calls**, so it refuses a `raise` in a helper ("NKI does not support 'raise'
+  statements") and refuses a call to a nested `def` ("inner functions can only be used
+  as fori_loop/while_loop body arguments") — the tile arithmetic is therefore raise-free
+  and the loop body inline. And **the grid is not optional**: `grid=1` gives 815.7 us
+  where `grid=2` gives 502.8, 1.62x for a launch subscript, because a logical core is two
+  physical halves at `logical-neuroncore-config: 2`.
+
 - `projects/micro_perf/vendor_ops/NEURON/ops/torch_tiled/`: a third `flash_attention`
   provider for the `head_dim > 128` prefill shapes that reach **no** fused path — same
   SDPA, called once per query tile. The motivation is the superquadratic scaling
@@ -149,7 +205,8 @@ This changelog follows semantic versioning and Keep a Changelog style.
   non-square score matrix while a query tile against its prefix needs bottom-right.
 
 - `projects/micro_perf/vendor_ops/NEURON/tools/probe_gelu_lowering.py`,
-  `probe_attention_head_dim_256.py`, `probe_topk_rotational.py`: the three measurements
+  `probe_attention_head_dim_256.py`, `probe_topk_rotational.py`,
+  `probe_rms_norm_lowering.py`: the four measurements
   the fixes above were decided from, kept because each answers a question that recurs.
   Respectively: which formulation of an activation the backend actually lowers well;
   whether a `head_dim` over the partition limit can be rescued by tiling rather than by
@@ -173,6 +230,16 @@ This changelog follows semantic versioning and Keep a Changelog style.
   `ops/torch/flash_attention.py` beside `ops/nkilib/flash_attention.py`. Both providers
   now run all 36 cases. Note the path rename: these rows land in `topk/torch/` where
   they used to land in `topk/base/`.
+
+- `projects/micro_perf/vendor_ops/NEURON/ops/torch/rms_norm.py`: the same base-suppression
+  trap, for the `rms_norm` provider above, and worth a second entry because it is now
+  confirmed to be a property of the registry rather than something specific to `topk`:
+  adding `ops/nkilib/rms_norm.py` alone would have stopped `F.rms_norm` being measured at
+  all, taking with it the baseline every ratio in that entry is quoted against. Both
+  providers now run all 12 cases, and it is also what covers the shapes the kernel
+  rejects (a token count that does not split into equal 128-row tiles, a hidden size too
+  wide for one partition's SBUF, `add_residual`, `float16`). Same path rename:
+  `rms_norm/torch/` where these rows used to be `rms_norm/base/`.
 
 - `projects/micro_perf/vendor_ops/NEURON/ops/nkilib/flash_attention.py`: the prefill
   rejection message told the reader that prefill "is measured by the `torch` provider,
@@ -288,6 +355,28 @@ This changelog follows semantic versioning and Keep a Changelog style.
   because its failure latches an error that the *next* device op inherits.
 
 ### Changed
+
+- Both sweep scripts (`vendor_ops/NEURON/tools/run_full_sweep.sh`,
+  `vendor_ops/GPU/tools/run_comparison_sweep.sh`): **`ONLY` now also accepts a prefix
+  group** — a token matches every label beginning with it followed by an underscore. So
+  the model-shaped set is `ONLY=qwen3_5_27b` rather than eight comma-separated labels
+  nobody retypes correctly, and with `RESULTS=` it lands in one tree per backend:
+
+  ```bash
+  RESULTS=/tmp/qwen3_5_27b_neuron LOG=/tmp/qwen3_5_27b_neuron.log \
+      ONLY=qwen3_5_27b vendor_ops/NEURON/tools/run_full_sweep.sh
+  RESULTS=/tmp/qwen3_5_27b_gpu ONLY=qwen3_5_27b \
+      vendor_ops/GPU/tools/run_comparison_sweep.sh 2>&1 | tee /tmp/qwen3_5_27b_gpu.log
+  ```
+
+  `ONLY=chip4` gets the four four-core labels the same way. Whole-label matching is tried
+  first, so a group name cannot shadow a label, and the documented guarantee that
+  `ONLY=gemm` does **not** select `single_gemm_ops` still holds — the prefix has to end at
+  an underscore. Both scripts keep identical `want()` semantics on purpose: the two sides
+  of a comparison have to be selectable the same way. This is deliberately not a new
+  script; a second file with its own list of labels is what
+  `run_new_workloads.sh` was, and it drifted (see the note at the top of
+  `run_full_sweep.sh`).
 
 - `projects/micro_perf/vendor_ops/GPU/README.md`: the `Cross-chip decode, on the
   aligned workload` subsection **moves out of the Summary and into `## Attention`**,

@@ -69,6 +69,17 @@
 #   ONLY=gemm ./run_comparison_sweep.sh       # run just that label
 #   ONLY=gemm,single_fa_linear_ops ...        # or several; a space-separated
 #                                             # "gemm single_fa_linear_ops" also works
+#   ONLY=qwen3_5_27b ./run_comparison_sweep.sh # or a whole prefix group: every
+#                                             # qwen3_5_27b_* label, one command
+#
+# The model-shaped set in one tree, to be compared against the Neuron tree the same
+# ONLY produces there:
+#
+#   RESULTS=/tmp/qwen3_5_27b_gpu ONLY=qwen3_5_27b ./run_comparison_sweep.sh \
+#       2>&1 | tee /tmp/qwen3_5_27b_gpu.log
+#
+# qwen3_5_27b_ccl is in that group and needs 4 GPUs; on a one-GPU box it writes
+# nothing, which is expected and not a failure of the rest.
 #
 # The log and $RESULTS layout are unchanged under ONLY, so the Neuron side's
 # analyze_sweep.py works on a one-label log exactly as on a full one. Every label
@@ -98,9 +109,19 @@ W=workloads
 # script and the NEURON sweep script would otherwise disagree on the delimiter, which
 # is a trap worth spending one substitution on. The match is on a whole delimited
 # word, so ONLY=gemm cannot also select single_gemm_ops.
+#
+# A token may also name a *prefix group*: it selects every label that begins with it
+# followed by an underscore, so `ONLY=qwen3_5_27b` runs the whole model-shaped set in
+# section 6 with one word. Kept identical to the Neuron script's `want()` on purpose
+# -- the two sides of a comparison have to be selectable the same way. Whole-word
+# matching still wins first, so a group name cannot shadow a label of the same name.
 want() {
     [ -z "$ONLY" ] && return 0
-    case " ${ONLY//,/ } " in *" $1 "*) return 0;; esac
+    local tok
+    for tok in ${ONLY//,/ }; do
+        [ "$tok" = "$1" ] && return 0
+        case "$1" in "$tok"_*) return 0;; esac
+    done
     return 1
 }
 

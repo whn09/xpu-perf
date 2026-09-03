@@ -49,6 +49,17 @@
 #                                           # arguments; touches no device
 #   ONLY=single_gemm_ops ./run_full_sweep.sh # run just that label
 #   ONLY=basic_index_ok,basic_index_slow ... # or several, comma-separated
+#   ONLY=qwen3_5_27b ./run_full_sweep.sh    # or a whole prefix group: all eight
+#                                           # qwen3_5_27b_* labels, one command
+#
+# The model-shaped set in one tree, which is how the Qwen3.5-27B tables in
+# ../../../workloads/models/qwen3_5_27b/README.md were produced:
+#
+#   RESULTS=/tmp/qwen3_5_27b_neuron LOG=/tmp/qwen3_5_27b_neuron.log \
+#       ONLY=qwen3_5_27b ./run_full_sweep.sh
+#
+# and the same two variables with ONLY=qwen3_5_27b against
+# ../../GPU/tools/run_comparison_sweep.sh give the tree to compare it against.
 #
 # Under ONLY the log and $RESULTS layout are unchanged, so analyze_sweep.py works
 # on a one-label log exactly as on a full one. Every label except xccl4, d2d and
@@ -78,9 +89,21 @@ fi
 # script and the GPU comparison script would otherwise disagree on the delimiter,
 # which is a trap worth spending one substitution on. The match is on a whole
 # word, so ONLY=gemm cannot also select single_gemm_ops.
+#
+# A token may also name a *prefix group*: it selects every label that begins with
+# it followed by an underscore. `ONLY=qwen3_5_27b` therefore runs all eight
+# qwen3_5_27b_* labels in section 9, which is the whole model-shaped workload set,
+# and `ONLY=chip4` runs the four four-core labels. That is one word instead of a
+# comma-separated list nobody can retype correctly, and -- unlike a second script
+# with its own list -- it cannot drift from the labels below. Whole-word matching
+# still wins first, so a group name can never shadow a label of the same name.
 want() {
     [ -z "$ONLY" ] && return 0
-    case " ${ONLY//,/ } " in *" $1 "*) return 0;; esac
+    local tok
+    for tok in ${ONLY//,/ }; do
+        [ "$tok" = "$1" ] && return 0
+        case "$1" in "$tok"_*) return 0;; esac
+    done
     return 1
 }
 
