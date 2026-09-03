@@ -97,6 +97,28 @@ This changelog follows semantic versioning and Keep a Changelog style.
 
 ### Changed
 
+- `projects/micro_perf/vendor_ops/GPU/README.md`: the `Cross-chip decode, on the
+  aligned workload` subsection **moves out of the Summary and into `## Attention`**,
+  next to the decode discussion it belongs to. It is a six-case eleven-column table
+  about one provider on one op, and sitting third from the top of the file it read as
+  if it were a headline. The Summary keeps the decode row and its link, so the anchor
+  still resolves from both places. Two claims in the section it moved next to are
+  corrected while touching it: the decode bullet said the 1.6-2.7x residual was "the
+  narrowest anywhere in this comparison outside the parity rows", which is wrong twice
+  over — it straddles the prefill bullet's 2.1x, and `rms_norm`/`layer_norm` sit at
+  1.5x — so it now says what actually distinguishes decode, that its residual stops
+  growing with problem size.
+- `projects/micro_perf/vendor_ops/GPU/README.md`: **the `gather`/`scatter` row now
+  says how much its 510x/715x costs an LLM, which is much less than the magnitude
+  suggests.** Nothing in `op_defs/llm_ops/` calls `torch.gather` or
+  `Tensor.scatter_`: the MoE combine path uses `index_add_` (`moe_gather.py:154`,
+  `moe_quant_group_gemm_combine.py:239`, and `llm_ops.md:768` states it outright),
+  embedding lookup uses `index_select`/`embedding`, and paged-KV gathering happens
+  inside an attention kernel. Those measure 3.8x, 0.98x and 0.97x respectively. The
+  row is therefore evidence about how neuronx-cc lowers a broadcast int64 index — a
+  class of bug worth knowing — not a cost an inference server pays today; the
+  LLM-shaped version of the question is `moe_scatter_dynamic_quant` (0.7 GB/s) and
+  `moe_gather` (9.2 GB/s), which still have no GPU column.
 - `projects/micro_perf/vendor_ops/GPU/README.md`: **the Summary table is rebuilt —
   grouped by op family, with the two normalisations separated into their own
   columns.** It had accumulated rows in no order (`gemm` at bf16, fp8 and fp32 were

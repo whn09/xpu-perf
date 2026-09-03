@@ -27,7 +27,7 @@ workload tree, and what is missing is listed with the reason
 | elementwise + reductions (13 of 24 ops) | **1.1-1.3x** | **0.93-1.15x** | parity, all within 15% of the H100's own %-of-peak: `add`, `sub`, `mul`, `div`, `exp`, `log`, `sqrt`, `silu`, `cast`, `softmax`, `reduce_sum`, `index_select`, `embedding` |
 | `rms_norm`, `layer_norm` | **1.7x** | **1.5x** | the only two of those 24 that are neither at parity nor pathological |
 | `gelu`, `sin`, `cos`, `reduce_max`, `reduce_min`, `index_add` | **4.0-8.9x** | **3.5-7.7x** | single-op lowering gaps, each with a fast sibling on the same chip — `silu` 1.09x against `gelu` 7.7x, `reduce_sum` 1.01x against `reduce_max` 3.5x, `index_select` 0.98x against `index_add` 3.8x |
-| `gather`, `scatter` | **510x / 715x** | **449x / 621x** | the op def is exonerated — the H100 runs both at 68-85% of peak. `gather` is one index dtype away from **1.08x**; `scatter` has no kernel at all |
+| `gather`, `scatter` | **510x / 715x** | **449x / 621x** | the op def is exonerated — the H100 runs both at 68-85% of peak. `gather` is one index dtype away from **1.08x**; `scatter` has no kernel at all. Basic-op forms: no `llm_ops` def calls either one, so read this as a lowering signal rather than a cost an LLM pays today ([why](#memory-bound-ops)) |
 | `topk`, `moe_softmax_topk` | **0.33x / 0.27x** | **0.29x / 0.23x** | Trainium2 3.0x and 3.7x ahead per chip, and the x4 behind that is measured at these shapes (4.01x, 4.00x) rather than assumed |
 | `add_rms_norm`, `qk_rms_norm`, `head_rms_norm`, `swiglu`, `moe_swiglu` | **0.40-1.46x** | **0.35-1.26x** | Trainium2 ahead on 8 of these 9 dtype/op rows, by up to 2.9x on `head_rms_norm` at fp32; the exception is `add_rms_norm` |
 | `rotary_embedding` | **1.15x** | **0.99x** | exactly the memory-bound bar — both backends get 5.9% of their own peak, so the missing 94% is the op def, not either chip |
@@ -134,50 +134,6 @@ cache length, which was the shape of the original finding.
 Every number in this file carries the unit caveats in
 [How to compare](#how-to-compare-these-to-the-trainium2-numbers). Read them before
 quoting anything.
-
-### Cross-chip decode, on the aligned workload
-
-This is the newest row in the table above and the only one where both backends ran
-the *same* file through the *same* provider code on the same day, so it is worth
-seeing case by case rather than as a range. `attention_tkg` requires
-`kv_len % 128 == 0`, so its numbers come from
-`../NEURON/workloads/fa_decode_tkg.json` rather than from the published
-`fa_linear_ops.json`. Both backends have now run that file, so the two columns below
-are the same six cases on both sides. "Best Trn2" is whichever of the two providers
-wins at that shape, since both stay registered:
-
-| B | kv_len | H100 lat | H100 GB/s | % of 3.35 TB/s | Best Trn2 core | Trn2 lat | Trn2 GB/s | % of 725 GB/s | Per core | **Per chip** |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 16 | 4,096 | 116.4 us | 2,312.4 | 69.0% | SDPA | 866.6 us | 310.5 | 42.8% | 7.45x | **1.86x** |
-| 16 | 8,192 | 191.1 us | 2,812.7 | 84.0% | `attention_tkg` | 2,411.4 us | 222.9 | 30.7% | 12.62x | **3.15x** |
-| 16 | 10,240 | 251.8 us | 2,667.8 | 79.6% | `attention_tkg` | 2,769.0 us | 242.6 | 33.5% | 11.00x | **2.75x** |
-| 16 | 16,384 | 353.4 us | 3,040.4 | **90.8%** | `attention_tkg` | 3,841.2 us | 279.7 | 38.6% | 10.87x | **2.72x** |
-| 64 | 4,096 | 368.4 us | 2,921.9 | 87.2% | SDPA | 3,239.1 us | 332.3 | **45.8%** | 8.79x | **2.20x** |
-| 64 | 10,240 | 924.5 us | 2,906.4 | 86.8% | `attention_tkg` | 8,748.5 us | 307.1 | 42.4% | 9.46x | **2.37x** |
-
-The same six cases with **SDPA only** — what this ratio was before 2026-09-03 — come
-out at **1.86x, 4.92x, 6.75x, 11.13x, 2.20x, 3.10x** per chip in the row order
-above. That series is why the summary row quotes a provider-dependent range rather
-than a single number: the choice of provider is worth up to 4.1x here, more than any
-hardware difference in this comparison.
-
-**Decode is 1.9-3.2x per chip on a 1.16x nominal bandwidth bar** (3.35 TB/s against
-4 x 725 GB/s), so 1.6-2.7x of it is still software. That straddles the prefill row's
-2.1x rather than beating it — decode is ahead at 4,096 and behind at 8,192 — but it
-differs from prefill in a way that matters more than the midpoint: once the right
-provider is used the residual **stops growing with the problem size**, which is what
-the SDPA-only column could not say. The H100's own curve is the flat one here: it
-sits at 69-91% of HBM peak everywhere and has essentially nothing left to win, which
-is why the whole cross-chip movement in this row comes from the Trainium side.
-
-Two things this run does *not* settle. The `q_len 4` case in that file is **rejected
-on both backends** by the `torch` provider — PyTorch's `is_causal` aligns to the
-top-left of a non-square score matrix — so the `nkilib` provider's speculative-decode
-coverage has no GPU counterpart and no ratio. And the per-chip column is `x4` on a
-single logical core; that multiplication is
-[measured for memory-bound work](#how-to-compare-these-to-the-trainium2-numbers) at
-1.00-1.02x, but not for this op specifically. The Trainium-side provider analysis is
-in [the NEURON README](../NEURON/README.md#decode-the-nkilib-provider-attention_tkg).
 
 ### What this table does not cover yet
 
@@ -608,11 +564,12 @@ Four conclusions, in order of how much they matter:
   [Details and the full table](../NEURON/README.md#decode-the-nkilib-provider-attention_tkg).
   The H100 has since run the same aligned workload, so the ratio is no longer an
   extrapolation: **1.9-3.2x per chip** on a 1.16x nominal bandwidth bar, tabulated
-  case by case in [the Summary](#summary). That is the narrowest software residual
-  anywhere in this comparison outside the parity rows, and the H100's own column is
-  flat at 69-91% of peak across all six cases — so the movement is entirely on the
-  Trainium side, and it is the one row where picking the right provider changed the
-  conclusion rather than the decimal place.
+  case by case [just below](#cross-chip-decode-on-the-aligned-workload). The 1.6-2.7x
+  software residual that leaves straddles the prefill bullet's 2.1x rather than
+  beating it; what distinguishes decode is that its residual stops growing with the
+  problem size. The H100's own column is flat at 69-91% of peak across all six cases,
+  so the movement is entirely on the Trainium side, and this is the one row where
+  picking the right provider changed the conclusion rather than the decimal place.
 - **GQA and MHA cost the same on both backends**, to within 1% at every shape, and
   on both the MHA row is marginally *faster* at `q_len 10240`. Prefill is
   compute-bound and GQA saves KV traffic rather than FLOPs, so this is the
@@ -623,6 +580,52 @@ Four conclusions, in order of how much they matter:
   61.2% -> 65.0%; Trainium goes 21.7% -> 24.0% with latency at 4 x 0.905 of the
   single-sequence case, i.e. essentially four sequential prefills. At `q_len 4096`
   one sequence already saturates the Neuron core.
+
+### Cross-chip decode, on the aligned workload
+
+The three decode rows earlier in this section are the published `fa_linear_ops.json`
+run, and they predate the `nkilib` provider. This subsection is the newer, narrower
+thing: the only row in the whole comparison where both backends ran the *same* file
+through the *same* provider code on the same day, which is worth seeing case by case
+rather than as the range [the Summary](#summary) quotes. `attention_tkg` requires
+`kv_len % 128 == 0`, so its numbers come from
+`../NEURON/workloads/fa_decode_tkg.json` rather than from the published
+`fa_linear_ops.json`. Both backends have now run that file, so the two columns below
+are the same six cases on both sides. "Best Trn2" is whichever of the two providers
+wins at that shape, since both stay registered:
+
+| B | kv_len | H100 lat | H100 GB/s | % of 3.35 TB/s | Best Trn2 core | Trn2 lat | Trn2 GB/s | % of 725 GB/s | Per core | **Per chip** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 16 | 4,096 | 116.4 us | 2,312.4 | 69.0% | SDPA | 866.6 us | 310.5 | 42.8% | 7.45x | **1.86x** |
+| 16 | 8,192 | 191.1 us | 2,812.7 | 84.0% | `attention_tkg` | 2,411.4 us | 222.9 | 30.7% | 12.62x | **3.15x** |
+| 16 | 10,240 | 251.8 us | 2,667.8 | 79.6% | `attention_tkg` | 2,769.0 us | 242.6 | 33.5% | 11.00x | **2.75x** |
+| 16 | 16,384 | 353.4 us | 3,040.4 | **90.8%** | `attention_tkg` | 3,841.2 us | 279.7 | 38.6% | 10.87x | **2.72x** |
+| 64 | 4,096 | 368.4 us | 2,921.9 | 87.2% | SDPA | 3,239.1 us | 332.3 | **45.8%** | 8.79x | **2.20x** |
+| 64 | 10,240 | 924.5 us | 2,906.4 | 86.8% | `attention_tkg` | 8,748.5 us | 307.1 | 42.4% | 9.46x | **2.37x** |
+
+The same six cases with **SDPA only** — what this ratio was before 2026-09-03 — come
+out at **1.86x, 4.92x, 6.75x, 11.13x, 2.20x, 3.10x** per chip in the row order
+above. That series is why the summary row quotes a provider-dependent range rather
+than a single number: the choice of provider is worth up to 4.1x here, more than any
+hardware difference in this comparison.
+
+**Decode is 1.9-3.2x per chip on a 1.16x nominal bandwidth bar** (3.35 TB/s against
+4 x 725 GB/s), so 1.6-2.7x of it is still software. That straddles the prefill row's
+2.1x rather than beating it — decode is ahead at 4,096 and behind at 8,192 — but it
+differs from prefill in a way that matters more than the midpoint: once the right
+provider is used the residual **stops growing with the problem size**, which is what
+the SDPA-only column could not say. The H100's own curve is the flat one here: it
+sits at 69-91% of HBM peak everywhere and has essentially nothing left to win, which
+is why the whole cross-chip movement in this row comes from the Trainium side.
+
+Two things this run does *not* settle. The `q_len 4` case in that file is **rejected
+on both backends** by the `torch` provider — PyTorch's `is_causal` aligns to the
+top-left of a non-square score matrix — so the `nkilib` provider's speculative-decode
+coverage has no GPU counterpart and no ratio. And the per-chip column is `x4` on a
+single logical core; that multiplication is
+[measured for memory-bound work](#how-to-compare-these-to-the-trainium2-numbers) at
+1.00-1.02x, but not for this op specifically. The Trainium-side provider analysis is
+in [the NEURON README](../NEURON/README.md#decode-the-nkilib-provider-attention_tkg).
 
 ## gemm
 
@@ -810,6 +813,26 @@ suggest:
   [the NEURON README](../NEURON/README.md#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity)
   for the measured table and for the separate registration bug that keeps the NKI
   gather kernel unreachable even when the index is right.
+- **How much that 510x/715x costs an LLM is a different question from how big it
+  is, and the answer is less than the number suggests.** Nothing in
+  `op_defs/llm_ops/` calls `torch.gather` or `Tensor.scatter_`. The MoE combine path
+  moves rows with `index_add_` instead (`moe_gather.py:154`,
+  `moe_quant_group_gemm_combine.py:239`, and `llm_ops.md:768` says so in as many
+  words: "The gather operation (actually index_add) is done in-place"), embedding
+  lookup uses `index_select`/`embedding`, and paged-KV block gathering happens
+  inside an attention kernel rather than as an aten op. Of those, `index_select` and
+  `embedding` are parity rows (0.98x, 0.97x) and `index_add` is in the 3.8x group —
+  none is anywhere near 510x. The one place production LLM code does reach for
+  `torch.gather` is sampling and logprob extraction, `logits.gather(-1, ids)` on a
+  `[batch, vocab]` tensor, which moves one element per sequence rather than a
+  hidden-state-sized block. So treat this row as a **lowering signal** — evidence
+  about what neuronx-cc does with a broadcast int64 index, which is a class of bug
+  that will show up wherever indices are built that way — rather than as a cost an
+  inference server is paying today. The LLM-shaped version of the same question is
+  `moe_scatter_dynamic_quant` (0.7 GB/s on Neuron) and `moe_gather` (9.2 GB/s, 68x
+  off `index_select` on the same chip), and neither has a GPU column yet, so neither
+  has been split into op def versus lowering the way `gather` has
+  ([above](#what-this-table-does-not-cover-yet)).
 - **The narrow-dtype and reduction anomalies are Neuron-only.** `sin`/`cos` are
   4x *slower* at bf16 than fp32 on Neuron; on the H100 `sin` is 2,884.9 bf16
   against 2,974.7 fp32, a 1.03x difference. `reduce_max` against `reduce_sum` is
