@@ -1,0 +1,33 @@
+{
+    "_comment": [
+        "broadcast is registered in op_defs/basic_ops/xccl_ops.py and had no workload file",
+        "anywhere in the repo, so it was untested rather than unsupported -- on both",
+        "backends.",
+        "",
+        "Worth having rather than filler: broadcast is the one collective whose cost model",
+        "differs from the other four. all_reduce, all_gather, reduce_scatter and all_to_all",
+        "all move O(size) per rank and their bus_size grows with rank count; a broadcast",
+        "moves the same bytes to every rank from one source, so a ring implementation is",
+        "(n-1) sequential hops of the whole payload and a tree is log(n) of it. That makes",
+        "it the case where the algorithm choice shows up most plainly in the number -- and",
+        "on this instance algorithm choice is not free: a replica group whose chips are not",
+        "adjacent on the 4x4 torus falls back to the Mesh algorithm and is then capped at",
+        "40 MiB. Read this file's ws=8 rows against the ccl8_llm and topo_far8 labels.",
+        "",
+        "In serving it is also not a synthetic op: it is how sampled token ids and any",
+        "rank-0 decision reach the other TP ranks, at tiny sizes where the latency floor",
+        "is the whole cost, which is why the small batch_size rows are kept.",
+        "",
+        "dtype includes int8 for the same reason as p2p.json -- the int8 collective anomaly",
+        "was found on all_gather and all_to_all, and broadcast is a third algorithm."
+    ],
+    "cases": [
+        {
+            "arg_type": ["default"],
+            "world_size": [2, 4, 8, 16, 32, 64],
+            "dtype": ["float32", "float16", "bfloat16", "int8"],
+            "batch_size": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144],
+            "dim_size": [1024]
+        }
+    ]
+}

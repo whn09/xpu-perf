@@ -8,7 +8,47 @@ This changelog follows semantic versioning and Keep a Changelog style.
 
 ### Added
 
-- `projects/micro_perf/vendor_ops/NEURON/tools/run_multicard_sweep.sh`: a 16-label
+- `projects/micro_perf/workloads/xccl_ops/{broadcast,p2p,all_reduce_h2d}.json`:
+  workload files for the three collectives that `op_defs/basic_ops/xccl_ops.py`
+  registers and **no workload JSON in the repo referenced**, on any backend. They
+  were absent from every coverage-gap list, including the ones in
+  `vendor_ops/GPU/README.md` and `vendor_ops/NEURON/README.md`, because a task name
+  nothing asks for produces no rejection and no report -- only silence, which reads
+  like coverage. `xccl_ops/` goes from 7 files to 10.
+
+  Running them for the first time produced two results and one bug. **`p2p` does not
+  exist on the Neuron `torch.distributed` backend at all** -- `RuntimeError: Backend
+  neuron does not support send` / `... does not support recv`, at every size, with
+  both ranks on one chip, in a launch that runs `broadcast` fine -- so a real one-way
+  single-link transfer is unreachable on Trainium today, and the NVLink-vs-NeuronLink
+  point-to-point comparison that `device2device.json` was assumed to cover is not in
+  this repo on either backend. **`broadcast` and `all_reduce_h2d` run**: at 8 ranks
+  on adjacent chips, bf16, `broadcast` gives 40.539 GB/s at 512 MiB and 1.886 GB/s at
+  2 MiB, and `all_reduce_h2d`'s largest case gives 167727.201 us / 6.404 GB/s
+  `algo_bw` -- the latter a ceiling rather than an overlap verdict, for three reasons
+  recorded in the workload file.
+
+  `p2p.json` also carries the `[1024, 2097152]` int8 2 GiB configuration that
+  `workloads/xccl_ops/README.md` already documented for the op and that had no file
+  to live in; that README gains signatures for `broadcast` and `all_reduce_h2d`,
+  which it had never listed.
+
+### Fixed
+
+- `projects/micro_perf/op_defs/basic_ops/xccl_ops.py`: **`broadcast` could not
+  produce a result on any backend.** `BroadcastOp.summary` had drifted twice from
+  `BasicOp.summary` -- it took `(self, latency_us)` while `Backend.perf` calls
+  `summary(latency_us, kernel_mapping)` (`core/backend.py:378`), and it unpacked the
+  return into `(target_dict, env_dict)` while `BasicOp.summary` returns one dict.
+  Every case died with `TypeError: ... takes 2 positional arguments but 3 were
+  given` or, past that, `ValueError: too many values to unpack (expected 2)`.
+  Unnoticed since the drift because the op had never once been called: no workload
+  file referenced `broadcast` until now. The per-broadcast division the override
+  performs is still correct after the fix.
+
+### Added
+
+- `projects/micro_perf/vendor_ops/NEURON/tools/run_multicard_sweep.sh`: a 22-label
   multi-chip sweep for a `trn2.48xlarge` (16 NeuronDevices x 4 logical cores = 64
   devices), with `tools/analyze_multicard.py` to summarize a result tree and
   `tools/cap_xccl_workloads.py` extended to pin `world_size` and to take a single
@@ -52,6 +92,19 @@ This changelog follows semantic versioning and Keep a Changelog style.
      648.7 GB/s is a local HBM copy, and nothing in the repo measures a peer-to-peer
      copy on any backend. `vendor_ops/GPU/README.md`'s coverage table had this row
      down as hardware-blocked; it is runnable on one GPU today.
+
+  Six further labels were added once the three missing collectives had workload
+  files: `broadcast` joins the `xccl_ws*` and `topo_hop*` task lists, `ccl8_h2d` runs
+  `all_reduce_h2d` at 8 ranks, and `p2p_hop{0,1,2}` are kept although they fail
+  today, as a one-minute check of whether a later Neuron release has gained
+  `send`/`recv`. `cap_xccl_workloads.py` is now also invoked for `world_size` 2,
+  which `p2p` needs.
+
+  Still unrun and needing no code: `--node_world_size` / `--node_rank` /
+  `--master_addr` are fully plumbed (`core/backend.py:491-506`,
+  `core/engine.py:88-98`) and have never been exercised on either backend, so
+  `world_size` 128 across two `trn2.48xlarge` boxes — where the `bus_bw` curve stops
+  being a NeuronLink curve — is a launch away.
 
 - `projects/micro_perf/vendor_ops/NEURON/tools/probe_int8_collective.py` and
   `vendor_ops/NEURON/workloads/ccl_int8_probe.json`: int8 collectives are 227x

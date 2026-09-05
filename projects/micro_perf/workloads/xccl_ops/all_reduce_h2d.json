@@ -1,0 +1,39 @@
+{
+    "_comment": [
+        "The third registered collective with no workload file anywhere in the repo.",
+        "",
+        "It is not another all_reduce. vendor_impl_run issues dist.all_reduce(async_op=True)",
+        "and then a host-to-device copy while that all_reduce is in flight, so what it",
+        "measures is *overlap*: whether the collective and the host DMA proceed at once, or",
+        "serialise. That is the single most load-bearing overlap in TP inference -- the",
+        "attention/MLP all_reduce against the next H2D -- and neither backend has a number",
+        "for it. Compare each row against all_reduce.json and host2device.json at the same",
+        "size: if latency is close to max(the two), the two engines overlap; if it is close",
+        "to their sum, they do not.",
+        "",
+        "Two quirks of the op def to read the numbers with, neither of them fixable from a",
+        "workload file:",
+        "  * the all_reduce is issued on the *default* group, not op_group, so it always",
+        "    spans every rank the launch started, while world_size here only feeds the",
+        "    bus_size formula. So launch with exactly as many devices as world_size asks",
+        "    for, or bus_bw is computed for a group that was not the one used.",
+        "  * async_op=True is never waited on -- there is no req.wait() -- so the measured",
+        "    latency bounds the H2D plus whatever of the all_reduce the timing barrier",
+        "    happens to catch, and a suspiciously low number means the collective escaped",
+        "    the window rather than that the overlap is perfect.",
+        "int8 is absent because the op def gates dtype to the three float formats.",
+        "",
+        "world_size is capped at 8 and batch_size at 262144: this op holds four buffers of",
+        "the payload (device data + its output, host src, device dst), so it hits the 24 GiB",
+        "per logical core ceiling twice as early as a plain all_reduce."
+    ],
+    "cases": [
+        {
+            "arg_type": ["default"],
+            "world_size": [2, 4, 8],
+            "dtype": ["float32", "float16", "bfloat16"],
+            "batch_size": [1, 16, 256, 1024, 4096, 16384, 65536, 131072, 262144],
+            "dim_size": [1024]
+        }
+    ]
+}

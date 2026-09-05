@@ -189,7 +189,7 @@ COMPUTE="XPU_PERF_ENGINES=ComputeEngine"
 if [ -z "$LIST" ]; then
     python3 "$TOOLS/cap_xccl_workloads.py" \
         $W/llm/single_test_ops/ccl_ops.json "$CAPPED/ccl_ws8" --world-size 8
-    for ws in 4 8 16 32 64; do
+    for ws in 2 4 8 16 32 64; do
         python3 "$TOOLS/cap_xccl_workloads.py" $W/xccl_ops \
             "$CAPPED/ws$ws" --world-size "$ws" --dtypes bfloat16
     done
@@ -213,11 +213,57 @@ run_one ccl8_llm 7200 "$(seq_dev 8)" "$XCCL" --workload /capped/ccl_ws8/ccl_ops.
 #    share one host DMA path and measure that contention, not the link. Same
 #    reason the world_size 4 host-transfer rows in ../README.md are flagged as
 #    not comparable to the world_size 2 ones.
+#
+#    broadcast is in the task list from ws4 up. It was registered in
+#    op_defs/basic_ops/xccl_ops.py with no workload file anywhere in the repo, so
+#    it had never once run on any backend -- and when workloads/xccl_ops/
+#    broadcast.json was added it turned out its summary() override had drifted
+#    twice from BasicOp.summary and killed every case. Worth its place here rather
+#    than for completeness: it is the one collective whose cost is (n-1) hops of
+#    the *whole* payload on a ring and log(n) on a tree, so it is where the
+#    runtime's algorithm choice is most visible -- and on this instance algorithm
+#    choice is not free (see section 6).
 for ws in 4 8 16 32 64; do
     run_one "xccl_ws$ws" 14400 "$(seq_dev "$ws")" "$XCCL" \
         --task_dir "/capped/ws$ws" \
-        --task all_gather,all_reduce,reduce_scatter,all_to_all
+        --task all_gather,all_reduce,reduce_scatter,all_to_all,broadcast
 done
+
+# 2b. all_reduce_h2d, the third op that had no workload file. It is not another
+#     all_reduce: it issues one with async_op=True and then does a host-to-device
+#     copy while it is in flight, so it measures *overlap* of the collective with
+#     the host DMA -- the single most load-bearing overlap in TP inference, and
+#     unmeasured on both backends until now.
+#
+#     Its own label because the op def issues the all_reduce on the *default*
+#     group rather than op_group, so the group is always every rank the launch
+#     started and `world_size` in the file only feeds the bus_size formula. 8
+#     devices, and the file's ws=8 cases, so the two agree.
+#
+#     Read it against xccl_ws8's all_reduce and against host2device at the same
+#     rank count -- latency near max(the two) means they overlap, near the sum
+#     means they do not. Do not read it alone: 8 ranks each copying the same
+#     payload share one host link, so the H2D half is contended by construction
+#     and the uncontended host2device number is not the right control.
+run_one ccl8_h2d 7200 "$(seq_dev 8)" "$XCCL" \
+    --workload /capped/ws8/all_reduce_h2d.json
+
+# 2c. p2p -- the only op in the repo that measures a real point-to-point transfer
+#     (dist.isend on one rank, dist.irecv on another), and the gap left by
+#     device2device turning out to be a local copy.
+#
+#     **Expected to fail on this backend today**, and kept for that reason: the
+#     native runtime's torch.distributed backend has no send/recv at all --
+#     "RuntimeError: Backend neuron does not support send" / "... does not support
+#     recv" -- so these three labels are a 1-minute check of whether a Neuron
+#     release has gained it, and the file's real first use is a multi-GPU box.
+#     Placement follows the d2d labels exactly, so if it ever runs the hop ladder
+#     is already here.
+run_one p2p_hop0 900 0,1 "$XCCL" --workload /capped/ws2/p2p.json
+run_one p2p_hop1 900 "0,$CORES_PER_CHIP" "$XCCL" \
+    --workload /capped/ws2/p2p.json
+run_one p2p_hop2 900 "0,$((2 * CORES_PER_CHIP))" "$XCCL" \
+    --workload /capped/ws2/p2p.json
 
 # 3. Where the rank count is held fixed and only the topology changes -- the
 #    comparison a 3xlarge cannot express at all. Four ranks, twice:
@@ -228,9 +274,11 @@ done
 #    all_reduce over that row therefore pays one hop per step and this is the
 #    cheapest inter-chip case, not the average one.
 run_one topo_hop0 10800 "$(seq_dev 4)" "$XCCL" \
-    --task_dir /capped/ws4 --task all_gather,all_reduce,reduce_scatter,all_to_all
+    --task_dir /capped/ws4 \
+    --task all_gather,all_reduce,reduce_scatter,all_to_all,broadcast
 run_one topo_hop1 10800 "$(stride_dev 4 "$CORES_PER_CHIP")" "$XCCL" \
-    --task_dir /capped/ws4 --task all_gather,all_reduce,reduce_scatter,all_to_all
+    --task_dir /capped/ws4 \
+    --task all_gather,all_reduce,reduce_scatter,all_to_all,broadcast
 
 # 4. device2device, which is a copy and not a collective, so ComputeEngine and
 #    only two devices. Three variants, and the pair of them is the point:

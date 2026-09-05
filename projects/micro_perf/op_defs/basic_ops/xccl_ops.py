@@ -385,14 +385,31 @@ class BroadcastOp(BasicOp):
             dist_module.broadcast(src[i], src=i, group=self.op_group)
         return src
 
-    def summary(self, latency_us):
-        target_dict, env_dict = super().summary(latency_us)
+    # This override had drifted twice from BasicOp.summary and so broadcast could
+    # not produce a result on any backend:
+    #   * it took (self, latency_us) while Backend.perf calls
+    #     summary(latency_us, kernel_mapping) (core/backend.py:378) ->
+    #     "TypeError: BroadcastOp.summary() takes 2 positional arguments but 3
+    #     were given";
+    #   * and it unpacked the return into (target_dict, env_dict) while
+    #     BasicOp.summary returns one dict -> "ValueError: too many values to
+    #     unpack (expected 2)".
+    # Neither was noticed because no workload file referenced broadcast until
+    # workloads/xccl_ops/broadcast.json, so the op had never once run.
+    #
+    # The division is still correct after the fix: vendor_impl_run does one
+    # broadcast per rank, so latency covers world_size of them and the sizes are
+    # for the whole loop. Scaling latency and both sizes by the same factor leaves
+    # algo_bw/bus_bw -- already computed by super() from the undivided pair --
+    # unchanged, which is what makes them per-broadcast figures.
+    def summary(self, latency_us, kernel_mapping={}):
+        target_dict = super().summary(latency_us, kernel_mapping)
         if target_dict:
             target_dict["latency(us)"] = round(target_dict["latency(us)"] / self.world_size, 3)
             target_dict["algo_size(B)"] = round(target_dict["algo_size(B)"] / self.world_size, 3)
             target_dict["bus_size(B)"] = round(target_dict["bus_size(B)"] / self.world_size, 3)
 
-        return target_dict, env_dict
+        return target_dict
 
 
 @ProviderRegistry.register_base_impl("p2p", "XCCLEngine")

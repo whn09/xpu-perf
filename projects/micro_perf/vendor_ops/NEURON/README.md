@@ -960,6 +960,78 @@ pinning for a comparison run. Note `--numa` is only a CPU-affinity knob:
 `BaseEngine.__init__` creates one process per device either way, and `numa_num` /
 `numa_order` only choose which `numa_cores` those processes are pinned to.
 
+#### Three collectives that had never run
+
+`op_defs/basic_ops/xccl_ops.py` registers eight collectives. Five of them
+(`all_gather`, `all_reduce`, `reduce_scatter`, `all_to_all`, `device2device`) had
+workload files; **`broadcast`, `p2p` and `all_reduce_h2d` were referenced by no
+workload JSON anywhere in the repo**, on any backend. That is a different thing
+from the [unsupported table](#known-unsupported) below: nobody had found them
+missing, because a task name that no file asks for is not a rejection, it is
+silence. `workloads/xccl_ops/{broadcast,p2p,all_reduce_h2d}.json` fill the gap —
+each file's `_comment` says what the op actually measures and how to read it —
+and running them for the first time produced one repo-wide bug and one hard limit.
+
+**`broadcast` was broken on every backend.** `BroadcastOp.summary` had drifted
+twice from `BasicOp.summary`: it took `(self, latency_us)` while `Backend.perf`
+calls `summary(latency_us, kernel_mapping)` (`core/backend.py:378`), and it
+unpacked the result into `(target_dict, env_dict)` while `BasicOp.summary`
+returns a single dict. Every case died with `TypeError: BroadcastOp.summary()
+takes 2 positional arguments but 3 were given` or, once that was fixed,
+`ValueError: too many values to unpack (expected 2)`. Neither had ever been seen
+because the op had never once been called. Fixed in place; the per-broadcast
+division it does is still correct after the fix, and the comment above it says
+why.
+
+With the fix, 8 ranks on chips 0-1, bf16:
+
+| `batch_size` | payload | latency (us) | `algo_bw` = `bus_bw` (GB/s) |
+|---|---|---|---|
+| 1024 | 2 MiB | 1111.596 | 1.886 |
+| 262144 | 512 MiB | 13243.147 | 40.539 |
+
+`broadcast` is the one collective whose `bus_size` equals its `algo_size` — no
+`2(n-1)/n` factor — so 40.5 GB/s here is directly comparable to `all_reduce`'s
+*algo* bandwidth at the same 8 ranks (79.3 bus → 45.3 algo), not to its 79.3.
+Getting a whole 512 MiB payload to 7 other ranks at 40 GB/s rules out the naive
+ring, which would be 7 sequential hops of the full payload and so ~1/7 of link
+bandwidth: the runtime is pipelining or using a tree. The 2 MiB row is the one
+that matters in serving — broadcasting sampled token ids to the other TP ranks is
+a tiny-payload latency problem, and 1111 us for 2 MiB says the floor, not the
+bandwidth, is the whole cost there.
+
+**`p2p` does not exist on this backend at all.** Not a placement or a capacity
+limit — both ranks on one chip, same launch that runs `broadcast` fine, every
+size:
+
+```
+RuntimeError: Backend neuron does not support send
+RuntimeError: Backend neuron does not support recv
+```
+
+So the native runtime's `torch.distributed` backend has no point-to-point
+primitive, and a real one-way one-link transfer is **unreachable through
+`torch.distributed` on Trainium today** — the collectives measure a whole ring,
+and `device2device` turns out to be
+[a local copy](#device2device-is-not-a-device-to-device-transfer). The three
+`p2p_hop*` labels in `run_multicard_sweep.sh` are kept as a one-minute check of
+whether a later Neuron release has gained it; the file's real first use is a
+multi-GPU box.
+
+**`all_reduce_h2d` runs**, and is the only op in the repo that measures
+*overlap*: `dist.all_reduce(async_op=True)` followed by a host-to-device copy
+while it is in flight. 8 ranks, bf16, largest case in the file: **167727.201 us,
+`algo_bw` 6.404 GB/s, `bus_bw` 8.805 GB/s**. That number is not yet an overlap
+verdict and should not be quoted as one, for three reasons written into the
+workload file: the op def issues the all_reduce on the *default* group rather
+than `op_group`; `async_op=True` is never `wait()`ed, so the timing window
+catches an unspecified fraction of the collective; and 8 ranks each copying the
+same payload contend for one host DMA path by construction, so the uncontended
+`host2device` row is the wrong control. The missing measurement is `host2device`
+at 8 ranks — with it, latency near `max(the two)` means the engines overlap and
+near their sum means they serialise. `ccl8_h2d` in the sweep produces the first
+half.
+
 ### XLA runtime
 
 2026-08-31: torch 2.9.1, torch-xla 2.9.0, torch-neuronx 2.9.0.2.15.32035,
@@ -1732,8 +1804,14 @@ Two different things are easy to conflate, so they are kept apart: a case the
 | ~~`flash_attention` multi-token decode~~ | now covered by the **`nkilib`** provider, which builds the active mask explicitly instead of relying on `is_causal` ([table](#decode-the-nkilib-provider-attention_tkg)). Still unsupported on `torch` | — |
 | `flash_attention` GQA / decode / `batch_size > 1` on the **XLA** runtime | the NKI `flash_fwd` kernel takes one contiguous K/V block for one head group; eager SDPA runs all three | this backend |
 | `flash_attention` prefill at `q_len: 32768` | SDPA does not complete at that length — see below | this backend (capacity) |
-| `p2p` | needs send/recv across multiple NeuronDevices | this backend |
+| `p2p` | **the native runtime's `torch.distributed` backend has no point-to-point at all**: `RuntimeError: Backend neuron does not support send` on the sender and `... does not support recv` on the receiver, at every size. Not a placement or capacity limit -- it is measured on a trn2.48xlarge with the two ranks on one chip, and the same launch runs `broadcast` and `all_reduce_h2d` fine | this backend (missing feature) |
 | collectives above ~1 GiB per rank | the 24 GiB per-core ceiling above | this backend (capacity) |
+
+Three collectives were in a fourth category until now -- registered in
+`op_defs/basic_ops/xccl_ops.py` and referenced by **no workload JSON anywhere in the
+repo**, so untested on every backend rather than unsupported on any. They now have
+files, and running them found one hard limit and one repo-wide bug:
+[`broadcast`, `p2p` and `all_reduce_h2d`](#three-collectives-that-had-never-run).
 
 `dequant_kv_cache` appears in **no workload JSON in the repo**, on any backend. It
 is untested, not unsupported. Twelve other ops were in that position until this
@@ -1835,6 +1913,38 @@ read them off the Neuron column as if they were:
   reasons in the op def. Both are in [Known unsupported](#known-unsupported). Until
   they are fixed there is no `store_kv_cache` number to compare, on this backend or
   the GPU.
+
+One gap is in the **Neuron `torch.distributed` backend** and cannot be closed from
+this repo: it has no `send`/`recv`, so `p2p` — the only op here that measures a
+single one-way transfer over a single link — raises `RuntimeError: Backend neuron
+does not support send` at every size, on one chip or across the torus. Until a
+Neuron release adds it, there is no point-to-point Trainium number to put against
+NVLink, and the collectives are the closest available proxy. See
+[Three collectives that had never run](#three-collectives-that-had-never-run); the
+`p2p_hop*` labels in `run_multicard_sweep.sh` exist to detect the day this changes.
+
+Three things are **runnable and simply unrun**, which is a different kind of gap
+from all of the above and the only kind that needs no code:
+
+- **Multi-node collectives.** `launch.py` already takes `--node_world_size`,
+  `--node_rank` and `--master_addr`; `core/backend.py:491-506` derives the global
+  rank and world size from them and `core/engine.py:88-98` exports
+  `MASTER_ADDR`/`RANK`/`WORLD_SIZE`. The path has never been exercised, on either
+  backend. Two trn2.48xlarge boxes make `world_size` 128 reachable, and the
+  interesting number is not the bandwidth but the *shape* of the drop from 64 to
+  128 — 64 ranks are one torus, 128 are two torii and an EFA fabric, so this is
+  where the `bus_bw` curve stops being a NeuronLink curve.
+- **`host2device` at 8 ranks**, the missing control for `all_reduce_h2d`.
+- **`gemm_fp8_compiled.json`** is in `vendor_ops/NEURON/workloads/` and in no sweep
+  label, so the 245.50 TF / 75.6% MFU fp8 result above is documented but not
+  reproducible by running a script. It needs an opt-in label, not a measurement.
+
+And one whole directory is a Neuron gap of a different scale: `projects/infer_perf/`
+has a `llm_perf/backends/GPU` and nothing else. Every number in this file is an
+operator number; there is no end-to-end LLM serving comparison on Trainium in this
+repo at all. `projects/train_perf` is a Megatron-LM checkout (CUDA), `trace_gen` is
+documentation with a download script, and `xpu_oj` is an `llm_sim` — none of the
+three has been looked at on this backend.
 
 ## Reproduce one row at a time
 

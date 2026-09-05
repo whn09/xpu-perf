@@ -170,8 +170,8 @@ quoting anything.
 
 ### What this table does not cover yet
 
-Twelve workload files have a Trainium2 number and **no GPU column**, so no ratio
-can be quoted for them: the seven in `xccl_ops/`, `gemm_ops.json`,
+Fifteen workload files have a Trainium2 number and **no GPU column**, so no ratio
+can be quoted for them: the ten in `xccl_ops/`, `gemm_ops.json`,
 `moe_dispatch_ops.json`, `moe_combine_ops.json`, and two of the `vendor_test/`
 files. `tools/run_comparison_sweep.sh` runs none of them. The remaining rows are
 a different problem — a case no backend can run, or one only a single backend can —
@@ -187,11 +187,25 @@ blocked on both backends, and none is any more. The Neuron numbers now run from
 `world_size` 4 to 64 on a trn2.48xlarge, so what is missing is a GPU column, not a
 measurement.
 
+`xccl_ops/` grew from seven files to ten in the process, and that is the part of
+this section that was **wrong rather than incomplete**: `broadcast`, `p2p` and
+`all_reduce_h2d` are registered base ops that no workload JSON in the repo asked
+for, so they appeared in no gap list, including this one. A task name nothing
+references produces no rejection and no report — it produces silence, which reads
+exactly like coverage. Their three new rows are below. One of them turned up a bug
+in shared code: **`broadcast` could not produce a result on any backend**, because
+`BroadcastOp.summary` had drifted twice from `BasicOp.summary` (wrong arity, and
+unpacking one dict as two). It is fixed, and it had gone unnoticed for the only
+possible reason — the op had never once been called.
+
 | Workload | Ops | What Trainium2 got | Blocker | TODO |
 |---|---|---|---|---|
 | `xccl_ops/{all_reduce,all_gather,reduce_scatter,all_to_all}.json` | 4 collectives | measured on Neuron from ws=4 to ws=64 — on a trn2.48xlarge at ws=64, `all_gather` 166.4, `all_reduce` 146.5, `reduce_scatter` 142.6, `all_to_all` 15.7 GB/s `bus_bw` ([table](../NEURON/README.md#world_size-scaling-8-to-64)) | **hardware** — `world_size` is 1 on one GPU | needs a p5.48xlarge (8x H100, NVLink). **The highest-value item in this list**, and now the only one-sided one left: the Neuron side is measured across 16 chips, so NVLink vs NeuronLink is a missing GPU column rather than a missing measurement. Compare against Neuron's ws=8 (`all_gather` 81.6, `all_reduce` 79.3 GB/s) — same rank count, and 8x H100 is what a p5.48xlarge is |
 | `single_test_ops/ccl_ops.json` | same 4 | **now runs on Neuron** at `world_size: 8` on a trn2.48xlarge: bf16 `all_gather` 81.6, `all_reduce` 79.3, `reduce_scatter` 68.3, `all_to_all` 28.5 GB/s ([table](../NEURON/README.md#ccl_opsjson-now-runs)). Still **0 cases** on a trn2.3xlarge, which has 4 logical cores | **hardware**, GPU side only | needs 8 GPUs. The int8 cases in this file are also the ones that exposed [int8 collectives being ~200x off](../NEURON/README.md#ccl_opsjson-now-runs) on the Neuron stack, so a GPU column here would say whether that is the op def or the Neuron runtime |
 | `xccl_ops/device2device.json` | `device2device` | 648.7 GB/s (bf16) | **none, and the row was mislabelled** — [the op copies within one device](../NEURON/README.md#device2device-is-not-a-device-to-device-transfer), so it never needed two. Measured on a trn2.48xlarge at 0, 1 and 2 NeuronLink hops it gives 642.3 / 642.5 / 642.9 GB/s, i.e. the hop count is not in the measurement | run it on the H100 as a local-copy number, which is what it is. A real peer-to-peer copy is **not** in this repo on any backend, so NVLink-vs-NeuronLink point-to-point stays uncovered by the row above, not by this one |
+| `xccl_ops/broadcast.json` | `broadcast` | **new file, and the first run of this op anywhere.** On Neuron at ws=8, bf16: 40.539 GB/s at 512 MiB, 1.886 GB/s at 2 MiB ([table](../NEURON/README.md#three-collectives-that-had-never-run)) | **hardware**, GPU side only — `world_size` 1 on one GPU | needs ≥2 GPUs. Worth a column of its own rather than folding into the collective row above: `broadcast` is the only op here whose `bus_size` equals its `algo_size`, so it is where the runtime's algorithm choice (ring = (n-1) hops of the whole payload, tree = log n) is visible in the number. Also the collective serving actually uses at tiny sizes — sampled token ids to the other TP ranks |
+| `xccl_ops/p2p.json` | `p2p` | **new file, and it does not run on Neuron at all**: `RuntimeError: Backend neuron does not support send` / `... does not support recv`, at every size, with both ranks on one chip | **Neuron backend** — a missing `torch.distributed` feature, not a hardware or placement limit. GPU side is the usual ≥2 GPUs | **the highest-value row after the collectives**, because it is the only op in the repo that measures a real one-way transfer over one link. NCCL has `isend`/`irecv`, so on a p5.48xlarge this file gives a genuine NVLink point-to-point number — against which Trainium currently has *no* answer through `torch.distributed`. That also makes it the row that finally covers what `device2device.json` was assumed to cover |
+| `xccl_ops/all_reduce_h2d.json` | `all_reduce_h2d` | **new file.** Runs on Neuron at ws=8; the largest bf16 case gives 167727.201 us, `algo_bw` 6.404 GB/s | **hardware**, GPU side only | needs ≥2 GPUs. This op measures *overlap* — an `async_op=True` all_reduce with a host-to-device copy issued into it — which is the most load-bearing overlap in TP inference and had no number on either backend. Read the Neuron caveats before quoting it: the all_reduce goes to the default group, `async_op` is never waited, and the right control (`host2device` at the same rank count) is the row below, which does not run here either |
 | `xccl_ops/{device2host,host2device}.json` | 2 | 14.3 / 14.0 GB/s at ws=2, and the ws=4 column is not comparable (1 GiB cap, four ranks sharing one host DMA path) | **harness**, not hardware — both ops are registered on `XCCLEngine` (`op_defs/basic_ops/xccl_ops.py:569,627`), and `perf_engine.py:173` skips that engine outright when `len(device_ids) * node_world_size <= 1`. So although both files do list a `world_size: 1` case, a one-GPU launch dispatches to an engine that was never started and writes `note: engine_not_started` for every case (`perf_engine.py:352-364`) — exit 0, nothing measured. `XPU_PERF_ENGINES=XCCLEngine` does not help: the env filter is applied *before* that guard, not instead of it | needs any box with ≥2 GPUs — unlike the collectives it does not need NVLink or all eight. An earlier version of this row claimed these ran here as-is, on the strength of the `world_size: 1` entry in the JSON alone; they do not. Still worth having, as the one number in the comparison governed by neither chip's HBM but by a host link, so 14.3 GB/s currently has nothing to be read against |
 | `single_test_ops/gemm_ops.json` | `moe_gating_gemm`, `quant_matmul`, `moe_quant_group_gemm` | `moe_gating_gemm` 21.89 TF / **48% MFU**; `quant_matmul` 15.78 "TOPS"; `moe_quant_group_gemm` **2.67-2.84 s at every shape** | **none** | run it. `moe_gating_gemm` is the interesting one — the only genuine compute-bound row outside plain `gemm`, at 48% of the fp32 peak against `gemm`'s 82% at the same dtype, with no GPU control to say which of those two numbers is the anomaly. The other two route through `fake_quant_gemm` and are [a bf16 simulation on every backend](../NEURON/README.md#the-quantized-ops-are-a-bf16-simulation-on-every-backend), so a GPU column there measures the same shared helper the `_dynamic_quant` rows already exposed |
 | `single_test_ops/moe_dispatch_ops.json` | `moe_scatter_dynamic_quant` | 0.7 GB/s | **none** | run it. At 0.7 GB/s it is in `gather`/`scatter` territory, and the GPU column is what would say whether that is the op def or the lowering — exactly the question the H100 settled for `gather` |
@@ -228,8 +242,20 @@ which is why this is listed as a gap and not as a bug.
 One further gap belongs to neither backend: **`dequant_kv_cache` appears in no
 workload JSON anywhere in the repo**, so it is untested rather than unsupported on
 both. Twelve ops were in that position until this port added
-`single_test_ops/{norm_ops,activation_ops,moe_gating_ops,quant_ops}.json`; this is
-the thirteenth.
+`single_test_ops/{norm_ops,activation_ops,moe_gating_ops,quant_ops}.json`, and
+three more (`broadcast`, `p2p`, `all_reduce_h2d`) until `xccl_ops/` got the files
+above. `dequant_kv_cache` is the last one left, and the only reason it is last is
+that it takes a `quant_kv_cache` output to dequantise, so a workload file for it
+needs a shape set that agrees with one — which is the work, not the JSON.
+
+One asymmetry in `xccl_ops/` that looks like a gap and is not: `all_gather` and
+`all_to_all` carry int8 cases while `all_reduce` and `reduce_scatter` do not. Those
+two *reduce*, and a sum of int8 overflows at 128, so the split is along movement
+vs. reduction and is deliberate. `broadcast.json` is on the movement side and does
+carry int8 — which matters, because int8 is where the Neuron collectives are ~200x
+off and a third pure-movement algorithm is a second data point on it. A real gap
+does remain: `int32` is accepted by every collective op def, reduces without
+overflowing, and is exercised by none of the ten files.
 
 ## Quick start
 
