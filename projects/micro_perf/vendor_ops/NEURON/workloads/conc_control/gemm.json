@@ -1,0 +1,42 @@
+{
+    "_comment": [
+        "Single-core control for the conc64_gemm label in tools/run_multicard_sweep.sh.",
+        "",
+        "conc64_gemm runs the whole of workloads/basic/tensor_gemm_ops/gemm.json with one",
+        "worker per logical core, 64 of them pulling from a shared queue. Every reported",
+        "latency there is still a single-core latency, so the concurrency loss is the diff",
+        "against one core of the same instance -- but running the same 648 cases serially",
+        "on one core is around 3h of wall time (they take 192s of measurement at 64-way,",
+        "and the work does not shrink), against a 4h watchdog, and a run the watchdog kills",
+        "writes no report at all.",
+        "",
+        "So the control is a subset, chosen to be exactly the shapes the 64-core run is",
+        "read at:",
+        "  * M=1 is the latency floor, where the answer is launch overhead and not the",
+        "    array, so 64 concurrent workers ought to hurt it most if the host is the",
+        "    bottleneck;",
+        "  * M=512 is the transition, M=4096/20480/28672 span the compute-bound plateau,",
+        "    and 28672x4096x4096 is where bf16 peaks at 64 cores (147.9 TFLOPS, 88.7% MFU);",
+        "  * K.N is the two square shapes rather than all four -- the skewed ones move the",
+        "    peak by <2% at 64 cores, so they do not change the ratio.",
+        "float8 is one shape per format on purpose: 16384x8192x8192 is the slowest case at",
+        "64 cores by two orders of magnitude (458ms, 1.5% MFU), and 192 vCPUs shared 64 ways",
+        "was the obvious suspect for it -- which only a single-core number can rule out.",
+        "",
+        "Compare per case, not peak-to-peak: ONLY=conc1_gemm here vs conc64_gemm there."
+    ],
+    "cases": [
+        {
+            "arg_type": "default",
+            "dtype": ["float32", "float16", "bfloat16"],
+            "K.N": [[4096, 4096], [8192, 8192]],
+            "M": [1, 512, 4096, 20480, 28672]
+        },
+        {
+            "arg_type": "default",
+            "dtype": ["float8_e4m3", "float8_e5m2"],
+            "K.N": [[8192, 8192]],
+            "M": [16384]
+        }
+    ]
+}

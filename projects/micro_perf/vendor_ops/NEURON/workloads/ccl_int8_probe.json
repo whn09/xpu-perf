@@ -1,0 +1,34 @@
+{
+    "all_gather": [
+        {
+            "arg_type": "llm",
+            "world_size": 8,
+            "dtype": "bfloat16",
+            "num_tokens": [262144],
+            "hidden_size": 1024
+        },
+        {
+            "arg_type": "llm",
+            "world_size": 8,
+            "dtype": "int8",
+            "num_tokens": [262144],
+            "hidden_size": 1024
+        }
+    ],
+    "all_to_all": [
+        {
+            "arg_type": "llm",
+            "world_size": 8,
+            "dtype": "bfloat16",
+            "num_tokens": [262144],
+            "hidden_size": 1024
+        },
+        {
+            "arg_type": "llm",
+            "world_size": 8,
+            "dtype": "int8",
+            "num_tokens": [262144],
+            "hidden_size": 1024
+        }
+    ]
+}

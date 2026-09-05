@@ -176,15 +176,22 @@ can be quoted for them: the seven in `xccl_ops/`, `gemm_ops.json`,
 files. `tools/run_comparison_sweep.sh` runs none of them. The remaining rows are
 a different problem — a case no backend can run, or one only a single backend can —
 and are marked as such. Most of this is a hardware limit, since a p5.4xlarge has
-one GPU. **Exactly three files are runnable here today and simply unrun**:
-`gemm_ops.json`, `moe_dispatch_ops.json` and `moe_combine_ops.json`. That is worth
-being explicit about rather than leaving the table above looking complete.
+one GPU. **Exactly four files are runnable here today and simply unrun**:
+`gemm_ops.json`, `moe_dispatch_ops.json`, `moe_combine_ops.json` and
+`xccl_ops/device2device.json` — the last one because that op turns out to copy
+*within* one device, so "needs two GPUs" was never true of it. That is worth being
+explicit about rather than leaving the table above looking complete.
+
+One thing did change on the other side: every collective row below used to be
+blocked on both backends, and none is any more. The Neuron numbers now run from
+`world_size` 4 to 64 on a trn2.48xlarge, so what is missing is a GPU column, not a
+measurement.
 
 | Workload | Ops | What Trainium2 got | Blocker | TODO |
 |---|---|---|---|---|
-| `xccl_ops/{all_reduce,all_gather,reduce_scatter,all_to_all}.json` | 4 collectives | best `bus_bw` at ws=4: `all_gather` 125.1, `all_reduce` 107.1, `reduce_scatter` 101.7, `all_to_all` 54.2 GB/s ([table](../NEURON/README.md#memory-bound-ops)) | **hardware** — `world_size` is 1 on one GPU | needs a p5.48xlarge (8x H100, NVLink). **The highest-value item in this list**: NVLink vs NeuronLink is the one remaining difference likely to matter at training scale, and nothing here constrains it |
-| `single_test_ops/ccl_ops.json` | same 4 | **0 cases** — the file asks for `world_size: 8` and a trn2.3xlarge has 4 logical cores | **hardware**, both sides | needs 8 of either; on the Neuron side a trn2.48xlarge |
-| `xccl_ops/device2device.json` | `device2device` | 648.7 GB/s (bf16) | **hardware** — needs two devices | same box. Note this op reads its operands exactly once, which is why it tops the Neuron memory-bound table |
+| `xccl_ops/{all_reduce,all_gather,reduce_scatter,all_to_all}.json` | 4 collectives | measured on Neuron from ws=4 to ws=64 — on a trn2.48xlarge at ws=64, `all_gather` 166.4, `all_reduce` 146.5, `reduce_scatter` 142.6, `all_to_all` 15.7 GB/s `bus_bw` ([table](../NEURON/README.md#world_size-scaling-8-to-64)) | **hardware** — `world_size` is 1 on one GPU | needs a p5.48xlarge (8x H100, NVLink). **The highest-value item in this list**, and now the only one-sided one left: the Neuron side is measured across 16 chips, so NVLink vs NeuronLink is a missing GPU column rather than a missing measurement. Compare against Neuron's ws=8 (`all_gather` 81.6, `all_reduce` 79.3 GB/s) — same rank count, and 8x H100 is what a p5.48xlarge is |
+| `single_test_ops/ccl_ops.json` | same 4 | **now runs on Neuron** at `world_size: 8` on a trn2.48xlarge: bf16 `all_gather` 81.6, `all_reduce` 79.3, `reduce_scatter` 68.3, `all_to_all` 28.5 GB/s ([table](../NEURON/README.md#ccl_opsjson-now-runs)). Still **0 cases** on a trn2.3xlarge, which has 4 logical cores | **hardware**, GPU side only | needs 8 GPUs. The int8 cases in this file are also the ones that exposed [int8 collectives being ~200x off](../NEURON/README.md#ccl_opsjson-now-runs) on the Neuron stack, so a GPU column here would say whether that is the op def or the Neuron runtime |
+| `xccl_ops/device2device.json` | `device2device` | 648.7 GB/s (bf16) | **none, and the row was mislabelled** — [the op copies within one device](../NEURON/README.md#device2device-is-not-a-device-to-device-transfer), so it never needed two. Measured on a trn2.48xlarge at 0, 1 and 2 NeuronLink hops it gives 642.3 / 642.5 / 642.9 GB/s, i.e. the hop count is not in the measurement | run it on the H100 as a local-copy number, which is what it is. A real peer-to-peer copy is **not** in this repo on any backend, so NVLink-vs-NeuronLink point-to-point stays uncovered by the row above, not by this one |
 | `xccl_ops/{device2host,host2device}.json` | 2 | 14.3 / 14.0 GB/s at ws=2, and the ws=4 column is not comparable (1 GiB cap, four ranks sharing one host DMA path) | **harness**, not hardware — both ops are registered on `XCCLEngine` (`op_defs/basic_ops/xccl_ops.py:569,627`), and `perf_engine.py:173` skips that engine outright when `len(device_ids) * node_world_size <= 1`. So although both files do list a `world_size: 1` case, a one-GPU launch dispatches to an engine that was never started and writes `note: engine_not_started` for every case (`perf_engine.py:352-364`) — exit 0, nothing measured. `XPU_PERF_ENGINES=XCCLEngine` does not help: the env filter is applied *before* that guard, not instead of it | needs any box with ≥2 GPUs — unlike the collectives it does not need NVLink or all eight. An earlier version of this row claimed these ran here as-is, on the strength of the `world_size: 1` entry in the JSON alone; they do not. Still worth having, as the one number in the comparison governed by neither chip's HBM but by a host link, so 14.3 GB/s currently has nothing to be read against |
 | `single_test_ops/gemm_ops.json` | `moe_gating_gemm`, `quant_matmul`, `moe_quant_group_gemm` | `moe_gating_gemm` 21.89 TF / **48% MFU**; `quant_matmul` 15.78 "TOPS"; `moe_quant_group_gemm` **2.67-2.84 s at every shape** | **none** | run it. `moe_gating_gemm` is the interesting one — the only genuine compute-bound row outside plain `gemm`, at 48% of the fp32 peak against `gemm`'s 82% at the same dtype, with no GPU control to say which of those two numbers is the anomaly. The other two route through `fake_quant_gemm` and are [a bf16 simulation on every backend](../NEURON/README.md#the-quantized-ops-are-a-bf16-simulation-on-every-backend), so a GPU column there measures the same shared helper the `_dynamic_quant` rows already exposed |
 | `single_test_ops/moe_dispatch_ops.json` | `moe_scatter_dynamic_quant` | 0.7 GB/s | **none** | run it. At 0.7 GB/s it is in `gather`/`scatter` territory, and the GPU column is what would say whether that is the op def or the lowering — exactly the question the H100 settled for `gather` |
@@ -1030,10 +1037,14 @@ Everything there is a TODO with a named file.
 
 What is missing for reasons that are *not* about workload coverage:
 
-- **Multi-chip anything.** One H100 against one Trainium2 chip is the widest
-  comparison here. Nothing in this document constrains how either scales past one
-  package, and the collectives rows that would are the hardware-blocked entries in
-  the table above.
+- **Multi-chip on the GPU side.** One H100 against one Trainium2 chip is still the
+  widest *comparison* here, but the asymmetry has moved: Trainium2 is now measured
+  across 16 chips and 64 logical cores on a trn2.48xlarge
+  ([section](../NEURON/README.md#multi-chip-trn248xlarge)) — collectives at
+  `world_size` 4 to 64, the cost of one NeuronLink hop at fixed rank count, and
+  64-core concurrency. There is no p5.48xlarge column for any of it, so nothing
+  here compares NVLink to NeuronLink. That is one box away, not a repo gap: the
+  workload files exist and run.
 - **`torch.compile` on either side.** Both backends are measured eager, which is
   what `launch.py` runs. That is not a neutral choice: it is precisely what made
   the fp8 row read as 99x instead of 1.56x, and there is no reason to assume fp8

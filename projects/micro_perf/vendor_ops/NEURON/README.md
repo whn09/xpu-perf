@@ -23,9 +23,11 @@ the numbers are, and what to do when it breaks.
 > trn2 support in [cszhz/xpu-perf](https://github.com/cszhz/xpu-perf) (that tree
 > is preserved on the `legacy-neuron` branch), and rebased here onto current
 > upstream. Verified on trn2.3xlarge on both runtimes, plus a full sweep of every
-> workload file on eager — see [Reference numbers](#reference-numbers). Measured
-> on one NeuronDevice only, so `world_size > 4` and cross-device collectives
-> remain untested.
+> workload file on eager — see [Reference numbers](#reference-numbers). The
+> single-chip tables are from a trn2.3xlarge; `world_size` 8-64 and the cost of
+> crossing a NeuronLink were added later on a trn2.48xlarge, see
+> [Multi-chip](#multi-chip-trn248xlarge). Nothing here has been run across two
+> instances.
 
 ## Quick start
 
@@ -247,6 +249,10 @@ holds 594-616 GB/s per core, ~2.4 TB/s of the chip's 2.9 TB/s.
 **2,536 GB/s per chip**, 87% of the 2.9 TB/s the chip has and within 1.18x of an
 H100's measured 2,985.
 
+This was extended to all 64 logical cores of a trn2.48xlarge — same method, one
+worker per core — and the plateau holds there too: see
+[64 cores at once](#64-cores-at-once).
+
 **Two exceptions.** The first is dtype-specific: fp8 `gemm` (medians 1.464 and
 1.525) and fp32 `reduce_sum` (median 1.369) are the only groups whose *median* does
 not scale, where every other dtype of every other op sits between 1.000 and 1.025.
@@ -290,7 +296,7 @@ these against. Best `mem_bw` per op, with the dtype that reached it:
 
 | Op | fp32 | fp16 | bf16 |
 |---|---|---|---|
-| `device2device` | — | — | **648.7** |
+| `device2device` (a local copy — [see below](#device2device-is-not-a-device-to-device-transfer)) | — | — | **648.7** |
 | `reduce_sum` | **639.0** | 314.9 | 315.4 |
 | `index_select` | 630.9 | — | **631.6** |
 | `embedding` | 629.2 | — | **631.5** |
@@ -638,7 +644,10 @@ the batch). Reproduce the configuration sweep behind these conclusions with
 For the same cases measured on an H100 with the same provider code, see
 [`../GPU/README.md`](../GPU/README.md).
 
-Collectives, best `bus_bw`:
+Collectives, best `bus_bw`. Both columns are **inside one chip** — a
+trn2.3xlarge is one NeuronDevice, so nothing here crosses a NeuronLink. For the
+cross-chip numbers see
+[Multi-chip: trn2.48xlarge](#multi-chip-trn248xlarge).
 
 | Op | ws=2 | ws=4 |
 |---|---|---|
@@ -672,6 +681,284 @@ and 16.00GB internal (scratchpad) allocations
 see [Troubleshooting](#troubleshooting). Cap `batch_size` at 262,144 (1 GiB at
 fp32, far past the bandwidth plateau) to avoid it entirely;
 `tools/cap_xccl_workloads.py` does this.
+
+### Multi-chip: trn2.48xlarge
+
+2026-09-05, same eager image and driver, on a **trn2.48xlarge**: 16 NeuronDevices
+x 4 logical cores = **64 devices** as micro_perf counts them, 96 GiB per chip
+(24 GiB per logical core, unchanged), 192 vCPU. Chip *N* owns logical cores
+`4N .. 4N+3`, and devices 0-3 and 12-15 hang off NUMA node 1 while 4-11 hang off
+node 0.
+
+The NeuronLink topology is a **4x4 torus in row-major order**, from `neuron-ls
+--topology`:
+
+```
+*––►[ 0 ]◄––►[ 1 ]◄––►[ 2 ]◄––►[ 3 ]◄––*
+*––►[ 4 ]◄––►[ 5 ]◄––►[ 6 ]◄––►[ 7 ]◄––*
+*––►[ 8 ]◄––►[ 9 ]◄––►[10 ]◄––►[11 ]◄––*
+*––►[12 ]◄––►[13 ]◄––►[14 ]◄––►[15 ]◄––*
+       (columns wrap too; * = wrap-around link)
+```
+
+So chip 0's neighbours are 1, 3, 4 and 12. **Adjacent indices are not adjacent
+chips**: 3 and 4 are two hops apart, and that distinction turns out to decide
+which collectives are legal, not just how fast they are — see
+[Placement](#placement-which-chips-you-pick) below.
+
+Everything here comes from `tools/run_multicard_sweep.sh`, which is separate from
+`run_full_sweep.sh` on purpose: 33 of that script's 39 labels are `--device 0` and
+it is the reproduction recipe for the single-chip tables above. Summarize a result
+tree with `tools/analyze_multicard.py`.
+
+Five things the 3xlarge could not answer are answered below, and one of the five
+answers is that a row in the table above does not mean what its name says.
+
+#### `ccl_ops.json` now runs
+
+`workloads/llm/single_test_ops/ccl_ops.json` was the only file in the repo with no
+runnable case at all: every case asks for `world_size: 8`. At 8 ranks (cores 0-7,
+i.e. chips 0 and 1) it runs, and it is also the first NeuronLink measurement in
+the repo. 262,144 x 1024, one rank per core:
+
+| Op | dtype | payload | latency | `bus_bw` | floor at 8 tokens |
+|---|---|---|---|---|---|
+| `all_gather` | bf16 | 512 MiB | 5.76 ms | **81.6 GB/s** | 148 us |
+| `all_reduce` | bf16 | 512 MiB | 11.85 ms | **79.3 GB/s** | 142 us |
+| `reduce_scatter` | bf16 | 512 MiB | 6.87 ms | **68.3 GB/s** | 150 us |
+| `all_to_all` | bf16 | 512 MiB | 16.46 ms | **28.5 GB/s** | 563 us |
+| `all_gather` | **int8** | 256 MiB | **1307.00 ms** | **0.2 GB/s** | 2,407 us |
+| `all_to_all` | **int8** | 256 MiB | **2002.03 ms** | **0.1 GB/s** | 6,882 us |
+
+The bf16 `all_reduce` plateau agrees with `nccom-test`, which reports a ~78 GB/s
+Ring plateau on the same hardware — two unrelated tools, so treat ~80 GB/s as the
+per-rank NeuronLink figure rather than a micro_perf artefact.
+
+**int8 collectives are broken, not merely slower.** 227x on `all_gather` and 122x
+on `all_to_all` against bf16, per *element* as well as per byte, with a 2.4 ms
+floor at 8 tokens where bf16 pays 147 us — and nothing is logged: no warning, no
+exception, no fallback notice. This matters for quantized tensor parallelism, where
+the point of int8 activations is to make the all-gather cheaper.
+
+`tools/probe_int8_collective.py` runs a bf16 phase and then an int8 phase of the
+same op and samples `neuron-monitor` at 1s underneath, on three signals:
+NeuronCore utilization, the 8 worker runtimes' own CPU summed (100% = one saturated
+vCPU), and instance-wide user CPU. The series is flat and unambiguous, and
+reproduced across three runs:
+
+| phase | NeuronCore util | 8 workers' CPU |
+|---|---|---|
+| `all_gather` bf16 | brief spike to 15-17% | ~9% of one vCPU |
+| `all_gather` int8 | **steady 1.15%** for 10-14 s | 7-11% of one vCPU |
+| `all_to_all` bf16 | brief spike to 75-85% | ~6% of one vCPU |
+| `all_to_all` int8 | **steady 2.95%** for 15-19 s | ≤32% of one vCPU |
+
+So **nothing is busy**. It is not a host fallback — this is not the fp8 story, where
+one vCPU pinned at 100% against an idle device was the whole answer; all eight ranks
+together never reach a third of a single vCPU. And it is on the device: utilization
+is small but steady and nonzero for the entire int8 phase, in a per-iteration
+pattern. Integrating, the int8 phase's total device-busy time is *comparable* to the
+bf16 phase's (10 s x 1.15% vs ~2 s x 16%), so this is not 200x more work — it is the
+same work spread over 200x the wall clock, i.e. a serialized issue path with the
+device idle in between. That makes it a runtime/CCL matter to raise upstream rather
+than something a workload or op-def change can fix, and int8 activations should be
+assumed to *cost* bandwidth on this stack until it is fixed.
+
+#### What crossing a chip boundary costs
+
+Rank count held at 4, only the placement changed — the comparison a single-chip
+instance cannot express. `topo_hop0` is cores 0-3, all inside chip 0. `topo_hop1`
+is cores 0, 4, 8, 12: one core in each of chips 0-3, so every ring step crosses a
+NeuronLink.
+
+| Op | hop0 (one chip) | hop1 (4 chips) | cost of leaving the chip |
+|---|---|---|---|
+| `all_gather` | 93.0 GB/s | 36.1 GB/s | **2.58x** |
+| `all_reduce` | 105.3 GB/s | 37.6 GB/s | **2.80x** |
+| `reduce_scatter` | 73.6 GB/s | 32.4 GB/s | **2.27x** |
+| `all_to_all` | 39.9 GB/s | *rejected by the runtime* | — |
+
+bf16, best `bus_bw` over `batch_size` 1 … 262,144. The latency floors are the
+same either way (104-111 us), so this is bandwidth, not launch cost.
+
+**`all_to_all` requires a mesh-mappable replica group.** At 4 ranks spread one per
+chip the runtime refuses outright:
+
+```
+ENC:enc_post_operation  [nec_dev 4] alltoall cannot be supported without Mesh
+algorithm, check if Mesh algorithm is supported on the current replica group
+size, rank_n(4)
+```
+
+It is not a size rule — 8, 16, 32 and 64 contiguous ranks all work. It is a
+*shape* rule, and it constrains where an expert-parallel group may be placed, not
+how big it may be.
+
+#### world_size scaling, 8 to 64
+
+bf16, best `bus_bw`, contiguous cores, `--numa -1`:
+
+| world_size | chips | `all_gather` | `all_reduce` | `reduce_scatter` | `all_to_all` |
+|---|---|---|---|---|---|
+| 4 (`topo_hop0`) | 1 | 93.0 | 105.3 | 73.6 | 39.9 |
+| 8 | 2 | 84.0 | 79.5 | 68.4 | 28.6 |
+| 16 | 4 | 107.6 | 119.2 | 112.7 | 18.6 |
+| 32 | 8 | 115.4 | 119.8 | 117.7 | 17.5 |
+| 64 | 16 | **166.4** | **146.5** | **142.6** | 15.7 |
+
+`bus_bw` is `2(n-1)/n x algo_size / latency` — bytes crossing *a* link, summed
+over the ring, not one link's bandwidth. It is expected to rise with rank count
+when the extra ranks bring extra links, so read the table as "the fabric keeps up
+to 64 ranks", not "64 ranks are 2x faster than 4". The three ring collectives
+scale; the small-message floor grows from 106 us at 4 ranks to ~1.0-1.4 ms at 64,
+which is the number that decides whether a small tensor-parallel `all_reduce` is
+worth doing at all.
+
+**`all_to_all` goes the other way** — 39.9 GB/s at 4 ranks down to 15.7 at 64,
+with the floor climbing 306 us → 5.36 ms. It sends n² messages, so this is the
+expected shape, and it is the row to check before assuming an expert-parallel
+dispatch will spread across the instance for free.
+
+#### `device2device` is not a device-to-device transfer
+
+Three placements, three identical numbers:
+
+| Label | devices | chips | `mem_bw` |
+|---|---|---|---|
+| `d2d_intra` | 0,1 | same chip | 642.3 GB/s |
+| `d2d_hop1` | 0,4 | adjacent on the torus | 642.5 GB/s |
+| `d2d_hop2` | 0,8 | two hops apart | 642.9 GB/s |
+
+Hop distance changes nothing because no hop is taken. `Device2DeviceOp` in
+`op_defs/basic_ops/xccl_ops.py` allocates `src` *and* `dst` on the same device and
+runs `dst.copy_(src)`; every worker copies within its own HBM. So the **648.7
+GB/s** in [Memory-bound ops](#memory-bound-ops) is a local HBM copy at 89% of one
+core's 725 GB/s share — a good number, and the right one to compare against `add`
+or `cast` — but it is not a peer-to-peer figure and must not be read as one.
+Nothing in the repo measures a peer-to-peer copy; the collectives are the only
+cross-chip traffic here.
+
+#### 64 cores at once
+
+`conc64_gemm` runs the gemm sweep with one worker per logical core — 64 of them,
+all 16 chips loaded — and `conc1_gemm` runs the same shapes on core 0 alone
+(`workloads/conc_control/gemm.json`; its header says why it is a subset). A
+`ComputeEngine` worker takes cases from a shared queue, so this is 64 *different*
+cases in flight and every latency below is still a single-core latency. The ratio
+is therefore the answer to "does a core still perform when its 63 neighbours are
+busy?".
+
+| dtype | shape (M x K x N) | 1 core | 64 cores | 64c / 1c | 64c TFLOPS | 64c MFU |
+|---|---|---|---|---|---|---|
+| bf16 | 28672 x 4096 x 4096 | 6,733 us | 6,505 us | **0.97x** | 147.9 | 88.7% |
+| bf16 | 20480 x 4096 x 4096 | 4,783 us | 4,765 us | **1.00x** | 144.2 | 86.5% |
+| bf16 | 4096 x 8192 x 8192 | 3,805 us | 3,877 us | **1.02x** | 141.8 | 85.0% |
+| bf16 | 28672 x 8192 x 8192 | 29,535 us | 28,769 us | **0.97x** | 133.8 | 80.2% |
+| fp16 | 20480 x 4096 x 4096 | 5,149 us | 4,723 us | **0.92x** | 145.5 | 87.3% |
+| fp32 | 4096 x 8192 x 8192 | 18,189 us | 16,327 us | **0.90x** | 33.7 | 74.4% |
+| bf16 | **1** x 4096 x 4096 | 80.9 us | 264.4 us | **3.27x** | 0.1 | 0.1% |
+| bf16 | **512** x 8192 x 8192 | 535 us | 910 us | **1.70x** | 75.5 | 45.3% |
+| fp16 | **512** x 8192 x 8192 | 533 us | 1,059 us | **1.99x** | 64.9 | 38.9% |
+| fp8 e4m3 | 16384 x 8192 x 8192 | 453,977 us | 458,226 us | **1.01x** | 4.8 | 1.5% |
+
+**On the compute-bound plateau there is no concurrency loss at all** — 0.90x to
+1.02x, i.e. within run-to-run noise, and several rows come out marginally faster
+at 64 cores than at 1. So the per-core numbers in the single-chip tables above are
+not a one-core-in-isolation artefact: bf16 gemm holds 147.9 TFLOPS per core with
+every core loaded, which is **9.5 PFLOPS of bf16 gemm per instance at 88.7% of the
+64-core peak**. "x4 per chip" does extend to "x64 per instance".
+
+**Small shapes are the exception, and they degrade badly.** M=1 costs 3.3x more
+latency at 64 cores; M=512 costs 1.7-2.0x. Those cases are host-dispatch-bound
+rather than array-bound — 64 workers share 192 vCPUs — so this is contention for
+the launch path, not for the fabric or for HBM. It is the same effect as
+[small-op latency](#small-op-latencies-measure-the-runtime-not-the-chip) showing up as latency, and it
+lands exactly on decode-shaped work. One row (fp16 512 x 4096 x 4096, 9.5x) is far
+outside the pattern of its neighbours and is more likely a warmup landing inside
+the measured window than a real 9.5x.
+
+The elementwise files (`conc64_mem` / `conc1_mem`, `add` `mul` `sub` `cast`, 216
+matched cases) say the same thing with a sharper size dependence:
+
+| payload | cases | median 64c/1c | p90 | worst |
+|---|---|---|---|---|
+| >= 256 MiB | 27 | **1.00x** | 1.87x | 2.33x |
+| 16-256 MiB | 48 | 2.00x | 10.81x | 14.29x |
+| 1-16 MiB | 48 | 2.09x | 11.33x | 31.84x |
+| < 1 MiB | 93 | 3.20x | 14.61x | 28.18x |
+
+Peak per-core `mem_bw` is unchanged for `mul` (601.8 → 602.2 GB/s) and `cast`
+(615.4 → 595.7), and loses 6-13% for `sub` (598.9 → 565.0) and `add` (603.9 →
+525.8). So **~38 TB/s of elementwise bandwidth per instance** (64 x ~595 GB/s,
+82% of 16 x 2.9 TB/s) is a measurement, on the same footing as the per-chip 2.4
+TB/s above. Everything below a quarter-gigabyte, though, is 2-3x worse with the
+instance loaded — and unlike the gemm case this is *not* only the smallest shapes:
+the 16-256 MiB bucket degrades 2x too, where a single core's device time is only a
+few hundred microseconds and the per-iteration host work is not negligible against
+it.
+
+**float8 is not slow because of CPU contention.** 458 ms at 64 cores and 454 ms on
+one idle core with 192 vCPUs free — 1.01x, at the largest shape. So the emulated
+float8 path is intrinsically that slow rather than starved. (The 4-core sweep above
+does show 1.46-1.53x median on float8, over all 12 of its shapes rather than only
+the largest, so smaller float8 shapes may well contend — what is ruled out is
+contention explaining the two orders of magnitude.) See
+[fp8: a dtype this chip cannot multiply](#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply).
+
+#### Placement: which chips you pick
+
+Four 8-rank runs of the same `ccl_ops.json`, differing only in the device list.
+The first three keep the two chips torus-adjacent and vary the NUMA node; the
+fourth breaks adjacency.
+
+| Label | chips | adjacency | NUMA | `all_gather` | `all_reduce` | `reduce_scatter` | `all_to_all` |
+|---|---|---|---|---|---|---|---|
+| `ccl8_llm` | 0,1 | adjacent | node 1 | 81.6 | 79.3 | 68.3 | 28.5 |
+| `numa_node0` | 4,5 | adjacent | node 0 | 81.8 | 79.2 | 68.2 | 28.5 |
+| `numa_cross` | 0,4 | adjacent | **crosses** | 81.7 | 79.2 | 68.3 | 28.5 |
+| `topo_far8` | 3,4 | **2 hops** | crosses | *fails* | *fails* | *fails* | **63.1** |
+
+bf16 `bus_bw` in GB/s at 512 MiB. The three adjacent placements agree to within
+0.3% on every op — including `numa_cross`, whose 8 ranks straddle the two sockets —
+so **the NUMA node the chips hang off is irrelevant** to a collective. That is
+worth establishing rather than assuming, because the launcher's own default gets
+NUMA wrong on this instance (below), and because it means a multi-chip number in
+this repo does not have to name its sockets.
+
+It does have to name its chips. A ring cannot be laid over 8 cores
+whose two chips are not neighbours, so the runtime falls back to its Mesh
+algorithm, and Mesh has a **40 MiB message cap**:
+
+```
+ENC:enc_post_operation  [nec_dev 13] Collective operation ALLREDUCE with
+total_size 268435456 over group id 0 (rank_n:8 node_n:1) is currently not
+supported. Replica-group 0: [0,1,2,3,4,5,6,7]
+ENC:enc_post_operation  Collective operation may not be supported on this
+replica-group, because message size is larger than 41943040 bytes. Consider
+using tiling or increasing buffer size by setting
+NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE or NEURON_RT_DBG_MESH_CHANNEL_BUFFER_SIZE
+```
+
+So `all_reduce`, `all_gather` and `reduce_scatter` **fail outright** at 512 MiB on
+a badly placed group — the small cases still run, which is why the label produces a
+report at all — while `all_to_all` not only survives but goes **2.2x faster than on
+an adjacent pair** (63.1 vs 28.5 GB/s), Mesh being the better fit for an n²
+pattern. Together with the [4-rank `all_to_all` rejection](#what-crossing-a-chip-boundary-costs)
+that is one rule stated twice: *which* chips a replica group lands on decides which
+collectives are legal and which algorithm they get, and neither the rank count nor
+the message size predicts it on its own. A tensor-parallel group placed across
+chips 3 and 4 does not run slower, it does not run.
+
+#### NUMA pinning
+
+`run_multicard_sweep.sh` passes `--numa -1` (no CPU pinning) everywhere, because on
+this instance the *default* is wrong: with `--numa` unset the launcher starts one
+process group per NUMA node and splits the device list between them in index order,
+but devices 0-3 and 12-15 are on node 1 while 4-11 are on node 0, so an index-order
+split pins most workers to the wrong socket. `NUMA=0` on the script re-enables
+pinning for a comparison run. Note `--numa` is only a CPU-affinity knob:
+`BaseEngine.__init__` creates one process per device either way, and `numa_num` /
+`numa_order` only choose which `numa_cores` those processes are pinned to.
 
 ### XLA runtime
 

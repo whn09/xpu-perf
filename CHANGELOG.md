@@ -8,6 +8,63 @@ This changelog follows semantic versioning and Keep a Changelog style.
 
 ### Added
 
+- `projects/micro_perf/vendor_ops/NEURON/tools/run_multicard_sweep.sh`: a 16-label
+  multi-chip sweep for a `trn2.48xlarge` (16 NeuronDevices x 4 logical cores = 64
+  devices), with `tools/analyze_multicard.py` to summarize a result tree and
+  `tools/cap_xccl_workloads.py` extended to pin `world_size` and to take a single
+  file as well as a directory. Deliberately separate from `run_full_sweep.sh`, 33 of
+  whose 39 labels are `--device 0`; no label overlaps. Every label passes
+  `--numa -1`, because the launcher's default splits the device list between NUMA
+  process groups **in index order** while this instance puts devices 0-3 and 12-15 on
+  node 1 and 4-11 on node 0.
+
+  Five things a `trn2.3xlarge` could not answer, all measured and written up in
+  [`vendor_ops/NEURON/README.md`](projects/micro_perf/vendor_ops/NEURON/README.md#multi-chip-trn248xlarge):
+
+  1. **`workloads/llm/single_test_ops/ccl_ops.json` now runs.** It was the only file
+     in the repo with *no* runnable case — every case asks for `world_size: 8` — and
+     it is now the repo's first NeuronLink measurement: bf16 `all_gather` 81.6,
+     `all_reduce` 79.3, `reduce_scatter` 68.3, `all_to_all` 28.5 GB/s `bus_bw`. The
+     `all_reduce` figure agrees with `nccom-test`'s ~78 GB/s Ring plateau on the same
+     box, so ~80 GB/s is cross-validated by two unrelated tools.
+  2. **`world_size` 4 to 64**, and **what leaving the chip costs** at fixed rank
+     count: at 4 ranks, one-per-chip against all-in-one-chip is 2.27-2.80x slower
+     with the latency floor unchanged, so it is bandwidth and not launch cost.
+  3. **Placement decides legality, not just speed.** `all_to_all` is refused
+     outright at 4 ranks spread one per chip (`alltoall cannot be supported without
+     Mesh algorithm ... rank_n(4)`) while 8/16/32/64 contiguous ranks work; and 8
+     ranks on two *non-adjacent* chips (3 and 4 are two hops apart on the 4x4 torus
+     despite the adjacent indices) fall back to the Mesh algorithm, which caps a
+     collective at 40 MiB — so `all_reduce`/`all_gather`/`reduce_scatter` *fail* at
+     512 MiB there while `all_to_all` survives and goes 2.2x faster. Which NUMA node
+     the chips hang off, by contrast, is worth 0.3%.
+  4. **64-core concurrency**, against a single-core control taken on the same
+     instance (`vendor_ops/NEURON/workloads/conc_control/gemm.json`; a 3xlarge
+     control would fold two instance types into a figure reported as concurrency
+     loss). On the compute-bound plateau the ratio is 0.90-1.02x — no loss at all, so
+     9.5 PFLOPS of bf16 gemm and ~38 TB/s of elementwise bandwidth per instance are
+     measurements rather than extrapolations. Small shapes are the exception and
+     degrade 2-3x, elementwise ones up to a payload of 256 MiB, which is where
+     decode-shaped work lives.
+  5. **`xccl_ops/device2device.json` does not measure a device-to-device transfer.**
+     0, 1 and 2 hops give 642.3 / 642.5 / 642.9 GB/s because no hop is taken:
+     `Device2DeviceOp` allocates `src` and `dst` on the same device. The published
+     648.7 GB/s is a local HBM copy, and nothing in the repo measures a peer-to-peer
+     copy on any backend. `vendor_ops/GPU/README.md`'s coverage table had this row
+     down as hardware-blocked; it is runnable on one GPU today.
+
+- `projects/micro_perf/vendor_ops/NEURON/tools/probe_int8_collective.py` and
+  `vendor_ops/NEURON/workloads/ccl_int8_probe.json`: int8 collectives are 227x
+  (`all_gather`) and 122x (`all_to_all`) slower than bf16 at `world_size` 8, per
+  element as well as per byte, with nothing logged. The probe runs a bf16 phase then
+  an int8 phase of the same op and samples `neuron-monitor` at 1s on NeuronCore
+  utilization, the worker runtimes' own CPU, and instance-wide CPU. Across three
+  runs: the int8 phases hold a steady 1.15% / 2.95% device utilization for their
+  whole duration while all eight ranks together never reach a third of one vCPU. So
+  it is neither a host fallback (unlike fp8) nor more work — integrated device-busy
+  time is comparable to bf16's — but the same work serialized over 200x the wall
+  clock. A runtime/CCL issue, not a workload one.
+
 - `projects/micro_perf/workloads/models/qwen3_5_27b/`: eight workload files (392
   cases) shaped from `Qwen/Qwen3.5-27B`'s real `config.json` rather than from powers
   of two, at TP=1 and TP=4, plus a README documenting the provenance of every shape.
