@@ -1,0 +1,20 @@
+{
+    "quant_matmul": [
+        {
+            "arg_type": "llm",
+            "dtype.w_dtype.compute_dtype.dst_dtype": [
+                ["mxfp8_e4m3fn", "mxfp8_e4m3fn", "mxfp8_e4m3fn", "bfloat16"],
+                ["mxfp8_e5m2", "mxfp8_e5m2", "mxfp8_e5m2", "bfloat16"],
+                ["mxfp8_e4m3fn", "mxfp4_e2m1fn", "mxfp8_e4m3fn", "bfloat16"],
+                ["mxfp4_e2m1fn", "mxfp4_e2m1fn", "mxfp4_e2m1fn", "bfloat16"]
+            ],
+            "num_tokens": [128, 512, 2048, 8192],
+            "hidden_size.new_hidden_size": [
+                [4096, 4096],
+                [5120, 25600],
+                [8192, 8192],
+                [8192, 28672]
+            ]
+        }
+    ]
+}

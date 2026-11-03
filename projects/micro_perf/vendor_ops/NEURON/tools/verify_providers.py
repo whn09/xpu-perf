@@ -39,6 +39,7 @@ import time
 import traceback
 
 os.environ.setdefault("XPU_PERF_NEURON_GEMM_COMPILE", "1")
+os.environ.setdefault("XPU_PERF_NEURON_MX", "1")
 
 import torch
 
@@ -57,6 +58,7 @@ EXPECTED_EAGER = {
     "rms_norm": {"torch", "nkilib"},
     "topk": {"torch", "nkilib"},
     "all_gather": {"torch"},
+    "quant_matmul": {"torch", "nkilib"},   # with XPU_PERF_NEURON_MX=1
 }
 
 # provider directory -> the file defining it, for re-running a swallowed import.
@@ -67,6 +69,7 @@ PROVIDER_FILES = {
     ("rms_norm", "nkilib"): "nkilib/rms_norm.py",
     ("topk", "nkilib"): "nkilib/topk.py",
     ("gemm", "torch_compile"): "torch_compile/gemm.py",
+    ("quant_matmul", "nkilib"): "nkilib/quant_matmul.py",
 }
 
 
@@ -122,6 +125,23 @@ CASES = [
 ]
 
 
+def mxq(T, H, N, a, w):
+    return {"arg_type": "llm", "num_tokens": T, "hidden_size": H, "new_hidden_size": N,
+            "dtype": a, "w_dtype": w, "compute_dtype": a, "dst_dtype": "bfloat16"}
+
+
+# MX quant_matmul: runs on Trn3 only. On Trn2 these must come back REJECTED -- that
+# is the guard that keeps a trn3 NEFF off a Trn2 core (it executes and faults it).
+CASES += [
+    ("quant_matmul", "nkilib", mxq(512, 4096, 4096, "mxfp8_e4m3fn", "mxfp8_e4m3fn")),
+    ("quant_matmul", "nkilib", mxq(512, 4096, 4096, "mxfp8_e5m2", "mxfp8_e5m2")),
+    ("quant_matmul", "nkilib", mxq(512, 8192, 8192, "mxfp8_e4m3fn", "mxfp4_e2m1fn")),
+    ("quant_matmul", "nkilib", mxq(128, 5120, 25600, "mxfp4_e2m1fn", "mxfp4_e2m1fn")),
+]
+
+MX_SIM_COMBOS = [(a, w) for a in ("e4m3", "e5m2", "fp4") for w in ("e4m3", "e5m2", "fp4")]
+
+
 # ---------------------------------------------------------------- references
 
 def ref_gemm(op, x, dt):
@@ -161,6 +181,65 @@ def ref_attention(op, x, dt):
         p = torch.softmax(sc, dim=-1).to(dt)
         out[:, h0:h1] = torch.matmul(p, v[:, h0:h1]).to(dt)
     return out.transpose(1, 2).reshape(op.num_tokens, hq, d)
+
+
+_MX_MOD = None
+
+
+def mx_module():
+    """ops/nkilib/quant_matmul.py, for its host-side dequant/reference helpers."""
+    global _MX_MOD
+    if _MX_MOD is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_verify_mx_quant_matmul", OPS_DIR / "nkilib" / "quant_matmul.py")
+        _MX_MOD = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_MX_MOD)
+    return _MX_MOD
+
+
+def ref_quant_matmul_mx(op, x, dt):
+    # exact MX product; the bf16 version of it is the floor (output rounding)
+    return mx_module().reference(x, op.a_fmt, op.w_fmt).to(dt)
+
+
+def mx_sim_child(lnc):
+    """Runs with NEURON_PLATFORM_TARGET_OVERRIDE=trn3, in its own process only."""
+    import numpy as np
+    import nki
+    M = mx_module()
+    T, H, N = 256, 2048, 2048
+    bad = 0
+    for a, w in MX_SIM_COMBOS:
+        x = {"a_q": M.random_packed(H // 4, T, a, "cpu"), "a_s": M.random_scales(H // 32, T, "cpu"),
+             "w_q": M.random_packed(H // 4, N, w, "cpu"), "w_s": M.random_scales(H // 32, N, "cpu")}
+        ref = M.reference(x, a, w)
+        k = M.build_kernel(a, w)
+        k = k[lnc] if lnc > 1 else k
+        got = nki.simulate(k)(*(x[n].numpy() for n in ("a_q", "a_s", "w_q", "w_s")))
+        got = torch.from_numpy(np.asarray(got).astype(np.float32))
+        rel = ((got - ref).norm() / ref.norm()).item()
+        floor = ((ref.to(torch.bfloat16).float() - ref).norm() / ref.norm()).item()
+        ok = rel <= 3 * floor
+        bad += not ok
+        print(f"{'PASS' if ok else 'FAIL':<6} mx sim trn3 lnc={lnc} a={a} w={w} {T}x{H}x{N}: "
+              f"rel={rel:.2e} floor={floor:.2e}", flush=True)
+    sys.exit(1 if bad else 0)
+
+
+def run_mx_sim():
+    import subprocess
+    env = dict(os.environ, NEURON_PLATFORM_TARGET_OVERRIDE="trn3")
+    ok = True
+    for lnc in (1, 2):
+        env["NEURON_LOGICAL_NC_CONFIG"] = str(lnc)
+        r = subprocess.run([sys.executable, __file__, "--_mx-sim-child", str(lnc)], env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in r.stdout.splitlines():
+            if line.startswith(("PASS", "FAIL", "Traceback")) or "Error" in line:
+                print(line)
+        ok &= r.returncode == 0
+    return ok
 
 
 def compare(got, want):
@@ -229,7 +308,13 @@ def main():
                     help="pass if device rel err <= slack x host same-dtype rel err")
     ap.add_argument("--only", default=None, help="comma list of op[:provider] to run")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--mx-sim", action="store_true",
+                    help="also check the MX quant_matmul kernel in the NKI simulator at "
+                         "target trn3 (CPU only; works on a Trn2 host)")
+    ap.add_argument("--_mx-sim-child", type=int, default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args._mx_sim_child is not None:
+        mx_sim_child(args._mx_sim_child)
 
     backend = build_backend()
     backend.load_all_ops()
@@ -316,7 +401,8 @@ def main():
                 rec.update(r)
             else:
                 ref_fn = {"gemm": ref_gemm, "rms_norm": ref_rms_norm,
-                          "flash_attention": ref_attention}[op_name]
+                          "flash_attention": ref_attention,
+                          "quant_matmul": ref_quant_matmul_mx}[op_name]
                 low = op.torch_dtype if hasattr(op, "torch_dtype") else torch.bfloat16
                 if low in (torch.float8_e5m2, torch.float8_e4m3fn):
                     low = torch.bfloat16      # fp8 inputs are exact in bf16; the
@@ -364,6 +450,11 @@ def main():
             pass
         backend.empty_cache()
 
+    mx_sim_ok = None
+    if args.mx_sim:
+        print("\n=== MX quant_matmul in the NKI simulator (target trn3) ===")
+        mx_sim_ok = run_mx_sim()
+
     print("\n=== summary ===")
     counts = {}
     for r in records:
@@ -373,7 +464,9 @@ def main():
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"versions": versions, "runtime": runtime, "records": records}, f, indent=1)
-    bad = (not reg_ok) or any(r["status"] in ("FAIL", "ERROR", "NOT_REGISTERED") for r in records)
+    if mx_sim_ok is not None:
+        print(f"mx simulator: {'OK' if mx_sim_ok else 'FAIL'}")
+    bad = (mx_sim_ok is False) or (not reg_ok) or any(r["status"] in ("FAIL", "ERROR", "NOT_REGISTERED") for r in records)
     sys.exit(1 if bad else 0)
 
 

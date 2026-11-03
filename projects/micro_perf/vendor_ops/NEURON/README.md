@@ -182,6 +182,33 @@ Trainium3 (`trn3.48xlarge`) is now in the MFU peak table (671 bf16/tf32, 183 fp3
 2517 fp8/MX TFLOPS per chip). **Nothing in this repo has run on Trn3 yet** — run
 `tools/verify_providers.py` there before trusting the first sweep.
 
+### MXFP8 / MXFP4 `quant_matmul` (Trainium3 only)
+
+`ops/nkilib/quant_matmul.py` runs `quant_matmul` on the NeuronCore-v4 MX datapath
+(`nisa.nc_matmul_mx`), for the compute dtypes `op_defs/llm_ops/quant_matmul.md`
+already names: `mxfp8_e4m3fn`, `mxfp8_e5m2`, `mxfp4_e2m1fn`, any activation x weight
+combination. Operands arrive pre-quantized (x4-packed along K, E8M0 scale per 32
+values), like the int8 op's, so the timed region is the MX GEMM. Opt-in, because a
+vendor provider for `quant_matmul` would otherwise replace the int8 base rows:
+
+```bash
+XPU_PERF_NEURON_MX=1 python launch.py --backend NEURON --device 0 \
+    --workload vendor_ops/NEURON/workloads/quant_matmul_mx.json
+```
+
+Validated in the NKI CPU simulator at target trn3 — all nine format combinations,
+LNC 1 and 2, match an exact host dequant-matmul to bf16 output rounding, and
+negative controls (doubled scales, swapped fp4 nibbles, permuted weights) are caught
+— and compiled by neuronx-cc for trn3 without errors. **Not yet run on Trn3
+hardware**: check it with `tools/verify_providers.py` there first (`--mx-sim` repeats
+the simulator check on any host). It is a straightforward first kernel; if its MFU is
+low, nkilib's tuned `experimental/matmul_mxfp8` is the next step.
+
+Every case is refused off Trn3, by instance type. That is not caution for its own
+sake: neuronx-cc will compile the kernel for trn3 on a Trn2 host when the target is
+overridden, and the 2.35 runtime then *executes* the trn3 NEFF on the Trn2 core,
+faulting it (`SEQUENCER_ERROR_SUBTYPE_BAD_OPCODE`) until the process exits.
+
 ### Beta-image measurements
 
 All on trn2.3xlarge, one logical NeuronCore (a trn2 chip is 4 logical cores at
