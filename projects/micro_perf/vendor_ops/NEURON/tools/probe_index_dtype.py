@@ -1,6 +1,6 @@
 """Why `gather` is ~450x off on Trainium, in one runnable file.
 
-Background is in ../README.md, section "Two index ops are pathologically slow, and
+Background is in ../READING_THE_NUMBERS.md, section "Two index ops are pathologically slow, and
 one is an int64 index away from parity". Short version: the device has no int64. An
 int64 index is converted on the way into the graph by a NKI custom call, and that
 conversion *materialises* the index -- which destroys the stride-0 broadcast that
@@ -31,7 +31,7 @@ import torch
 import torch_neuronx  # noqa: F401  (registers the neuron device)
 
 N = 1024
-# 65536 is deliberately absent: ../README.md records `gather` wedging neuronx-cc
+# 65536 is deliberately absent: ../READING_THE_NUMBERS.md records `gather` wedging neuronx-cc
 # for hours at that size, and a compile hang is not something a timeout survives.
 DIMS = [128, 512, 1024, 4096, 8192, 32768]
 DTYPES = [("float32", torch.float32), ("bfloat16", torch.bfloat16)]

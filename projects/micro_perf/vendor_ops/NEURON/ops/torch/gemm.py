@@ -11,7 +11,7 @@ from xpu_perf.micro_perf.backends.NEURON.backend_neuron import RUNTIME_EAGER
 # torch fp8 type. The `mxfloat8*` aliases are deliberately absent: they map to the
 # same torch.float8_e4m3fn / float8_e5m2 with no block-scale tensor anywhere in
 # the op def, so accepting them would republish the numbers below under a label
-# that promises microscaling. See README, "fp8: the sweep measures the eager path,
+# that promises microscaling. See READING_THE_NUMBERS.md, "fp8: the sweep measures the eager path,
 # in a dtype this chip cannot multiply".
 FP8_DTYPES = frozenset({"float8", "float8_e4m3", "float8_e5m2"})
 

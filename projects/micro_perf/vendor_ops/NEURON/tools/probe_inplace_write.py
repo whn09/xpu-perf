@@ -1,6 +1,6 @@
 """Are `store_kv_cache`'s and `rotary_embedding`'s in-place writes actually in-place?
 
-Background in ../README.md, sections "Writes into a strided slice view are not
+Background in ../READING_THE_NUMBERS.md and ../RESULTS.md, sections "Writes into a strided slice view are not
 in-place" and "`rotary_embedding` is not a Neuron result at all".
 
 Two op defs write into a *strided slice view* of a large pre-allocated tensor and

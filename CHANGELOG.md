@@ -59,7 +59,7 @@ This changelog follows semantic versioning and Keep a Changelog style.
   node 1 and 4-11 on node 0.
 
   Five things a `trn2.3xlarge` could not answer, all measured and written up in
-  [`vendor_ops/NEURON/README.md`](projects/micro_perf/vendor_ops/NEURON/README.md#multi-chip-trn248xlarge):
+  [`vendor_ops/NEURON/README.md`](projects/micro_perf/vendor_ops/NEURON/RESULTS.md#multi-chip-trn248xlarge):
 
   1. **`workloads/llm/single_test_ops/ccl_ops.json` now runs.** It was the only file
      in the repo with *no* runnable case — every case asks for `world_size: 8` — and

@@ -40,7 +40,7 @@
 #
 # Read the results with the same analyzer as the Neuron side:
 #   python3 vendor_ops/NEURON/tools/analyze_sweep.py <log>
-# and compare MFU columns, not latencies -- see NEURON/README.md, "MFU". One
+# and compare MFU columns, not latencies -- see NEURON/READING_THE_NUMBERS.md, "MFU". One
 # H100 is a whole accelerator; one Neuron device is a *logical NeuronCore*, a
 # quarter of a Trainium2 chip at the default LNC=2. Per-device latency ratios
 # between the two are therefore meaningless on their own.

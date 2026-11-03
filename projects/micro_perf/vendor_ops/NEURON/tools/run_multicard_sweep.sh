@@ -3,7 +3,7 @@
 # trn2.48xlarge: 16 trn2 devices x 4 logical NeuronCores = 64 devices as
 # micro_perf counts them.
 #
-# ../README.md's numbers were all taken on a trn2.3xlarge, which is one device
+# ../RESULTS.md's numbers were all taken on a trn2.3xlarge, which is one device
 # and four logical cores. Everything about crossing a chip boundary was therefore
 # unmeasurable there, and three claims in the docs were left open:
 #
@@ -202,7 +202,7 @@ run_one ccl8_llm 7200 "$(seq_dev 8)" "$XCCL" --workload /capped/ccl_ws8/ccl_ops.
 
 # 2. world_size scaling, bf16 only. The question here is how bus_bw moves as
 #    ranks are added, and one dtype answers it in a quarter of the cases -- the
-#    dtype dependence is already covered at world_size 4 in ../README.md.
+#    dtype dependence is already covered at world_size 4 in ../RESULTS.md.
 #
 #    ws4 is included even though run_full_sweep.sh has an xccl4: this one is the
 #    same 4 ranks on *this* instance, which is the control the ws8/16/32/64 rows
@@ -211,7 +211,7 @@ run_one ccl8_llm 7200 "$(seq_dev 8)" "$XCCL" --workload /capped/ccl_ws8/ccl_ops.
 #
 #    device2host/host2device are excluded on purpose: with 64 ranks they all
 #    share one host DMA path and measure that contention, not the link. Same
-#    reason the world_size 4 host-transfer rows in ../README.md are flagged as
+#    reason the world_size 4 host-transfer rows in ../RESULTS.md are flagged as
 #    not comparable to the world_size 2 ones.
 #
 #    broadcast is in the task list from ws4 up. It was registered in
@@ -283,7 +283,7 @@ run_one topo_hop1 10800 "$(stride_dev 4 "$CORES_PER_CHIP")" "$XCCL" \
 # 4. device2device, which is a copy and not a collective, so ComputeEngine and
 #    only two devices. Three variants, and the pair of them is the point:
 #      intra: cores 0,1 -- same chip, on-package, this is the 648 GB/s row in
-#             ../README.md;
+#             ../RESULTS.md;
 #      hop1:  cores 0,4 -- chip 0 to chip 1, adjacent on the torus;
 #      hop2:  cores 0,8 -- chip 0 to chip 2, two hops (0's neighbours are
 #             1,3,4,12; 2 is not among them).
@@ -303,7 +303,7 @@ run_one d2d_hop2  5400 "0,$((2 * CORES_PER_CHIP))" "$COMPUTE" \
 #    something off-chip (host, PCIe, power) caps it first.
 #    The conc1_* labels are the control, and they are not optional: the ratio has
 #    to be against one core of *this* instance, measured the same way. The
-#    single-core numbers in ../README.md are from a trn2.3xlarge, and dividing a
+#    single-core numbers in ../RESULTS.md are from a trn2.3xlarge, and dividing a
 #    64-core number here by a 3xlarge number there would fold every difference
 #    between the two instances into a figure reported as concurrency loss.
 run_one conc64_gemm 14400 "$(seq_dev 64)" "$COMPUTE" \

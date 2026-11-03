@@ -671,7 +671,7 @@ class BackendNEURON(Backend):
 
             time.sleep(0.2)
 
-            # No kernel-level profiler is available on Neuron (see README), so
+            # No kernel-level profiler is available on Neuron (see READING_THE_NUMBERS.md), so
             # core_perf never collects a kernel breakdown.
             latency_us, kernel_mapping = self.core_perf(
                 op_instance, 2, prefer_iters, tensor_list, profiling=False
@@ -691,7 +691,7 @@ class BackendNEURON(Backend):
         profiling=True
     ):
         # Neither runtime offers a kernel-level profiler, so profiling is
-        # ignored and the kernel breakdown is always empty (see README).
+        # ignored and the kernel breakdown is always empty (see READING_THE_NUMBERS.md).
         if self._runtime == RUNTIME_EAGER:
             return self._core_perf_eager(
                 op_instance, warmup_iterations, prefer_iterations, tensor_list

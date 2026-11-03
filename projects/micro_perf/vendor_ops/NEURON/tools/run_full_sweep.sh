@@ -1,7 +1,7 @@
 #!/bin/bash
 # Drive a full micro_perf sweep on the eager (PyTorch-native) Neuron stack.
 #
-# This produced the "Eager runtime, full sweep" numbers in ../README.md. Run it
+# This produced the "Eager runtime, full sweep" numbers in ../RESULTS.md. Run it
 # from projects/micro_perf on a trn2.3xlarge with the image from
 # Dockerfile.eager. Expect the better part of a day.
 #
@@ -64,7 +64,7 @@
 # Under ONLY the log and $RESULTS layout are unchanged, so analyze_sweep.py works
 # on a one-label log exactly as on a full one. Every label except xccl4, d2d and
 # the four chip4_* runs is on a single logical NeuronCore (`--device 0`); see
-# ../README.md, "Reproduce one row at a time".
+# ../REPRODUCE.md, "Reproduce one row at a time".
 set -u
 
 IMAGE=${IMAGE:-xpu-perf-eager:latest}

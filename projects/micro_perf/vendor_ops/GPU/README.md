@@ -113,7 +113,7 @@ Tensor Engine cannot multiply — `nc_matmul` takes legacy `e4m3` and `e5m2` on
 NeuronCore-v3, and OCP `e4m3fn` "starting NeuronCore-v4", i.e. Trn3. Compiled, in `e5m2`,
 one logical core does **245.50 TFLOPS at 75.6%
 of its fp8 peak** at 4096³, which puts the per-chip gap at **1.56x** against a 1.52x
-nominal bar — [details](../NEURON/README.md#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply).
+nominal bar — [details](../NEURON/READING_THE_NUMBERS.md#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply).
 A 12-shape sweep through the new `torch_compile` provider peaks higher still, 281.97
 TFLOPS = **86.8%** of that core's fp8 peak at 16384x4096x4096; the 1.56x stays
 sourced to 4096³ because that is the shape whose x4 to a per-chip figure was
@@ -126,7 +126,7 @@ exactly what the two orders of magnitude are: the op def hands the device an
 **int64** index, the device has no int64, and converting it materialises a
 stride-0 broadcast that the fast lowering needs to see intact. The same call with
 an int32 index is 291-731x faster and lands within 8% of `index_select` —
-[details](../NEURON/README.md#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity).
+[details](../NEURON/READING_THE_NUMBERS.md#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity).
 
 Several results cut against the pattern and are worth knowing. Trainium2 uses
 *more* of its own bandwidth than an H100 does on the head/QK norms and `swiglu`, it
@@ -145,7 +145,7 @@ in `rotate()` doing five-plus materialising elementwise passes where a fused ker
 would do one. Per chip that is 197.4 against 171.2, **1.15x**, exactly the
 memory-bound bar. This row was previously blamed on Neuron's slow bf16 `sin`/`cos`;
 that was wrong, since `cos` and `sin` are precomputed outside the timed region —
-see [the NEURON README](../NEURON/README.md#rotary_embedding-is-not-a-neuron-result-at-all)
+see [the NEURON README](../NEURON/RESULTS.md#rotary_embedding-is-not-a-neuron-result-at-all)
 for the decomposition.
 
 The decode row is the one that moved most, and it moved because of a provider
@@ -200,14 +200,14 @@ possible reason — the op had never once been called.
 
 | Workload | Ops | What Trainium2 got | Blocker | TODO |
 |---|---|---|---|---|
-| `xccl_ops/{all_reduce,all_gather,reduce_scatter,all_to_all}.json` | 4 collectives | measured on Neuron from ws=4 to ws=64 — on a trn2.48xlarge at ws=64, `all_gather` 166.4, `all_reduce` 146.5, `reduce_scatter` 142.6, `all_to_all` 15.7 GB/s `bus_bw` ([table](../NEURON/README.md#world_size-scaling-8-to-64)) | **hardware** — `world_size` is 1 on one GPU | needs a p5.48xlarge (8x H100, NVLink). **The highest-value item in this list**, and now the only one-sided one left: the Neuron side is measured across 16 chips, so NVLink vs NeuronLink is a missing GPU column rather than a missing measurement. Compare against Neuron's ws=8 (`all_gather` 81.6, `all_reduce` 79.3 GB/s) — same rank count, and 8x H100 is what a p5.48xlarge is |
-| `single_test_ops/ccl_ops.json` | same 4 | **now runs on Neuron** at `world_size: 8` on a trn2.48xlarge: bf16 `all_gather` 81.6, `all_reduce` 79.3, `reduce_scatter` 68.3, `all_to_all` 28.5 GB/s ([table](../NEURON/README.md#ccl_opsjson-now-runs)). Still **0 cases** on a trn2.3xlarge, which has 4 logical cores | **hardware**, GPU side only | needs 8 GPUs. The int8 cases in this file are also the ones that exposed [int8 collectives being ~200x off](../NEURON/README.md#ccl_opsjson-now-runs) on the Neuron stack, so a GPU column here would say whether that is the op def or the Neuron runtime |
-| `xccl_ops/device2device.json` | `device2device` | 648.7 GB/s (bf16) | **none, and the row was mislabelled** — [the op copies within one device](../NEURON/README.md#device2device-is-not-a-device-to-device-transfer), so it never needed two. Measured on a trn2.48xlarge at 0, 1 and 2 NeuronLink hops it gives 642.3 / 642.5 / 642.9 GB/s, i.e. the hop count is not in the measurement | run it on the H100 as a local-copy number, which is what it is. A real peer-to-peer copy is **not** in this repo on any backend, so NVLink-vs-NeuronLink point-to-point stays uncovered by the row above, not by this one |
-| `xccl_ops/broadcast.json` | `broadcast` | **new file, and the first run of this op anywhere.** On Neuron at ws=8, bf16: 40.539 GB/s at 512 MiB, 1.886 GB/s at 2 MiB ([table](../NEURON/README.md#three-collectives-that-had-never-run)) | **hardware**, GPU side only — `world_size` 1 on one GPU | needs ≥2 GPUs. Worth a column of its own rather than folding into the collective row above: `broadcast` is the only op here whose `bus_size` equals its `algo_size`, so it is where the runtime's algorithm choice (ring = (n-1) hops of the whole payload, tree = log n) is visible in the number. Also the collective serving actually uses at tiny sizes — sampled token ids to the other TP ranks |
+| `xccl_ops/{all_reduce,all_gather,reduce_scatter,all_to_all}.json` | 4 collectives | measured on Neuron from ws=4 to ws=64 — on a trn2.48xlarge at ws=64, `all_gather` 166.4, `all_reduce` 146.5, `reduce_scatter` 142.6, `all_to_all` 15.7 GB/s `bus_bw` ([table](../NEURON/RESULTS.md#world_size-scaling-8-to-64)) | **hardware** — `world_size` is 1 on one GPU | needs a p5.48xlarge (8x H100, NVLink). **The highest-value item in this list**, and now the only one-sided one left: the Neuron side is measured across 16 chips, so NVLink vs NeuronLink is a missing GPU column rather than a missing measurement. Compare against Neuron's ws=8 (`all_gather` 81.6, `all_reduce` 79.3 GB/s) — same rank count, and 8x H100 is what a p5.48xlarge is |
+| `single_test_ops/ccl_ops.json` | same 4 | **now runs on Neuron** at `world_size: 8` on a trn2.48xlarge: bf16 `all_gather` 81.6, `all_reduce` 79.3, `reduce_scatter` 68.3, `all_to_all` 28.5 GB/s ([table](../NEURON/RESULTS.md#ccl_opsjson-now-runs)). Still **0 cases** on a trn2.3xlarge, which has 4 logical cores | **hardware**, GPU side only | needs 8 GPUs. The int8 cases in this file are also the ones that exposed [int8 collectives being ~200x off](../NEURON/RESULTS.md#ccl_opsjson-now-runs) on the Neuron stack, so a GPU column here would say whether that is the op def or the Neuron runtime |
+| `xccl_ops/device2device.json` | `device2device` | 648.7 GB/s (bf16) | **none, and the row was mislabelled** — [the op copies within one device](../NEURON/RESULTS.md#device2device-is-not-a-device-to-device-transfer), so it never needed two. Measured on a trn2.48xlarge at 0, 1 and 2 NeuronLink hops it gives 642.3 / 642.5 / 642.9 GB/s, i.e. the hop count is not in the measurement | run it on the H100 as a local-copy number, which is what it is. A real peer-to-peer copy is **not** in this repo on any backend, so NVLink-vs-NeuronLink point-to-point stays uncovered by the row above, not by this one |
+| `xccl_ops/broadcast.json` | `broadcast` | **new file, and the first run of this op anywhere.** On Neuron at ws=8, bf16: 40.539 GB/s at 512 MiB, 1.886 GB/s at 2 MiB ([table](../NEURON/RESULTS.md#three-collectives-that-had-never-run)) | **hardware**, GPU side only — `world_size` 1 on one GPU | needs ≥2 GPUs. Worth a column of its own rather than folding into the collective row above: `broadcast` is the only op here whose `bus_size` equals its `algo_size`, so it is where the runtime's algorithm choice (ring = (n-1) hops of the whole payload, tree = log n) is visible in the number. Also the collective serving actually uses at tiny sizes — sampled token ids to the other TP ranks |
 | `xccl_ops/p2p.json` | `p2p` | **new file, and it does not run on Neuron at all**: `RuntimeError: Backend neuron does not support send` / `... does not support recv`, at every size, with both ranks on one chip | **Neuron backend** — a missing `torch.distributed` feature, not a hardware or placement limit. GPU side is the usual ≥2 GPUs | **the highest-value row after the collectives**, because it is the only op in the repo that measures a real one-way transfer over one link. NCCL has `isend`/`irecv`, so on a p5.48xlarge this file gives a genuine NVLink point-to-point number — against which Trainium currently has *no* answer through `torch.distributed`. That also makes it the row that finally covers what `device2device.json` was assumed to cover |
 | `xccl_ops/all_reduce_h2d.json` | `all_reduce_h2d` | **new file.** Runs on Neuron at ws=8; the largest bf16 case gives 167727.201 us, `algo_bw` 6.404 GB/s | **hardware**, GPU side only | needs ≥2 GPUs. This op measures *overlap* — an `async_op=True` all_reduce with a host-to-device copy issued into it — which is the most load-bearing overlap in TP inference and had no number on either backend. Read the Neuron caveats before quoting it: the all_reduce goes to the default group, `async_op` is never waited, and the right control (`host2device` at the same rank count) is the row below, which does not run here either |
 | `xccl_ops/{device2host,host2device}.json` | 2 | 14.3 / 14.0 GB/s at ws=2, and the ws=4 column is not comparable (1 GiB cap, four ranks sharing one host DMA path) | **harness**, not hardware — both ops are registered on `XCCLEngine` (`op_defs/basic_ops/xccl_ops.py:569,627`), and `perf_engine.py:173` skips that engine outright when `len(device_ids) * node_world_size <= 1`. So although both files do list a `world_size: 1` case, a one-GPU launch dispatches to an engine that was never started and writes `note: engine_not_started` for every case (`perf_engine.py:352-364`) — exit 0, nothing measured. `XPU_PERF_ENGINES=XCCLEngine` does not help: the env filter is applied *before* that guard, not instead of it | needs any box with ≥2 GPUs — unlike the collectives it does not need NVLink or all eight. An earlier version of this row claimed these ran here as-is, on the strength of the `world_size: 1` entry in the JSON alone; they do not. Still worth having, as the one number in the comparison governed by neither chip's HBM but by a host link, so 14.3 GB/s currently has nothing to be read against |
-| `single_test_ops/gemm_ops.json` | `moe_gating_gemm`, `quant_matmul`, `moe_quant_group_gemm` | `moe_gating_gemm` 21.89 TF / **48% MFU**; `quant_matmul` 15.78 "TOPS"; `moe_quant_group_gemm` **2.67-2.84 s at every shape** | **none** | run it. `moe_gating_gemm` is the interesting one — the only genuine compute-bound row outside plain `gemm`, at 48% of the fp32 peak against `gemm`'s 82% at the same dtype, with no GPU control to say which of those two numbers is the anomaly. The other two route through `fake_quant_gemm` and are [a bf16 simulation on every backend](../NEURON/README.md#the-quantized-ops-are-a-bf16-simulation-on-every-backend), so a GPU column there measures the same shared helper the `_dynamic_quant` rows already exposed |
+| `single_test_ops/gemm_ops.json` | `moe_gating_gemm`, `quant_matmul`, `moe_quant_group_gemm` | `moe_gating_gemm` 21.89 TF / **48% MFU**; `quant_matmul` 15.78 "TOPS"; `moe_quant_group_gemm` **2.67-2.84 s at every shape** | **none** | run it. `moe_gating_gemm` is the interesting one — the only genuine compute-bound row outside plain `gemm`, at 48% of the fp32 peak against `gemm`'s 82% at the same dtype, with no GPU control to say which of those two numbers is the anomaly. The other two route through `fake_quant_gemm` and are [a bf16 simulation on every backend](../NEURON/READING_THE_NUMBERS.md#the-quantized-ops-are-a-bf16-simulation-on-every-backend), so a GPU column there measures the same shared helper the `_dynamic_quant` rows already exposed |
 | `single_test_ops/moe_dispatch_ops.json` | `moe_scatter_dynamic_quant` | 0.7 GB/s | **none** | run it. At 0.7 GB/s it is in `gather`/`scatter` territory, and the GPU column is what would say whether that is the op def or the lowering — exactly the question the H100 settled for `gather` |
 | `single_test_ops/moe_combine_ops.json` | `moe_gather`, `moe_quant_group_gemm_combine` | `moe_gather` 9.2 GB/s | **none** | run it, same reason — `moe_gather` at 9.2 GB/s is 68x off `index_select` on the same chip |
 | `single_test_ops/fa_ops.json` | paged `flash_attention` | **0 cases** — every case sets `block_size: 512`, and the `torch` SDPA provider rejects a paged cache | **both backends, and it is a missing provider rather than a missing install** | see below. Installing `flash_attn` does *not* fill this row: `fa2`/`fa3` reject all 11 cases too |
@@ -339,7 +339,7 @@ actually took on an idle p5.4xlarge, not the watchdog budgets in the script:
 | `basic_vector_norm_ops` | `basic/vector_norm_ops` (all) | 51 s | " |
 | `basic_vector_reduction_ops` | `basic/vector_reduction_ops` (all) | 84 s | " |
 | `basic_vector_sfu_ops` | `basic/vector_sfu_ops` (all) | 289 s | " |
-| `basic_vector_index_ops` | `basic/vector_index_ops` (all) | 62 s | `gather`/`scatter`, the [two ops Neuron is 100x off on](../NEURON/README.md#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity) |
+| `basic_vector_index_ops` | `basic/vector_index_ops` (all) | 62 s | `gather`/`scatter`, the [two ops Neuron is 100x off on](../NEURON/READING_THE_NUMBERS.md#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity) |
 | `single_norm_ops` | `llm/single_test_ops/norm_ops.json` | 84 s | [norm/activation/MoE](#norm-activation-and-moe-ops) |
 | `single_activation_ops` | `llm/single_test_ops/activation_ops.json` | 52 s | " |
 | `single_moe_gating_ops` | `llm/single_test_ops/moe_gating_ops.json` | **1,191 s** | " — the longest run here, and 9.7x the same file on one NeuronCore (123 s) |
@@ -365,7 +365,7 @@ at the median. Do not read any elapsed time in this table as a performance
 figure.
 
 The Trainium2 side is most of a day; see
-[NEURON/README.md, Reproduce one row at a time](../NEURON/README.md#reproduce-one-row-at-a-time)
+[NEURON/README.md, Reproduce one row at a time](../NEURON/REPRODUCE.md#reproduce-one-row-at-a-time)
 for its label list, and note that two labels are named differently there — `gemm`
 is `basic_tensor_gemm_ops`, and `basic_vector_index_ops` is split into
 `basic_index_ok` and `basic_index_slow` because `gather`/`scatter` have to be run
@@ -462,7 +462,7 @@ and essentially all of the difference is a per-shape warm-up on the eager Neuron
 runtime that sits outside the timed loop (~2.9 s the first time a shape is seen,
 ~2.6 ms every later time in the same process). The full breakdown and the evidence
 that it is not `neuronx-cc` are in
-[`../NEURON/README.md`](../NEURON/README.md#sweep-wall-clock-is-not-a-performance-comparison).
+[`../NEURON/README.md`](../NEURON/READING_THE_NUMBERS.md#sweep-wall-clock-is-not-a-performance-comparison).
 
 The GPU half of that measurement is worth knowing on its own, because it explains
 what the 403 s is made of and none of it is the H100:
@@ -615,7 +615,7 @@ Four conclusions, in order of how much they matter:
   lowers to is `nkilib`'s `attention_cte`, by object identity in
   `decompositions.py`, and calling `attention_cte` by hand with the launch
   arguments torch_neuronx uses reproduces the same latency to 0.97x
-  ([details](../NEURON/README.md#attention)). So the 3.1x is `attention_cte`
+  ([details](../NEURON/RESULTS.md#attention)). So the 3.1x is `attention_cte`
   against cuDNN/FlashAttention at the same shape, with no better kernel sitting
   unused on the Neuron side.
 - **Decode on Trainium was not bandwidth-limited, which is why it was fixable — and
@@ -633,7 +633,7 @@ Four conclusions, in order of how much they matter:
   both backends in the table degrade with cache length, which read as a per-call
   fixed cost being amortised; `attention_tkg` improves with cache length instead, so
   on Trainium that degradation was the SDPA path rather than the chip.
-  [Details and the full table](../NEURON/README.md#decode-the-nkilib-provider-attention_tkg).
+  [Details and the full table](../NEURON/RESULTS.md#decode-the-nkilib-provider-attention_tkg).
   The H100 has since run the same aligned workload, so the ratio is no longer an
   extrapolation: **1.9-3.2x per chip** on a 1.16x nominal bandwidth bar, tabulated
   case by case [just below](#cross-chip-decode-on-the-aligned-workload). The 1.6-2.7x
@@ -697,7 +697,7 @@ coverage has no GPU counterpart and no ratio. And the per-chip column is `x4` on
 single logical core; that multiplication is
 [measured for memory-bound work](#how-to-compare-these-to-the-trainium2-numbers) at
 1.00-1.02x, but not for this op specifically. The Trainium-side provider analysis is
-in [the NEURON README](../NEURON/README.md#decode-the-nkilib-provider-attention_tkg).
+in [the NEURON README](../NEURON/RESULTS.md#decode-the-nkilib-provider-attention_tkg).
 
 ## gemm
 
@@ -773,7 +773,7 @@ own bf16 on a nominal 1.95x bar, 115.7x the eager number at the same shape. Unli
 eager fp8, that path scales across cores cleanly (1.018x worst case over four
 concurrent runs), so **982 TFLOPS per chip and a real gap of 1.56x** where the
 nominal fp8 peak ratio is 1.52x
-([details](../NEURON/README.md#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply)).
+([details](../NEURON/READING_THE_NUMBERS.md#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply)).
 
 Two things follow. The ~99x row stays in the table because it is what
 `gemm.json` measures today and it is reproducible — closing it needs an fp8
@@ -891,7 +891,7 @@ suggest:
   the proximate cause. `scatter` is not fixable that way — `aten::scatter_.src` has
   no NKI implementation at all, so its 621x is real. The op def is deliberately
   *not* changed, since `torch.gather` requires int64 on CPU and CUDA; see
-  [the NEURON README](../NEURON/README.md#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity)
+  [the NEURON README](../NEURON/READING_THE_NUMBERS.md#two-index-ops-are-pathologically-slow-and-one-is-an-int64-index-away-from-parity)
   for the measured table and for the separate registration bug that keeps the NKI
   gather kernel unreachable even when the index is right.
 - **How much that 510x/715x costs an LLM is a different question from how big it
@@ -938,7 +938,7 @@ suggest:
   These are the only `pre_fa_ops.json` numbers in this comparison; the file's other
   op, `store_kv_cache`, does not run on **either** backend (two base-op-def
   blockers, [listed in the NEURON
-  README](../NEURON/README.md#known-unsupported)).
+  README](../NEURON/READING_THE_NUMBERS.md#known-unsupported)).
 - **Selection and sorting are where the H100 is the weak side**, and it is two ops
   rather than one, which is what makes it a pattern instead of an oddity:
 
@@ -1066,7 +1066,7 @@ What is missing for reasons that are *not* about workload coverage:
 - **Multi-chip on the GPU side.** One H100 against one Trainium2 chip is still the
   widest *comparison* here, but the asymmetry has moved: Trainium2 is now measured
   across 16 chips and 64 logical cores on a trn2.48xlarge
-  ([section](../NEURON/README.md#multi-chip-trn248xlarge)) — collectives at
+  ([section](../NEURON/RESULTS.md#multi-chip-trn248xlarge)) — collectives at
   `world_size` 4 to 64, the cost of one NeuronLink hop at fixed rank count, and
   64-core concurrency. There is no p5.48xlarge column for any of it, so nothing
   here compares NVLink to NeuronLink. That is one box away, not a repo gap: the
