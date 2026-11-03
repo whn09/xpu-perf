@@ -74,6 +74,23 @@ RESULTS=${RESULTS:-/tmp/sweep_results}
 WS4=${WS4:-/tmp/xccl_ws4}                 # capped copies of workloads/xccl_ops
 DOCKER=${DOCKER:-sudo docker}
 WAIT_BUDGET_S=${WAIT_BUDGET_S:-1800}
+# RUNNER=docker (default; the beta image) or RUNNER=venv: run launch.py directly
+# in the active Python environment, e.g. the DLAMI's
+# /opt/aws_neuronx_venv_torch_neuronx_2_14_0. In venv mode the watchdog kills the
+# launch's whole process group, which is the venv analogue of `docker kill`:
+# launch.py's worker children otherwise outlive it and keep their cores.
+RUNNER=${RUNNER:-docker}
+PYTHON=${PYTHON:-python}
+# Lanes on a multi-chip instance (trn2.48xlarge): DEVICE_BASE shifts every
+# label's device list (0 -> DEVICE_BASE, 0,1,2,3 -> DEVICE_BASE..+3), NO_WAIT=1
+# skips the machine-wide idle check (which would make concurrent lanes wait on
+# each other), and LAUNCH_EXTRA is appended to every launch -- pass
+# "--numa <node of that chip>" so workers are pinned to the right socket; the
+# launcher's default split is wrong on this instance (RESULTS.md, "NUMA pinning").
+DEVICE_BASE=${DEVICE_BASE:-0}
+NO_WAIT=${NO_WAIT:-}
+LAUNCH_EXTRA=${LAUNCH_EXTRA:-}
+if [ "$RUNNER" = venv ]; then XW=$WS4; RES_IN=$RESULTS; else XW=/xccl_ws4; RES_IN=/results; fi
 TOOLS=$(cd "$(dirname "$0")" && pwd)
 ONLY=${ONLY:-}
 LIST=${LIST:-}
@@ -148,6 +165,7 @@ count_busy_containers() {
 # Raise WAIT_BUDGET_S when someone else's job is already on the chip: the
 # default 30 min is enough to outlast a stuck teardown, not a neighbour's sweep.
 wait_for_free() {
+    [ -n "$NO_WAIT" ] && return 0
     local waited=0 holders others
     while true; do
         holders=$(count_holders)
@@ -172,6 +190,9 @@ run_one() {
     local tmo="$1"; shift
     local dev="$1"; shift
     local env_prefix="$1"; shift
+    local d mapped=""
+    for d in ${dev//,/ }; do mapped="${mapped:+$mapped,}$((d + DEVICE_BASE))"; done
+    dev=$mapped
     if [ -n "$LIST" ]; then
         printf '%-26s dev=%-8s budget=%-7s %s\n' \
             "$label" "$dev" "${tmo}s" "$*"
@@ -186,6 +207,24 @@ run_one() {
     echo "########## RUN $label   tmo=${tmo}s   dev=$dev   $(date -Is)"
     wait_for_free || { echo "########## RUN $label SKIPPED (busy)"; return 1; }
 
+    if [ "$RUNNER" = venv ]; then
+        echo "load_avg $(cut -d' ' -f1-3 /proc/loadavg) runner=venv extra=$LAUNCH_EXTRA"
+        setsid env $env_prefix PYTHONPATH="$REPO/src" "$PYTHON" launch.py \
+            --backend NEURON --device "$dev" --report_dir "$RESULTS/$label" \
+            $LAUNCH_EXTRA "$@" > >(grep -vE "$NOISE") 2>&1 &
+        runpid=$!   # setsid execs into the launch: its pid is the process group
+        ( sleep "$tmo"; kill -TERM -- "-$runpid" 2>/dev/null \
+            && echo "########## RUN $label KILLED by watchdog after ${tmo}s"; \
+          sleep 30; kill -KILL -- "-$runpid" 2>/dev/null ) &
+        wdpid=$!
+        wait "$runpid"; rc=$?
+        kill "$wdpid" 2>/dev/null
+        wait "$wdpid" 2>/dev/null
+        kill -KILL -- "-$runpid" 2>/dev/null   # stragglers holding cores
+        echo "########## RUN $label exit=$rc elapsed=$(( $(date +%s) - start ))s $(date -Is)"
+        return 0
+    fi
+
     $DOCKER rm -f "$cname" >/dev/null 2>&1
 
     $DOCKER run --rm --name "$cname" --privileged \
@@ -193,7 +232,7 @@ run_one() {
         -w /xpu-perf/projects/micro_perf \
         -e PYTHONPATH=/xpu-perf/src "$IMAGE" \
         env $env_prefix python launch.py --backend NEURON --device "$dev" \
-        --report_dir "/results/$label" "$@" \
+        --report_dir "$RES_IN/$label" $LAUNCH_EXTRA "$@" \
         > >(grep -vE "$NOISE") 2>&1 &
     runpid=$!   # docker itself; note there is no pipeline here, see reason 1
 
@@ -258,6 +297,10 @@ run_one single_fa_decode_tkg 5400 0 - \
 
 # 3. Basic ops, one directory per launch.
 #
+#    Since SDK 2.33 the `torch` provider rejects the eager fp8 cases (they returned
+#    wrong products) and runs the tfloat32 ones through a per-case compiled graph
+#    (2-14 s of compile each), so the history below describes the beta-image run.
+#
 #    tensor_gemm_ops is not in this loop either, for the same reason as
 #    fa_linear_ops: gemm.json enumerates 856 cases and the 24 **fp8** ones are
 #    *last*, at 20-570 s each against ~1 ms for a bf16 case. At the 5400 s the
@@ -276,6 +319,11 @@ run_one single_fa_decode_tkg 5400 0 - \
 #    here as the chip's fp8 ceiling.
 run_one basic_tensor_gemm_ops 28800 0 - \
     --task_dir "$W/basic/tensor_gemm_ops" --task all
+
+# 3b. fp8 gemm on the path that reaches the tensor engines: the torch_compile
+#     provider (opt-in) over the shapes that pair with its required dst_dtype.
+run_one gemm_fp8_compiled 7200 0 "XPU_PERF_NEURON_GEMM_COMPILE=1" \
+    --workload vendor_ops/NEURON/workloads/gemm_fp8_compiled.json
 
 for d in vector_linear_ops vector_activation_ops vector_sfu_ops \
          vector_norm_ops vector_reduction_ops; do
@@ -296,12 +344,12 @@ run_one basic_index_slow 3600 0 - --task_dir $W/basic/vector_index_ops \
 #    the warmup all_reduce; the upstream default of 60 s does not.
 run_one xccl4 10800 0,1,2,3 \
     "XPU_PERF_ENGINES=XCCLEngine XPU_PERF_XCCL_READY_TIMEOUT_S=2400" \
-    --task_dir /xccl_ws4 \
+    --task_dir "$XW" \
     --task all_gather,all_reduce,reduce_scatter,all_to_all,device2host,host2device
 
 # 6. device2device separately, under ComputeEngine. See reason 4.
 run_one d2d 5400 0,1 "XPU_PERF_ENGINES=ComputeEngine" \
-    --workload /xccl_ws4/device2device.json
+    --workload "$XW/device2device.json"
 
 # 7. The whole chip: the same compute-bound and memory-bound cases with all four
 #    logical cores working at once.
