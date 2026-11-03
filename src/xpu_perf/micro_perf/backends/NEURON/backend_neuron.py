@@ -94,6 +94,22 @@ NEURON_CHIP_PEAK_TFLOPS = {
         "float8": 1299.0, "float8_e4m3": 1299.0, "float8_e5m2": 1299.0,
         "mxfloat8": 1299.0, "mxfloat8_e4m3": 1299.0, "mxfloat8_e5m2": 1299.0,
     },
+    # Trainium3 (8x NeuronCore-v4): "2,517 MXFP8/MXFP4 TFLOPS, 671 BF16/FP16/TF32
+    # TFLOPS, 183 FP32 TFLOPS" (about-neuron/arch/neuron-hardware/trainium3.html,
+    # Neuron 2.33 docs; its Trn2-vs-Trn3 table lists FP8 as 1299 -> 2517). The MX
+    # rate is reached only through nisa.nc_matmul_mx; a plain fp8 matmul is scored
+    # against the same figure because that is what AWS publishes for "FP8", which
+    # makes a low fp8 MFU on Trn3 a statement about the path, not the chip. The
+    # mxfp* keys are the compute_dtype strings quant_matmul.md defines.
+    "trn3": {
+        "float32": 183.0,
+        "tfloat32": 671.0,
+        "float16": 671.0, "half": 671.0,
+        "bfloat16": 671.0,
+        "float8": 2517.0, "float8_e4m3": 2517.0, "float8_e5m2": 2517.0,
+        "mxfloat8": 2517.0, "mxfloat8_e4m3": 2517.0, "mxfloat8_e5m2": 2517.0,
+        "mxfp8_e4m3fn": 2517.0, "mxfp8_e5m2": 2517.0, "mxfp4_e2m1fn": 2517.0,
+    },
 }
 
 
@@ -196,9 +212,14 @@ class BackendNEURON(Backend):
         pass
 
     def _chip_family(self):
-        """trn1 / trn2 from the instance type, or None for anything else."""
+        """trn1 / trn2 / trn3 from the instance type, or None for anything else.
+
+        None means no "mfu" field, silently -- which is what a Trn3 run got before
+        "trn3" was listed here. Note `trn2u.48xlarge` (Trn2 UltraServer) maps to
+        trn2 by prefix, as it should.
+        """
         instance_type = self.backend_info.get("device_name", "")
-        for family in ("trn2", "trn1"):
+        for family in ("trn3", "trn2", "trn1"):
             if instance_type.startswith(family):
                 return family
         return None

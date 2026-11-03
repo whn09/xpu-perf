@@ -99,7 +99,14 @@ class NeuronCompiledGemmOp:
                 "measured by the `torch` provider"
             )
 
-        if self.dtype not in COMPILABLE_FP8:
+        # Trn3 (NeuronCore-v4) multiplies OCP float8_e4m3fn natively, so the
+        # e4m3 strings are accepted there. Not yet run on a Trn3: on Trn2 this
+        # branch is unreachable, and the first Trn3 run should be checked with
+        # tools/verify_providers.py before its numbers are used.
+        compilable = COMPILABLE_FP8
+        if self.backend._chip_family() == "trn3":
+            compilable = COMPILABLE_FP8 | {"float8", "float8_e4m3"}
+        if self.dtype not in compilable:
             raise NotImplementedError(
                 f"dtype {self.dtype} maps to torch.float8_e4m3fn (OCP), which "
                 "nc_matmul supports only from NeuronCore-v4 (Trn3); neuronx-cc "

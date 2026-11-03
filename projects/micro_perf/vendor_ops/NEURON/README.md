@@ -141,6 +141,49 @@ instead.
 
 ## Reference numbers
 
+### Re-validated on Neuron SDK 2.33 (official DLAMI)
+
+The tables below were measured on the beta image. On 2026-11-03 every provider was
+re-checked for *numerical correctness* — not just that it runs — on a trn2.48xlarge
+from the official Neuron 2.33 multi-framework DLAMI (`aws_neuronx_venv_torch_neuronx_2_14_0`:
+torch 2.14.0, torch-neuronx 2.14.3, neuronx-cc 2.28.7631, nki 0.7.0, runtime-lib
+2.35.30, collectives 2.35.43, driver 2.31.7 — exactly the SDK 2.33 release content),
+with `tools/verify_providers.py`. It builds each provider through the real backend,
+compares the device output to an fp32 host reference on the same inputs, and passes
+a case only if its error is within 3x of the same computation done on the host in
+the case's own dtype. 25 cases across `gemm`, `rms_norm`, `topk` and all three
+`flash_attention` providers; collectives were smoke-run (`all_reduce`, `all_gather`,
+4 ranks), not numerically checked.
+
+What changed:
+
+- **eager fp8 `gemm` returned wrong products** — rel err 0.65 (e5m2) / 0.68
+  (e4m3fn) against an fp32 matmul of the same fp8 values, where rounding the exact
+  product to fp8 costs 0.03-0.05. Inputs round-trip bit-exactly and an on-device cast
+  to bf16 before the matmul is correct, so it is the eager fp8 matmul itself. The
+  `torch` provider now rejects fp8; **discard earlier eager-fp8 rows** (the beta was
+  only ever timed, so whether it was already wrong there is unknown). The compiled
+  path (`torch_compile`, `XPU_PERF_NEURON_GEMM_COMPILE=1`) is correct: rel 1.7e-3.
+- **`tfloat32` `gemm` is now measured.** It was rejected as "an NVIDIA format", but
+  TF32 is a Tensor Engine datatype on Trn2/Trn3 at the bf16 rate. It is reached with
+  neuronx-cc's `--auto-cast=matmult --auto-cast-type=tf32` (not with
+  `torch.set_float32_matmul_precision`, which does nothing here): 106.8 TFLOPS at
+  4096³ against 35.4 for fp32, 131.6 TFLOPS (79% of peak) at 32768x1024x8192, rel err
+  1.5e-4. The flag is scoped to one `torch.compile` graph per case, because the eager
+  graph cache is keyed by shape and dtype but not by compiler flags — exporting it
+  would silently make the fp32 cases of the same shapes TF32 too (measured).
+- **`rms_norm`/`nkilib` no longer runs token counts that do not split across the
+  LNC programs** (`num_tokens: 1`): neuronx-cc 2.28 rejects a 1-program grid at
+  LNC=2 with `NCC_EVRF066`. The `torch` provider covers those rows.
+- Everything else matches to rounding (bf16 rel 1.66e-3 = the host bf16 floor;
+  topk values and indices exact; attention within the host floor).
+
+Trainium3 (`trn3.48xlarge`) is now in the MFU peak table (671 bf16/tf32, 183 fp32,
+2517 fp8/MX TFLOPS per chip). **Nothing in this repo has run on Trn3 yet** — run
+`tools/verify_providers.py` there before trusting the first sweep.
+
+### Beta-image measurements
+
 All on trn2.3xlarge, one logical NeuronCore (a trn2 chip is 4 logical cores at
 the default LNC=2). Read them with [Reading the numbers](#reading-the-numbers) —
 several are runtime overhead rather than hardware results, and a few of the
@@ -1336,6 +1379,11 @@ The practical consequences:
 
 ### fp8: the sweep measures the eager path, in a dtype this chip cannot multiply
 
+> **Superseded on SDK 2.33:** the eager fp8 path below returns numerically wrong
+> results (rel err ~0.65) and the `torch` provider now rejects fp8. The analysis of
+> *why* eager cannot reach the fp8 datapath still stands; the eager latencies do not.
+> See [Re-validated on Neuron SDK 2.33](#re-validated-on-neuron-sdk-233-official-dlami).
+
 `workloads/basic/tensor_gemm_ops/gemm.json` has `float8_e4m3` and `float8_e5m2`
 cases, and this backend's `gemm` accepts them (the base `GemmOp` gates `dtype` to
 the four float formats, so no other backend reports them). They run:
@@ -1843,7 +1891,7 @@ implementation through the `base` provider:
 
 | Op | Provider | Runtime | Why |
 |---|---|---|---|
-| `gemm` | `torch` | both | rejects `tfloat32` (an NVIDIA format) and `int8` (not lowered through `torch.matmul`); accepts `float8_e4m3` / `float8_e5m2`, which the base op def gates out — see [fp8 is measured on the eager path, in a dtype this chip cannot multiply](#fp8-the-sweep-measures-the-eager-path-in-a-dtype-this-chip-cannot-multiply) |
+| `gemm` | `torch` | both | rejects `int8` (not lowered through `torch.matmul`) and, since SDK 2.33, fp8 (eager fp8 matmul is numerically wrong — use `torch_compile`); runs `tfloat32` through a per-case `torch.compile` graph with neuronx-cc TF32 auto-cast (eager runtime only) — see [Re-validated on Neuron SDK 2.33](#re-validated-on-neuron-sdk-233-official-dlami) |
 | `all_gather` | `torch` | both | base uses `dist.all_gather_into_tensor`, unimplemented on the `xla` backend; the `neuron` backend implements it, so eager reproduces the base behaviour |
 | `flash_attention` | `nki` / `torch` | `xla` / `eager` | no base implementation exists; NKI `flash_fwd` on XLA, `scaled_dot_product_attention` on eager |
 

@@ -280,6 +280,20 @@ try:
                 )
 
             self.grid = _pick_grid(self.batch_size)
+            if self.grid != LNC:
+                # neuronx-cc 2.28 (Neuron SDK 2.33) refuses a grid that differs
+                # from the LNC the framework compiles at: `[NCC_EVRF066] NKI kernel
+                # 'rms_norm_kernel' is configured with LNC=1, but neuronx-cc is
+                # using LNC=2`. The beta compiler accepted it, which is where the
+                # published 1-token rows came from. This is every token count that
+                # does not split into LNC equal tiles -- `num_tokens: 1` in all the
+                # norm workloads -- and the `torch` provider covers them.
+                raise ValueError(
+                    f"num_tokens {self.batch_size} does not split evenly across "
+                    f"the {LNC} programs of LNC={LNC}, and neuronx-cc rejects a "
+                    "1-program grid at LNC>1 (NCC_EVRF066); measured by the "
+                    "`torch` provider instead."
+                )
             if not _splits_evenly(self.batch_size, self.grid):
                 raise ValueError(
                     f"num_tokens {self.batch_size} does not split into equal "
