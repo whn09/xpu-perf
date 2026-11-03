@@ -59,6 +59,15 @@ RESULTS=${RESULTS:-/tmp/multicard_results}
 CAPPED=${CAPPED:-/tmp/xccl_capped}        # capped workload copies, per world_size
 DOCKER=${DOCKER:-sudo docker}
 WAIT_BUDGET_S=${WAIT_BUDGET_S:-1800}
+# RUNNER=venv: run launch.py in the active Python environment (e.g. the DLAMI's
+# aws_neuronx_venv_torch_neuronx_2_14_0) instead of the docker image -- same
+# watchdog semantics, applied to the launch's process group. The labels below
+# name container paths (/capped/...), which venv mode maps to $CAPPED. NO_WAIT=1
+# skips the machine-wide idle check. This is also how to run the sweep on a
+# trn3.48xlarge, which has the same 64 logical cores at LNC=2.
+RUNNER=${RUNNER:-docker}
+PYTHON=${PYTHON:-python}
+NO_WAIT=${NO_WAIT:-}
 TOOLS=$(cd "$(dirname "$0")" && pwd)
 ONLY=${ONLY:-}
 LIST=${LIST:-}
@@ -154,7 +163,29 @@ run_one() {
     start=$(date +%s)
     echo ""
     echo "########## RUN $label   tmo=${tmo}s   dev=$dev   $(date -Is)"
-    wait_for_free || { echo "########## RUN $label SKIPPED (busy)"; return 1; }
+    if [ -z "$NO_WAIT" ]; then
+        wait_for_free || { echo "########## RUN $label SKIPPED (busy)"; return 1; }
+    fi
+
+    if [ "$RUNNER" = venv ]; then
+        local a args=()
+        for a in "$@"; do args+=("${a//\/capped/$CAPPED}"); done
+        echo "load_avg $(cut -d' ' -f1-3 /proc/loadavg) runner=venv"
+        setsid env $env_prefix PYTHONPATH="$REPO/src" "$PYTHON" launch.py \
+            --backend NEURON --device "$dev" --numa "$NUMA" \
+            --report_dir "$RESULTS/$label" "${args[@]}" > >(grep -vE "$NOISE") 2>&1 &
+        runpid=$!
+        ( sleep "$tmo"; kill -TERM -- "-$runpid" 2>/dev/null \
+            && echo "########## RUN $label KILLED by watchdog after ${tmo}s"; \
+          sleep 30; kill -KILL -- "-$runpid" 2>/dev/null ) &
+        wdpid=$!
+        wait "$runpid"; rc=$?
+        kill "$wdpid" 2>/dev/null
+        wait "$wdpid" 2>/dev/null
+        kill -KILL -- "-$runpid" 2>/dev/null
+        echo "########## RUN $label exit=$rc elapsed=$(( $(date +%s) - start ))s $(date -Is)"
+        return 0
+    fi
 
     $DOCKER rm -f "$cname" >/dev/null 2>&1
 
