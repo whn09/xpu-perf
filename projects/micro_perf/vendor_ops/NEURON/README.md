@@ -41,6 +41,8 @@ pip install -e .
 cd projects/micro_perf && pip install -r requirements.txt
 ```
 
+Every command below runs from `projects/micro_perf`.
+
 `pip install -e .` must not touch numpy: on Python 3.12 the Neuron compiler needs
 numpy >= 2, and an older pin here once downgraded it and broke every compile with
 `module 'numpy' has no attribute 'long'`. If you see that error,
@@ -63,7 +65,6 @@ reported as `neuron_runtime` in the report — **check it before trusting one.**
 torch_neuronx` fails with `Failed to get Neuron instance information. Status: 1`):
 
 ```bash
-cd projects/micro_perf
 docker build -f vendor_ops/NEURON/tools/Dockerfile.eager \
     -t xpu-perf-eager:latest vendor_ops/NEURON/tools
 docker run --rm --privileged \
@@ -107,8 +108,6 @@ provider returning wrong numbers at a plausible latency.
 ### 3. Run
 
 ```bash
-cd projects/micro_perf
-
 # smoke test: the backend end to end, no long compile
 python launch.py --backend NEURON --device 0 --task_dir workloads/neuron_smoke
 
