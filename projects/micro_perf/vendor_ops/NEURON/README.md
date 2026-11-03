@@ -133,7 +133,7 @@ so give concurrent runs different cores. For a whole-repo sweep do not use
 | fp32 / fp16 / bf16 | everything | default | |
 | tfloat32 | `gemm` | default (`torch` provider) | neuronx-cc TF32 auto-cast, scoped to one compiled graph per case: 106.8 TFLOPS at 4096³ vs 35.4 fp32 on Trn2 |
 | fp8 e5m2 | `gemm` | `XPU_PERF_NEURON_GEMM_COMPILE=1` + `vendor_ops/NEURON/workloads/gemm_fp8_compiled.json` | `torch_compile` provider; set an explicit `dst_dtype` |
-| fp8 e4m3 (OCP e4m3fn) | `gemm` | same | **Trn3 only** — Trn2 has no e4m3fn datapath (`NCC_EVRF051`) |
+| fp8 e4m3 (OCP e4m3fn) | `gemm` | same flag + `vendor_ops/NEURON/workloads/gemm_fp8_e4m3_compiled.json` (or `ONLY=trn3_fp8_e4m3_compiled`) | **Trn3 only** — Trn2 has no e4m3fn datapath (`NCC_EVRF051`) |
 | fp8, eager | `gemm` | — | rejected: eager fp8 matmul returns wrong products on SDK 2.33 ([details](RESULTS.md#re-validated-on-neuron-sdk-233-official-dlami)) |
 | MXFP8 / MXFP4 | `quant_matmul` | `XPU_PERF_NEURON_MX=1`, see [step 5](#5-mxfp8--mxfp4-on-trainium3) | **Trn3 only** |
 | int8 | `quant_matmul` and family | default | a bf16 simulation on every backend ([why](READING_THE_NUMBERS.md#the-quantized-ops-are-a-bf16-simulation-on-every-backend)) |
@@ -150,15 +150,25 @@ so give concurrent runs different cores. For a whole-repo sweep do not use
 python vendor_ops/NEURON/tools/verify_providers.py --device 0 --mx-sim --only quant_matmul
 XPU_PERF_NEURON_MX=1 python launch.py --backend NEURON --device 0 \
     --workload vendor_ops/NEURON/workloads/quant_matmul_mx.json
+
+# or both Trn3-only labels (MX + OCP-e4m3 compiled fp8 gemm) through the sweep script
+RUNNER=venv ONLY=trn3 vendor_ops/NEURON/tools/run_full_sweep.sh
 ```
 
 - **What is measured.** Operands arrive pre-quantized — x4-packed along K, one E8M0
   scale per 32 values — exactly as the int8 op receives int8 activations with their
   scales, so the timed region is the MX GEMM. Activation quantization is a separate
   op in this suite. The workload sweeps four format pairs (e4m3·e4m3, e5m2·e5m2,
-  e4m3 activations · fp4 weights, fp4·fp4) over `num_tokens` 128-8192 and four
-  `hidden_size x new_hidden_size` shapes. Constraints: `hidden_size % 512 == 0`,
-  `num_tokens % 128 == 0`, `new_hidden_size % 1024 == 0`, `dst_dtype` bf16.
+  e4m3 activations · fp4 weights, fp4·fp4) over four `hidden_size x new_hidden_size`
+  shapes, at prefill `num_tokens` 128-8192 and decode `num_tokens` 1-64 (144 cases).
+  Constraints: `hidden_size % 512 == 0`, `new_hidden_size % 1024 == 0`, `dst_dtype`
+  bf16.
+- **Decode shapes.** `nc_matmul_mx` takes an even token count of at most 128 per
+  tile, so the provider pads `num_tokens` to the next even number (1 → 2) up to 128
+  and to the next multiple of 128 above it. The padding tokens are computed but not
+  counted in `calc_flops`; at decode sizes the op is weight-read bound, so read
+  `mem_bw` rather than MFU there. Verified in the trn3 simulator at T = 1, 2, 8, 63,
+  64, 128, 200 (LNC 1 and 2) and compiled for trn3.
 - **MFU** is scored against 2517 TFLOPS per chip (629.25 per logical core at LNC=2),
   the published MXFP8/MXFP4 peak.
 - **Why opt-in.** Registering a vendor provider for `quant_matmul` replaces the base

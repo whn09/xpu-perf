@@ -137,6 +137,13 @@ CASES += [
     ("quant_matmul", "nkilib", mxq(512, 4096, 4096, "mxfp8_e5m2", "mxfp8_e5m2")),
     ("quant_matmul", "nkilib", mxq(512, 8192, 8192, "mxfp8_e4m3fn", "mxfp4_e2m1fn")),
     ("quant_matmul", "nkilib", mxq(128, 5120, 25600, "mxfp4_e2m1fn", "mxfp4_e2m1fn")),
+    # decode: padded to an even token count (1 -> 2) inside the provider
+    ("quant_matmul", "nkilib", mxq(1, 4096, 4096, "mxfp8_e4m3fn", "mxfp8_e4m3fn")),
+    ("quant_matmul", "nkilib", mxq(8, 5120, 25600, "mxfp8_e4m3fn", "mxfp4_e2m1fn")),
+    ("quant_matmul", "nkilib", mxq(64, 8192, 8192, "mxfp8_e5m2", "mxfp8_e5m2")),
+    # OCP e4m3fn compiled gemm: Trn3 only (NCC_EVRF051 before NeuronCore-v4); REJECTED on Trn2
+    ("gemm", "torch_compile", {"arg_type": "default", "dtype": "float8_e4m3", "dst_dtype": "bfloat16",
+                               "M": 2048, "K": 2048, "N": 2048}),
 ]
 
 MX_SIM_COMBOS = [(a, w) for a in ("e4m3", "e5m2", "fp4") for w in ("e4m3", "e5m2", "fp4")]

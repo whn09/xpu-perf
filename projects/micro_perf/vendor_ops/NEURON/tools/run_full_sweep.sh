@@ -417,6 +417,19 @@ if [ -n "$ONLY" ] || [ -n "$LIST" ]; then
         --workload $Q/ccl_ops.json
 fi
 
+# 10. Trainium3-only providers, gated behind ONLY (`ONLY=trn3` runs both). On any
+#     other chip every case is rejected up front -- the MX provider refuses off Trn3
+#     because a trn3 NEFF on a Trn2 core faults it, and float8_e4m3 (OCP e4m3fn) has
+#     no Tensor Engine datapath before NeuronCore-v4 -- so these labels are only
+#     meaningful on a trn3 instance. Check numerics first:
+#     `python vendor_ops/NEURON/tools/verify_providers.py --device 0 --mx-sim`.
+if [ -n "$ONLY" ] || [ -n "$LIST" ]; then
+    run_one trn3_mx 10800 0 "XPU_PERF_NEURON_MX=1" \
+        --workload vendor_ops/NEURON/workloads/quant_matmul_mx.json
+    run_one trn3_fp8_e4m3_compiled 7200 0 "XPU_PERF_NEURON_GEMM_COMPILE=1" \
+        --workload vendor_ops/NEURON/workloads/gemm_fp8_e4m3_compiled.json
+fi
+
 if [ -z "$LIST" ]; then
     echo ""
     echo "=============== sweep finished $(date -Is) ==============="

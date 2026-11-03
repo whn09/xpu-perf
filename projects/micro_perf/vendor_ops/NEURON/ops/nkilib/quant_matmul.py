@@ -71,7 +71,20 @@ ENV_FLAG = "XPU_PERF_NEURON_MX"
 MX_FORMATS = {"mxfp8_e4m3fn": "e4m3", "mxfp8_e5m2": "e5m2", "mxfp4_e2m1fn": "fp4"}
 
 P = 128      # partitions: one K tile = 128 x4 rows = 512 K values
-TT = 128     # tokens per stationary tile (stationary free dim <= 128)
+TT = 128     # max tokens per stationary tile (stationary free dim: even, <= 128)
+
+
+def padded_tokens(t):
+    """Token count the kernel runs at: even and <= 128, or a multiple of 128.
+
+    nc_matmul_mx's stationary free dim (tokens here) must be even and at most 128,
+    so decode batches are padded to the next even count (1 -> 2) and anything above
+    128 to the next multiple of 128. The padding tokens are real work for the
+    Tensor Engine but are not counted in calc_flops.
+    """
+    if t <= TT:
+        return t + (t & 1)
+    return -(-t // TT) * TT
 NT = 512     # narrowest moving tile: one fp32 PSUM bank; widened to 1024/2048 when
              # the resident weight slab still fits SLAB_BUDGET
 SLAB_BUDGET = 64 * 1024   # bytes per partition for one weight slab (data + scales)
@@ -190,16 +203,17 @@ def build_kernel(a_fmt, w_fmt):
             for q in range(4):
                 nisa.dma_copy(dst=ws_sb[nl.ds(32 * q, 4), :, :],
                               src=ws_v[:, q, :, nl.ds(n0, nt)].permute((1, 0, 2)))
-            for ti in nl.affine_range(T // TT):
-                t0 = ti * TT
+            tt = TT if T >= TT else T      # decode: one tile of T (even) tokens
+            for ti in nl.affine_range(T // tt):
+                t0 = ti * tt
                 # the whole K extent of this token tile: 1 + 4 DMAs, not 5 per K tile
-                a_sb = nl.ndarray((P, n_k, TT), dtype=a_q.dtype, buffer=nl.sbuf)
-                as_sb = nl.ndarray((P, n_k, TT), dtype=nl.uint8, buffer=nl.sbuf)
-                nisa.dma_copy(dst=a_sb, src=a_v[:, :, nl.ds(t0, TT)])
+                a_sb = nl.ndarray((P, n_k, tt), dtype=a_q.dtype, buffer=nl.sbuf)
+                as_sb = nl.ndarray((P, n_k, tt), dtype=nl.uint8, buffer=nl.sbuf)
+                nisa.dma_copy(dst=a_sb, src=a_v[:, :, nl.ds(t0, tt)])
                 for q in range(4):
                     nisa.dma_copy(dst=as_sb[nl.ds(32 * q, 4), :, :],
-                                  src=as_v[:, q, :, nl.ds(t0, TT)].permute((1, 0, 2)))
-                ps = nl.ndarray((TT, nt), dtype=nl.float32, buffer=nl.psum)
+                                  src=as_v[:, q, :, nl.ds(t0, tt)].permute((1, 0, 2)))
+                ps = nl.ndarray((tt, nt), dtype=nl.float32, buffer=nl.psum)
                 for ki in nl.affine_range(n_k):
                     nisa.nc_matmul_mx(
                         dst=ps,
@@ -208,9 +222,9 @@ def build_kernel(a_fmt, w_fmt):
                         stationary_scale=as_sb[:, ki, :],
                         moving_scale=ws_sb[:, ki, :],
                     )
-                res = nl.ndarray((TT, nt), dtype=nl.bfloat16, buffer=nl.sbuf)
+                res = nl.ndarray((tt, nt), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=res, src=ps)
-                nl.store(out[nl.ds(t0, TT), nl.ds(n0, nt)], value=res)
+                nl.store(out[nl.ds(t0, tt), nl.ds(n0, nt)], value=res)
         return out
 
     _KERNELS[key] = mx_quant_matmul
@@ -255,8 +269,6 @@ class NkiMXQuantMatmulOp:
         T, H, N = self.num_tokens, self.hidden_size, self.new_hidden_size
         if H % (4 * P) != 0:
             raise ValueError(f"hidden_size {H} must be a multiple of {4 * P}")
-        if T % TT != 0:
-            raise ValueError(f"num_tokens {T} must be a multiple of {TT} (no tail tile)")
         if N % (NT * self.lnc) != 0:
             raise ValueError(f"new_hidden_size {N} must be a multiple of {NT * self.lnc}")
         item = 2 if MX_FORMATS[self.w_dtype] == "fp4" else 4
@@ -267,13 +279,14 @@ class NkiMXQuantMatmulOp:
         self.a_fmt = MX_FORMATS[self.dtype]
         self.w_fmt = MX_FORMATS[self.w_dtype]
         T, H, N = self.num_tokens, self.hidden_size, self.new_hidden_size
+        self.padded_num_tokens = Tp = padded_tokens(T)
         dev = self.backend.get_torch_device_name()
         a_fmt, w_fmt = self.a_fmt, self.w_fmt
 
         self.input_tensor_info = {
-            "a_q": OpTensorInfo(shape=[H // 4, T], dtype=packed_torch_dtype(a_fmt), device=dev,
+            "a_q": OpTensorInfo(shape=[H // 4, Tp], dtype=packed_torch_dtype(a_fmt), device=dev,
                                 creator=lambda size, dtype, device: random_packed(size[0], size[1], a_fmt, device)),
-            "a_s": OpTensorInfo(shape=[H // 32, T], dtype=torch.uint8, device=dev,
+            "a_s": OpTensorInfo(shape=[H // 32, Tp], dtype=torch.uint8, device=dev,
                                 creator=lambda size, dtype, device: random_scales(size[0], size[1], device)),
             "w_q": OpTensorInfo(shape=[H // 4, N], dtype=packed_torch_dtype(w_fmt), device=dev,
                                 creator=lambda size, dtype, device: random_packed(size[0], size[1], w_fmt, device)),
@@ -281,7 +294,7 @@ class NkiMXQuantMatmulOp:
                                 creator=lambda size, dtype, device: random_scales(size[0], size[1], device)),
         }
         self.output_tensor_info = {
-            "y": OpTensorInfo(shape=[T, N], dtype=torch.bfloat16, device=dev),
+            "y": OpTensorInfo(shape=[Tp, N], dtype=torch.bfloat16, device=dev),
         }
         self.input_tensor_size = sum(calc_tensor_size(i) for i in self.input_tensor_info.values())
         self.output_tensor_size = sum(calc_tensor_size(i) for i in self.output_tensor_info.values())
