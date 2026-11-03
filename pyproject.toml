@@ -12,7 +12,10 @@ dependencies = [
     "jsonlines", 
     "flask", 
     "requests", 
-    "numpy<=1.26.4"
+    # Neuron SDK (neuronx-cc, torch-neuronx, ml_dtypes) needs numpy>=2 on py3.12;
+    # the old <=1.26.4 pin silently downgraded the DLAMI venv and broke every compile.
+    "numpy<=1.26.4; python_version < '3.12'",
+    "numpy>=2; python_version >= '3.12'"
 ]
 
 [tool.setuptools.packages.find]
