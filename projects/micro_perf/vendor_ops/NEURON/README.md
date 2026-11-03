@@ -169,8 +169,16 @@ XPU_PERF_NEURON_MX=1 python launch.py --backend NEURON --device 0 \
   rounding (rel 1.66e-3), and negative controls (doubled scales, swapped fp4
   nibbles, permuted weights) are caught; neuronx-cc compiles it for trn3 cleanly. On
   Trn3, `verify_providers.py` additionally checks the device output against the host
-  reference. It is a straightforward first kernel; if its MFU is low, nkilib's tuned
-  `experimental/matmul_mxfp8` is the next step.
+  reference.
+- **Kernel structure.** A weight slab (512-2048 columns, as wide as SBUF allows)
+  stays resident across token tiles, and each 128-token tile brings its whole K
+  extent and scales in 5 DMAs through K-major HBM views. The first version issued 5
+  DMAs per 128x512 K tile; compiled for trn3, the restructure cuts DMA instructions
+  per core 9-27x (e.g. 10,416 -> 756 at 512x8192x28672, 42,112 -> 1,556 at 8192³
+  with fp4 weights) and total instructions 4-12x. That is an instruction count, not
+  a timing — the compiler gives no latency estimate for NKI kernels and Trn2 cannot
+  run them — so the first Trn3 MFU is still the real test; nkilib's tuned
+  `experimental/matmul_mxfp8` is the next step if it is low.
 - **Refused off Trn3, by instance type.** neuronx-cc will compile the kernel for
   trn3 on a Trn2 host if the target is overridden, and the 2.35 runtime then
   *executes* the trn3 NEFF on the Trn2 core and faults it

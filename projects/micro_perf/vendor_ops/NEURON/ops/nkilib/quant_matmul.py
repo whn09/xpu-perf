@@ -38,9 +38,13 @@ scales are stored dense in HBM and spread into the hardware quadrant layout on l
 simulator with negative controls: doubling every weight scale doubles the output
 exactly, and swapping fp4 nibbles or permuting the weight moves rel err to ~1.4.
 
-This is a straightforward first kernel, not a tuned one: one 512-wide weight slab
-stays resident in SBUF across all token tiles, and the activation tile is re-read
-per slab. It has not run on Trn3 hardware -- the first Trn3 run should go through
+Structure: a weight slab (512-2048 columns, as wide as SBUF allows) stays resident
+across all token tiles; for each 128-token tile the whole K extent of the
+activation and its scales arrives in 5 DMAs (1 data + 1 per scale quadrant), via
+K-major HBM views, and the slab in another 5. The first version issued 5 DMAs per
+128 x 512 K tile instead -- ~115k 512-byte scale DMAs per program at
+8192 x 8192 x 28672, more than the ~29k data DMAs -- which would have made it
+DMA-issue-bound before the Tensor Engine was busy. It has not run on Trn3 hardware -- the first Trn3 run should go through
 tools/verify_providers.py (which checks it bit-for-bit against the host reference)
 before its numbers are used, and nkilib's tuned `experimental/matmul_mxfp8` is the
 obvious next step if the MFU comes in low.
@@ -68,7 +72,9 @@ MX_FORMATS = {"mxfp8_e4m3fn": "e4m3", "mxfp8_e5m2": "e5m2", "mxfp4_e2m1fn": "fp4
 
 P = 128      # partitions: one K tile = 128 x4 rows = 512 K values
 TT = 128     # tokens per stationary tile (stationary free dim <= 128)
-NT = 512     # moving free dim per matmul: one fp32 PSUM bank
+NT = 512     # narrowest moving tile: one fp32 PSUM bank; widened to 1024/2048 when
+             # the resident weight slab still fits SLAB_BUDGET
+SLAB_BUDGET = 64 * 1024   # bytes per partition for one weight slab (data + scales)
 
 FP4_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
@@ -155,45 +161,66 @@ def build_kernel(a_fmt, w_fmt):
         n_per_prg = N // nl.num_programs(0)
         pid = nl.program_id(0)
 
-        for ni in nl.affine_range(n_per_prg // NT):
-            n0 = pid * n_per_prg + ni * NT
-            # the weight slab for this n tile stays resident across all token tiles
-            w_sb = nl.ndarray((P, n_k, NT), dtype=w_q.dtype, buffer=nl.sbuf)
-            ws_sb = nl.ndarray((P, n_k, NT), dtype=nl.uint8, buffer=nl.sbuf)
-            for ki in nl.affine_range(n_k):
-                nisa.dma_copy(dst=w_sb[:, ki, :], src=w_q[nl.ds(ki * P, P), nl.ds(n0, NT)])
-                for q in nl.affine_range(4):
-                    # hardware scale layout: partition 32q+i <- dense row 4q+i
-                    nisa.dma_copy(dst=ws_sb[nl.ds(32 * q, 4), ki, :],
-                                  src=w_s[nl.ds(ki * 16 + 4 * q, 4), nl.ds(n0, NT)])
+        # Widest moving tile whose resident weight slab fits the budget: fewer
+        # activation re-reads and fewer, larger matmuls. One nc_matmul_mx takes up
+        # to 4096 fp32 moving columns (all of PSUM); 2048 leaves room to overlap.
+        slab_per_col = n_k * ((2 if w_q.dtype in (nl.int16, nl.uint16) else 4) + 1)
+        nt = NT
+        if n_per_prg % 1024 == 0 and slab_per_col * 1024 <= SLAB_BUDGET:
+            nt = 1024
+        if n_per_prg % 2048 == 0 and slab_per_col * 2048 <= SLAB_BUDGET:
+            nt = 2048
+
+        # K-major HBM views, so one DMA moves every K tile of an operand:
+        #   data   [kp, f]     -> [p, ki, f]        kp = ki*128 + p
+        #   scales [kp/8, f]   -> per quadrant q: [i, ki, f]   dense row ki*16 + 4q + i,
+        #                         landing on SBUF partition 32q + i (hardware layout)
+        a_v = a_q.reshape((n_k, P, T)).permute((1, 0, 2))
+        w_v = w_q.reshape((n_k, P, N)).permute((1, 0, 2))
+        as_v = a_s.reshape((n_k, 4, 4, T))
+        ws_v = w_s.reshape((n_k, 4, 4, N))
+
+        for ni in nl.affine_range(n_per_prg // nt):
+            n0 = pid * n_per_prg + ni * nt
+            # the weight slab for this n tile stays resident across all token tiles:
+            # 1 data DMA + 4 scale DMAs, instead of n_k + 4*n_k
+            w_sb = nl.ndarray((P, n_k, nt), dtype=w_q.dtype, buffer=nl.sbuf)
+            ws_sb = nl.ndarray((P, n_k, nt), dtype=nl.uint8, buffer=nl.sbuf)
+            nisa.dma_copy(dst=w_sb, src=w_v[:, :, nl.ds(n0, nt)])
+            for q in range(4):
+                nisa.dma_copy(dst=ws_sb[nl.ds(32 * q, 4), :, :],
+                              src=ws_v[:, q, :, nl.ds(n0, nt)].permute((1, 0, 2)))
             for ti in nl.affine_range(T // TT):
                 t0 = ti * TT
-                ps = nl.ndarray((TT, NT), dtype=nl.float32, buffer=nl.psum)
+                # the whole K extent of this token tile: 1 + 4 DMAs, not 5 per K tile
+                a_sb = nl.ndarray((P, n_k, TT), dtype=a_q.dtype, buffer=nl.sbuf)
+                as_sb = nl.ndarray((P, n_k, TT), dtype=nl.uint8, buffer=nl.sbuf)
+                nisa.dma_copy(dst=a_sb, src=a_v[:, :, nl.ds(t0, TT)])
+                for q in range(4):
+                    nisa.dma_copy(dst=as_sb[nl.ds(32 * q, 4), :, :],
+                                  src=as_v[:, q, :, nl.ds(t0, TT)].permute((1, 0, 2)))
+                ps = nl.ndarray((TT, nt), dtype=nl.float32, buffer=nl.psum)
                 for ki in nl.affine_range(n_k):
-                    a_sb = nl.ndarray((P, TT), dtype=a_q.dtype, buffer=nl.sbuf)
-                    as_sb = nl.ndarray((P, TT), dtype=nl.uint8, buffer=nl.sbuf)
-                    nisa.dma_copy(dst=a_sb, src=a_q[nl.ds(ki * P, P), nl.ds(t0, TT)])
-                    for q in nl.affine_range(4):
-                        nisa.dma_copy(dst=as_sb[nl.ds(32 * q, 4), :],
-                                      src=a_s[nl.ds(ki * 16 + 4 * q, 4), nl.ds(t0, TT)])
                     nisa.nc_matmul_mx(
                         dst=ps,
-                        stationary=a_sb.view(A_X4),
+                        stationary=a_sb[:, ki, :].view(A_X4),
                         moving=w_sb[:, ki, :].view(W_X4),
-                        stationary_scale=as_sb,
+                        stationary_scale=as_sb[:, ki, :],
                         moving_scale=ws_sb[:, ki, :],
                     )
-                res = nl.ndarray((TT, NT), dtype=nl.bfloat16, buffer=nl.sbuf)
+                res = nl.ndarray((TT, nt), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=res, src=ps)
-                nl.store(out[nl.ds(t0, TT), nl.ds(n0, NT)], value=res)
+                nl.store(out[nl.ds(t0, TT), nl.ds(n0, nt)], value=res)
         return out
 
     _KERNELS[key] = mx_quant_matmul
     return mx_quant_matmul
 
 
-# SBUF the resident weight slab needs per partition: data + one scale byte per x4 row
-_SLAB_BUDGET = 160 * 1024
+# SBUF the resident weight slab needs per partition (data + one scale byte per x4
+# row), at the narrowest 512-column tile. Leaves room for the activation tiles and
+# for the compiler to double-buffer the slab across n tiles.
+_SLAB_BUDGET = 96 * 1024
 
 
 class NkiMXQuantMatmulOp:
