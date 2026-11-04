@@ -49,7 +49,7 @@ attention+MLP blocks. Qwen3.5-27B is not that:
 | `hidden_size` | 5120 | every `hidden_size` and every GEMM K below |
 | `intermediate_size` | 17408 | not a power of two; `gemm.json`'s `K.N` pairs never touch it |
 | `num_attention_heads` / `num_key_value_heads` | 24 / 4 | GQA 6:1; TP=4 is the maximum clean TP |
-| `head_dim` | **256** | above every Neuron flash kernel's 128-partition limit, so no fused attention path exists there (measured: up to 154x, cut to 38x by tiling the query axis); the H100's SDPA takes it for free |
+| `head_dim` | **256** | above nkilib's 128-partition decode kernel. Prefill has a fused path since torch-neuronx 2.14 (Neuron SDK 2.33) widened the SDPA rewrite gate to `E <= 512` — 7.7-9.6x raw, was up to 154x; decode is still unfused (9.5-10.7x raw). The H100's SDPA takes it for free |
 | `attn_output_gate` | true | q projection is 2x wide: 24×256×2 = 12288, not 6144 |
 | `partial_rotary_factor` | 0.25 | rotary covers 64 of the 256 dims — `rope_dim: 64` |
 | `vocab_size`, `tie_word_embeddings` | 248320, false | a 2.54 GB embedding *and* a separate 2.54 GB lm_head |
@@ -130,12 +130,13 @@ Two caveats to read the output with:
 
 * **`head_dim: 256` is the point of these cases, and it is where the two backends
   diverge most.** On the H100 it costs nothing — 82% of the peak a power-of-two head_dim
-  reaches. On Trainium2 it misses *every* fused path (`nkilib`'s `P_MAX = 128` and
-  torch_neuronx's SDPA rewrite gate both cap at 128), and the measured result is 37.6x
-  at `q_len` 4096 rising to 153.9x at 10240. The published attention comparison
-  (prefill 3.1x, decode 1.9-3.2x) therefore does **not** describe these 16 layers. The
-  10240 rows now also run a third provider, `torch_tiled`, which recovers 4x of that
-  without a kernel. See the Trainium2 section.
+  reaches. On the beta image Trainium2 missed *every* fused path (`nkilib`'s `P_MAX = 128`
+  and torch_neuronx's SDPA rewrite gate both capped at 128): 37.6x at `q_len` 4096 rising
+  to 153.9x at 10240. **Since Neuron SDK 2.33 (torch-neuronx 2.14) the SDPA gate allows
+  `E <= 512`, prefill reaches the fused NKI kernel, and the same rows are 9.6x and 7.7x
+  raw (59-91 TFLOPS).** Decode still misses it (`q_len` 1 fails the gate's `L % 128`),
+  and `torch_tiled`, written for the beta, is now 5.5x slower than `torch`. See the
+  Trainium2 section.
 * **`is_causal=True` is hardcoded** in `op_defs/llm_ops/flash_attention.py`, and
   vision attention is not causal. The vision rows are therefore an upper bound on a
   cheaper op, not a faithful measurement. Fixing that needs an op-def change.
@@ -345,7 +346,7 @@ that are not are the whole result.
 | `silu`, `mul`, `exp` | 4.7-6.1x | 1.2-1.5x | parity, at the bandwidth ratio |
 | `topk`, `k <= 8` | 3.1-6.2x | 0.8-1.6x | parity |
 | `softmax` (vocab) | 6.7x | 1.7x | slightly behind |
-| `flash_attention`, `head_dim 256` | **9.7x median, 154x max** | up to **38x** | **broken** |
+| `flash_attention`, `head_dim 256` | prefill **7.7-9.6x** (SDK 2.33; beta: 154x max); decode 9.5-10.7x | prefill 1.9-2.4x | prefill **behind, no longer broken**; decode unfused |
 | `gelu` | **52x median, 61.7x max** | **13-15x** | **broken** |
 | `topk`, `k = 50` | **28-57x** | **7-14x** | **cliff above k=8** |
 
@@ -383,9 +384,39 @@ actually run their scan in.
 Tiny-N is a non-issue: at ≤1024 tokens `5120 → 96` and `5120 → 24` are 0.75-0.8x raw,
 i.e. Trn2 is **absolutely faster**, and only reach 4-5x at 10240 tokens.
 
-### `head_dim: 256` has no fused attention path on Neuron at all
+### `head_dim: 256` had no fused attention path on Neuron — prefill fixed in SDK 2.33
 
-This is the finding that overturns the parity expectation for this specific model.
+**Update, Neuron SDK 2.33 (torch-neuronx 2.14.3, 2026-11-03, trn2.48xlarge, re-measured
+alone on an idle host).** torch-neuronx 2.14 widened the SDPA rewrite gate
+(`_can_use_nki_flash_attention` in `neuron_dynamo_backend/decompositions.py`) from
+`D <= 128` with `L % 512 == 0 and S % 512 == 0` to `E <= 512` with `L % 128 == 0`, so
+`head_dim 256` prefill now reaches the fused NKI flash kernel through the plain `torch`
+provider:
+
+| shape | beta Trn2 | SDK 2.33 Trn2 | H100 | raw ratio now (was) | per chip |
+| --- | --- | --- | --- | --- | --- |
+| prefill 24/4/256, q_len 4096 | 13.7 ms, 15.0 TFLOPS | **3.48 ms, 59.2 TFLOPS** | 364 us | **9.6x** (37.6x) | 2.4x |
+| prefill 24/4/256, q_len 10240 | 282.6 ms, 4.6 TFLOPS | **14.16 ms, 91.0 TFLOPS** | 1836 us | **7.7x** (153.9x) | 1.9x |
+| prefill 6/1/256 (TP=4), q_len 4096 | 3.5 ms | **1.06 ms, 48.8 TFLOPS** | — | — (21.9x) | — |
+| prefill 6/1/256 (TP=4), q_len 10240 | 70.5 ms | **3.57 ms, 90.2 TFLOPS** | 564 us | **6.3x** (125.3x) | 1.6x |
+| decode 24/4/256, B=64, cache 4096 | — | 4,266 us, 252 GB/s | 399 us | 10.7x (4.6-10.4x range) | 2.7x |
+| decode 24/4/256, B=16, cache 10240 | — | 2,528 us, 266 GB/s | 267 us | 9.5x | 2.4x |
+
+- **Prefill is no longer broken.** Throughput now *rises* with context (59 → 91 TFLOPS,
+  past the 61.3 TFLOPS the `head_dim 128` control reached on the beta), the ratio
+  shrinks instead of growing, and the worst case went from 153.9x to 7.7x raw. Per chip
+  it is still 1.6-2.4x behind, outside the ~1-1.5x parity band.
+- **Decode is unchanged:** `q_len` 1 fails the gate's `L % 128`, `attention_tkg` still
+  caps at 128 partitions, and the rows sit at 250-270 GB/s, about a third of a core's
+  HBM bandwidth.
+- **`torch_tiled` is obsolete on this SDK:** 77.6 ms vs `torch`'s 14.16 ms at 24/4/256
+  q_len 10240, 23.3 ms vs 3.57 ms at 6/1/256. It still runs alongside `torch` and is
+  reported under its own provider name, so read the `torch` rows.
+
+The rest of this section is the beta-image measurement, kept for the record.
+
+This is the finding that overturned the parity expectation for this specific model (on
+the beta image).
 
 | shape | Trn2 | H100 | raw ratio |
 | --- | --- | --- | --- |
@@ -422,6 +453,9 @@ Consequence for the model: these are 16 of 64 layers and ~1.68B of 27.31B params
 at 10240-token prefill they would dominate total time outright.
 
 #### Partly recovered: 153x → 38x by tiling the query axis, no kernel needed
+
+> **Superseded on Neuron SDK 2.33:** the fused path above makes `torch` 5.5x faster than
+> `torch_tiled` at these shapes. This subsection describes the beta image.
 
 `vendor_ops/NEURON/ops/torch_tiled/flash_attention.py` is a third provider that calls
 the same SDPA once per query tile instead of once per call. It exists because of the
@@ -683,7 +717,8 @@ for this *model*:
   norms are ahead per chip.
 * **But three specific software gaps dominate the model's real runtime**, none of them
   a silicon property: no fused attention at `head_dim 256` (up to 154x, growing with
-  context), `gelu` 12-15x under its own chip's roofline, and `topk` above k=8.
+  context, on the beta image; prefill fixed by SDK 2.33), `gelu` 12-15x under its own
+  chip's roofline, and `topk` above k=8.
   Collectives at TP=4 add a fourth.
 
 So parity is a statement about the chip, not a prediction about this checkpoint. All
@@ -696,7 +731,7 @@ a different kind of fix, which is the useful part:
 | --- | --- | --- | --- |
 | `gelu` | 15.41x per chip | **4.35x** | the benchmark was measuring the erf form; the model asks for the tanh form. `erf` has no fast lowering, `tanh`/`sigmoid`/`exp` all reach the roofline. Op def now exposes torch's `approximate`. |
 | `topk` | 14.2x per chip worst | **2.91x** | nkilib already ships `rotational_topk`, which is flat in `k`. 40-line provider, up to 8.8x. |
-| attention `head_dim 256` | 153.6x raw worst | **38.4x** | tile the query axis so the 5.03 GB score matrix never lands whole. No kernel, and it no longer grows with context. |
+| attention `head_dim 256` | 153.6x raw worst | **38.4x** → **7.7x** on SDK 2.33 | beta: tile the query axis so the 5.03 GB score matrix never lands whole. SDK 2.33: torch-neuronx 2.14's SDPA rewrite now takes `E <= 512`, so prefill reaches the fused NKI kernel and the tiling is no longer needed. Decode is still unfused. |
 | `rms_norm` | 3.45x per chip (bf16), 3.61x (fp32) | **1.50x / 1.26x** | 83% of the op was the row reduction, as its own HBM pass at 112 GB/s. A written-from-scratch fused NKI kernel reaches 440/554 GB/s, 94-97% of `silu`'s. |
 | `all_reduce` at TP=4 | 4.1x over budget | — | not attempted; it is fixed overhead, not bandwidth. |
 
@@ -750,8 +785,8 @@ JSON. Listed in rough order of how much they matter:
 5. **`softplus`, `tanh`.** The GDN decay path. `sigmoid` and `rsqrt` are also absent
    as standalone ops but are at least exercised inside `silu` and `rms_norm`.
 6. **Batched matmul (`bmm`).** Every attention-shaped product with a batch dimension
-   that is not going through the fused kernel — which, given `head_dim: 256`, is all
-   16 attention layers.
+   that is not going through the fused kernel — on the beta image, given `head_dim: 256`,
+   all 16 attention layers; since SDK 2.33, their decode steps.
 7. **`where`.** Masking non-finite KV entries; on Neuron `v * mask` is not a
    substitute, since `inf * 0` is NaN.
 8. **`index_copy_`, `pad`, `cat` / `stack` / `chunk`.** Cheap individually, but the

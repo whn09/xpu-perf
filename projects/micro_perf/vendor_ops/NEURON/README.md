@@ -230,8 +230,10 @@ XPU_PERF_ENGINES=XCCLEngine XPU_PERF_XCCL_READY_TIMEOUT_S=2400 \
   183 (fp32) and 2517 (fp8/MX) TFLOPS per chip, from the Neuron Trainium3
   architecture page. Before this, a Trn3 report silently had no `mfu` field.
 - Choices that are *conservative* on Trn3, not wrong: the nkilib `rms_norm` SBUF
-  budget is the smallest generation's (Trn3 has 32 MiB per core vs Trn2's 24), and
-  `torch_tiled` attention's size threshold was tuned on Trn2.
+  budget is the smallest generation's (Trn3 has 32 MiB per core vs Trn2's 24).
+- `torch_tiled` attention is obsolete on SDK 2.33: torch-neuronx 2.14's SDPA rewrite
+  now takes `head_dim 256`, and `torch` is 5.5x faster than the tiled path at the
+  shapes it was written for. It still runs alongside `torch`; read the `torch` rows.
 - **Multi-node (one UltraServer, 4 x trn3.48xlarge).** UltraServer mode is per
   process, not machine state (`neuron-ls` showing `ultraserver-mode: unset` is
   normal). Every rank needs `NEURON_RT_ULTRASERVER_MODE=1`,

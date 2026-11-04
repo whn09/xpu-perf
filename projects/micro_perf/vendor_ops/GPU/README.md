@@ -68,6 +68,12 @@ weaker and more useful one: **nothing in the far group is explained by peak FLOP
 or peak bandwidth**, and every row in it has a named cause — an int64 index, an
 absent kernel, an unfused helper, a dtype the Tensor Engine cannot take.
 
+> **Update, Neuron SDK 2.33 (torch-neuronx 2.14):** the SDPA rewrite gate now takes
+> `E <= 512`, so `head_dim 256` prefill reaches the fused NKI kernel: 9.6x at `q_len` 4096
+> and 7.7x at 10240 (59-91 TFLOPS), and `torch_tiled` is now slower than `torch`. Decode at
+> `head_dim 256` is still unfused. The paragraphs below describe the beta image; see
+> [the Qwen3.5-27B README](../../workloads/models/qwen3_5_27b/README.md#head_dim-256-had-no-fused-attention-path-on-neuron--prefill-fixed-in-sdk-233).
+
 **Do not read the attention rows as model-independent.** Every row above is measured
 at `head_dim 128`, and that is the value both of Trainium2's fused paths are gated on:
 `nkilib` puts head_dim on 128 partitions (`P_MAX`), and torch_neuronx's SDPA rewrite
